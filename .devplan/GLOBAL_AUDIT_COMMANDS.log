@@ -1,0 +1,184 @@
+# AOPMem v0.1 Global Audit Commands Log
+
+Date: 2026-06-13
+Mode: final independent audit.
+Product files were not edited.
+
+## Recovery And Context
+
+Command: `sed -n '1,520p' .../pasted-text.txt`
+Result: PASS. Audit request read.
+
+Command: `sed -n '1,220p' /Users/arkadijcukavin/.codex/RTK.md`
+Result: PASS. `rtk` rule read.
+
+Command: `codebase-memory-mcp get_architecture`
+Result: PASS after using indexed project name
+`Users-arkadijcukavin-PycharmProjects-aopmem-cli`.
+
+Command: `find . -maxdepth 2 -type f`
+Result: PASS. Repo layout inspected.
+
+Command: `sed -n ... README/RUN_FIRST/reference files`
+Result: PARTIAL. Required reference docs were read from
+`aopmem_v0_1_final_orchestrated_pack/`. Root `reference/` and root
+`RUN_FIRST.md` are absent. Root README exists only as lowercase `readme.md`
+on disk.
+
+Command: `sed -n ... .devplan/CURRENT_STAGE.md`
+Result: PASS. Current stage says `STAGE_055_COMPLETE`.
+
+Command: `python3 -m json.tool .devplan/EXECUTION_LEDGER.json`
+Result: PASS. Ledger JSON is valid.
+
+Command: `jq -r '.stages | length' .devplan/EXECUTION_LEDGER.json`
+Result: PASS. Output: `55`.
+
+Command:
+`jq -r '([.stages[].status] | unique | join(",")), .blocked, .verified_through_stage, .next_cumulative_audit_stage, .current_stage' .devplan/EXECUTION_LEDGER.json`
+Result: PASS. Output: `VERIFIED`, `false`, `STAGE_055`, `none`,
+`STAGE_055_COMPLETE`.
+
+Command: `rg -n "BLOCKED|STAGE_055_MILESTONE_AUDIT|verified-through" .devplan/...`
+Result: PARTIAL. Ledger/proof are final, but
+`.devplan/HANDOFFS/STAGE_055.md` still says verified-through remains
+`STAGE_050`.
+
+## Rust Health
+
+Command: `rtk cargo build`
+Result: PASS. Finished dev build with 0 errors.
+
+Command: `rtk cargo test`
+Result: PASS. `164 passed`.
+
+Command: `rtk cargo test --tests`
+Result: PASS. `164 passed`.
+
+Command: `cargo run --quiet -- --help`
+Result: PASS. Stable top-level help printed.
+
+Command: `cargo run --quiet -- doctor --help`
+Result: PASS.
+
+Command: `cargo run --quiet -- init --help`
+Result: PASS.
+
+Command: `cargo run --quiet -- recall --help`
+Result: PASS.
+
+Command: `cargo run --quiet -- tool --help`
+Result: PASS. Shows `create-draft`, `list`, `get`, `run`, `validate`.
+
+## Drift Scan
+
+Command:
+`find . -path './target' -prune -o -path './dist' -prune -o -path './.git' -prune -o -type f \( -path './.github/*' -o -name '*.yml' -o -name '*.yaml' \) -print`
+Result: PASS. No GitHub Actions or CI workflow files found.
+
+Command:
+`rg -n -i "mem0|hindsight|qdrant|embedding|vector|semantic search|custom MCP server|migration old MVP|import old MVP|old MVP|background enrichment|current_state|task history|markdown export|markdown import|GitHub Actions|CI workflow" --glob '!target/**' --glob '!dist/**' --glob '!Cargo.lock' .`
+Result: PASS with classification. Hits are docs/spec/stage prompts, old audit
+text, and `src/verify/mod.rs` forbidden-term scanner/tests. No forbidden
+backend implementation found.
+
+Command:
+`rg -n -i "vector|embedding|semantic|qdrant|mem0|hindsight|current_state|task_history|markdown_export|markdown_import|background_enrichment" Cargo.toml src install templates scripts docs proof .devplan --glob '!target/**' --glob '!dist/**'`
+Result: PASS with classification. Source hits are install semantic question
+names, Memory Keeper semantic judgment text, and drift scanner constants/tests.
+No vector/semantic dependency, table, or runtime path found.
+
+## SQLite Proof
+
+Command: temp `AOPMEM_HOME` init plus `sqlite3 "$db" ...`
+Result: PASS.
+
+Tables:
+`aliases`, `events`, `fts_nodes`, `links`, `mcp_profiles`, `nodes`,
+`registries`, `schema_migrations`, `sources`, `tags`, `tool_contracts`,
+plus FTS backing tables and `sqlite_sequence`.
+
+Migration marker:
+`001|001_init`.
+
+Node columns:
+`id`, `node_type`, `status`, `title`, `summary`, `body`, `source_ref`,
+`confidence`, `trust_level`, `created_at`, `updated_at`.
+
+No vector/embedding tables:
+`0`.
+
+FTS:
+`CREATE VIRTUAL TABLE fts_nodes USING fts5(title, summary, body, aliases)`.
+
+Audit snapshot:
+`memory.sql: ASCII text`.
+
+Note: external `sqlite3` connection pragmas are per connection. Product code
+`open_workspace_db` applies `foreign_keys=ON`, `journal_mode=WAL`, and
+`busy_timeout=5000`; covered by Rust tests.
+
+## CLI Contract Probes
+
+Command: temp workspace contract probe for `status`, `doctor`, `node get`,
+`node list`, `node update`, `link list`, `recall`, `mcp list`, `mcp get`,
+`adapter status`, `reflect inventory`, and `artifacts cleanup`.
+Result: PASS.
+
+Output:
+`PASS contract_probes=status,doctor,node_get,node_list,node_update,link_list,recall,mcp_list,mcp_get,adapter_status,reflect_inventory,artifacts_cleanup`
+
+## End-To-End Temp Proof
+
+Command: custom temp fixture under `/tmp` with isolated `AOPMEM_HOME`.
+Result: PASS.
+
+Covered:
+- `init` with 5 semantic answers.
+- Runtime under `AOPMEM_HOME/workspaces/<repo>-<hash>`.
+- `aopmem.sqlite`, `tools/`, `artifacts/`, `logs/`, `runtimes/`,
+  `audit-git/` created.
+- No `.aopmem` in target repo.
+- `.understand.docs` absent when disabled.
+- `.understand.docs/SCHEMA.md` present when Understand is enabled.
+- Adapter seed preserved existing file text and did not duplicate block.
+- Adapter status detected drift, and sync replaced only the managed block.
+- Node create/list/get/update and link add/list worked.
+- Recall returned linked traversal, FTS fallback, and 1 source-backed hunch.
+- Tool draft, validate, list, get, run, and runner dry-run worked.
+- External read ran without approval.
+- External write blocked without `+++` and ran with `--approved '+++'`.
+- Reflection proposal create/apply auto-applied low risk and drafted high risk.
+- Artifacts cleanup removed old dated artifact dir.
+- Doctor returned healthy.
+- Audit snapshot was text `.sql`.
+
+Important output:
+
+```text
+PASS workspace=.../home-main/workspaces/repo-main-4c46e55f
+PASS mcp_enabled_statuses=[{"id":"codebase-memory-mcp","status":"configured_unverified","side_effects":"local_read","approval_requirement":"none"},{"id":"understand-anything","status":"configured_unverified","side_effects":"local_read","approval_requirement":"none"}]
+PASS recall_hunches=1 fts=1
+PASS tool_run=tool-ok:sample
+PASS doctor_healthy=true
+```
+
+## Source Reads
+
+Read focused source snippets from:
+- `src/cli/mod.rs`
+- `src/storage/mod.rs`
+- `src/schema/mod.rs`
+- `src/install/mod.rs`
+- `src/tools/mod.rs`
+- `src/recall/mod.rs`
+- `src/reflection/mod.rs`
+- `src/artifacts/mod.rs`
+- `src/audit/mod.rs`
+- `src/adapter/mod.rs`
+- `src/verify/mod.rs`
+- `install/v0.1/install_prompt.md`
+- `templates/**`
+- `scripts/**`
+
+Result: PASS. Evidence used in the report.

@@ -1,0 +1,201 @@
+# GA-001 Focused Re-Audit Commands
+
+Date: 2026-06-13
+CWD: /Users/arkadijcukavin/PycharmProjects/aopmem-cli
+
+## Context Discovery
+
+Command:
+
+```text
+codebase-memory-mcp list_projects
+```
+
+Result:
+
+```text
+PASS project found: Users-arkadijcukavin-PycharmProjects-aopmem-cli
+```
+
+Command:
+
+```text
+codebase-memory-mcp search_graph \
+  query="configured_unverified optional MCP status Understand Anything Codebase Memory" \
+  project="Users-arkadijcukavin-PycharmProjects-aopmem-cli" \
+  limit=20
+```
+
+Result:
+
+```text
+PASS relevant symbols found, including src/install/mod.rs optional_mcp_status
+```
+
+Command:
+
+```text
+ls -1 reference .devplan | sed -n '1,160p'
+```
+
+Result:
+
+```text
+reference/ is absent at repo root.
+.devplan exists.
+```
+
+Command:
+
+```text
+rg --files | rg '(^|/)(FINAL_DECISION_LOG|TOOLS_AND_MCP_REGISTRY|INSTALL_AND_WORKSPACE_INIT|MASTER_SPEC|MCP|INSTALL|WORKSPACE|REGISTRY).*\.md$|\.devplan/(FINAL_DECISION_LOG|MASTER_SPEC|PROOF_LOG|GLOBAL_AUDIT_REPORT)\.md$'
+```
+
+Result:
+
+```text
+PASS actual reference files found:
+aopmem_v0_1_final_orchestrated_pack/reference/INSTALL_AND_WORKSPACE_INIT.md
+aopmem_v0_1_final_orchestrated_pack/reference/FINAL_DECISION_LOG.md
+aopmem_v0_1_final_orchestrated_pack/reference/TOOLS_AND_MCP_REGISTRY.md
+```
+
+## Files Read
+
+Commands:
+
+```text
+sed -n '1,180p' .devplan/GLOBAL_AUDIT_REPORT.md
+sed -n '130,180p' .devplan/GLOBAL_AUDIT_COMMANDS.log
+sed -n '286,333p' .devplan/FINAL_DECISION_LOG.md
+sed -n '286,333p' aopmem_v0_1_final_orchestrated_pack/reference/FINAL_DECISION_LOG.md
+sed -n '1,180p' aopmem_v0_1_final_orchestrated_pack/reference/TOOLS_AND_MCP_REGISTRY.md
+sed -n '1,160p' aopmem_v0_1_final_orchestrated_pack/reference/INSTALL_AND_WORKSPACE_INIT.md
+sed -n '4660,4740p' .devplan/PROOF_LOG.md
+```
+
+Result:
+
+```text
+PASS final decision/spec files explicitly allow:
+disabled, installed, missing, configured_unverified.
+
+PASS configured_unverified semantics are documented:
+user enabled optional MCP/tool; CLI cannot reliably verify it; capability may
+be agent-local, host-global, shell-managed, or outside deterministic CLI
+detection; status is valid and non-blocking for v0.1; CLI must not fake
+installed without deterministic evidence.
+```
+
+## Cargo Checks
+
+Command:
+
+```text
+rtk cargo build
+```
+
+Result:
+
+```text
+PASS exit=0
+cargo build (0 crates compiled)
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.11s
+```
+
+Command:
+
+```text
+rtk cargo test
+```
+
+Result:
+
+```text
+PASS exit=0
+cargo test: 164 passed (1 suite, 2.64s)
+```
+
+Command:
+
+```text
+rtk cargo test --tests
+```
+
+Result:
+
+```text
+PASS exit=0
+cargo test: 164 passed (1 suite, 1.77s)
+```
+
+## Focused Grep
+
+Command:
+
+```text
+rg -n -i "configured_unverified|optional MCP|Understand Anything|Codebase Memory MCP" \
+  .devplan aopmem_v0_1_final_orchestrated_pack/reference \
+  aopmem_v0_1_final_orchestrated_pack/stage_prompts src tests install templates \
+  --glob '!target/**' --glob '!.git/**' --glob '!dist/**'
+```
+
+Result:
+
+```text
+PASS hits found and classified in GA001_REAUDIT_REPORT.md.
+```
+
+Command:
+
+```text
+rg -n -i "missing" \
+  .devplan/FINAL_DECISION_LOG.md \
+  aopmem_v0_1_final_orchestrated_pack/reference/FINAL_DECISION_LOG.md \
+  aopmem_v0_1_final_orchestrated_pack/reference/TOOLS_AND_MCP_REGISTRY.md \
+  aopmem_v0_1_final_orchestrated_pack/reference/INSTALL_AND_WORKSPACE_INIT.md \
+  .devplan/GLOBAL_AUDIT_REPORT.md .devplan/GLOBAL_AUDIT_COMMANDS.log \
+  .devplan/PROOF_LOG.md \
+  aopmem_v0_1_final_orchestrated_pack/stage_prompts/STAGE_029.md \
+  aopmem_v0_1_final_orchestrated_pack/stage_prompts/STAGE_030.md \
+  src/install/mod.rs tests --glob '!target/**'
+```
+
+Result:
+
+```text
+PASS missing-status hits match final contract or historical/test context.
+```
+
+Command:
+
+```text
+rg -n -i -P "enabled optional MCP.*MUST be missing|MUST be missing.*enabled optional MCP|configured_unverified.*invalid|invalid.*configured_unverified|configured_unverified.*blocks release|blocks release.*configured_unverified|configured_unverified.*must[- ]fix|must[- ]fix.*configured_unverified|configured_unverified.*(?<!non-)blocking|(?<!non-)blocking.*configured_unverified" \
+  .devplan aopmem_v0_1_final_orchestrated_pack/reference \
+  aopmem_v0_1_final_orchestrated_pack/stage_prompts src tests install templates \
+  --glob '!target/**' --glob '!.git/**' --glob '!dist/**'
+```
+
+Result:
+
+```text
+INFO exit=0 only historical PROOF_LOG command/result lines matched:
+.devplan/PROOF_LOG.md:4712
+.devplan/PROOF_LOG.md:4722
+```
+
+Command:
+
+```text
+rg -n -i -P "enabled optional MCP.*MUST be missing|MUST be missing.*enabled optional MCP|configured_unverified.*invalid|invalid.*configured_unverified|configured_unverified.*blocks release|blocks release.*configured_unverified|configured_unverified.*must[- ]fix|must[- ]fix.*configured_unverified|configured_unverified.*(?<!non-)blocking|(?<!non-)blocking.*configured_unverified" \
+  .devplan aopmem_v0_1_final_orchestrated_pack/reference \
+  aopmem_v0_1_final_orchestrated_pack/stage_prompts src tests install templates \
+  --glob '!target/**' --glob '!.git/**' --glob '!dist/**' \
+  --glob '!**/PROOF_LOG.md' --glob '!**/GLOBAL_AUDIT_COMMANDS.log'
+```
+
+Result:
+
+```text
+PASS exit=1 no current spec/product/test/install/template conflict found.
+```

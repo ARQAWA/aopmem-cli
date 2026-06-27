@@ -1,0 +1,539 @@
+{
+  "project": "AOPMem v0.1",
+  "current_stage": "STAGE_055_COMPLETE",
+  "last_completed_implementation_stage": "STAGE_055",
+  "verified_through_stage": "STAGE_055",
+  "last_audit_status": "PASS",
+  "audit_cadence": "cumulative_milestone_every_5_stages",
+  "next_cumulative_audit_stage": "none",
+  "next_cumulative_audit_focus": "none",
+  "derc_model_cutover_stage": "STAGE_029",
+  "historical_audit_model_note": "Existing VERIFIED/PASS statuses through STAGE_028 remain valid from the earlier per-stage audit model.",
+  "blocked": false,
+  "global_audit_p2_remediation": {
+    "status": "DONE_LOCAL_CHECKS_PASSED",
+    "findings_closed": [
+      "GA-001",
+      "GA-002",
+      "GA-003",
+      "GA-004",
+      "GA-008"
+    ],
+    "checks": [
+      "cargo build",
+      "cargo test",
+      "cargo test --tests",
+      "CLI probes",
+      "drift scan"
+    ],
+    "known_limitations": [
+      "No new global audit was run.",
+      "Optional MCP installed status is used only when a direct CLI detector passes.",
+      "Reflection/settings remain node-backed in v0.1."
+    ]
+  },
+  "global_audit_ga_001_decision_resolution": {
+    "status": "VERIFIED_BY_DECISION_PATCH",
+    "finding": "GA-001",
+    "resolution": "configured_unverified is accepted as a valid non-blocking status for enabled optional MCP capabilities when the CLI has no reliable deterministic detector.",
+    "product_code_changed": false,
+    "allowed_optional_mcp_statuses": [
+      "disabled",
+      "installed",
+      "missing",
+      "configured_unverified"
+    ],
+    "rules": [
+      "enabled + detector pass -> installed",
+      "enabled + detector fail -> missing",
+      "enabled + no reliable detector -> configured_unverified",
+      "disabled -> disabled",
+      "missing or configured_unverified must not fail install",
+      "CLI must not fake installed without deterministic evidence"
+    ],
+    "checks": [
+      "cargo build",
+      "cargo test",
+      "cargo test --tests",
+      "focused grep"
+    ]
+  },
+  "stages": [
+    {
+      "stage": "001",
+      "status": "VERIFIED",
+      "requirements": [
+        "REQ-DERC-001",
+        "REQ-DERC-002",
+        "REQ-DERC-003",
+        "REQ-DERC-004"
+      ],
+      "notes": "Initialized dev repo DERC files. Audit passed."
+    },
+    {
+      "stage": "002",
+      "status": "VERIFIED",
+      "requirements": [
+        "REQ-PROD-001"
+      ],
+      "notes": "Created Rust crate skeleton. Audit passed."
+    },
+    {
+      "stage": "003",
+      "status": "VERIFIED",
+      "requirements": [
+        "REQ-PROD-001"
+      ],
+      "notes": "Added near-term CLI/storage dependencies with crate justifications. Audit passed."
+    },
+    {
+      "stage": "004",
+      "status": "VERIFIED",
+      "requirements": [
+        "REQ-CLI-001"
+      ],
+      "notes": "Added CLI shell and command routing skeleton. Audit passed."
+    },
+    {
+      "stage": "005",
+      "status": "VERIFIED",
+      "requirements": [
+        "REQ-CLI-002",
+        "REQ-CLI-003",
+        "REQ-CLI-004"
+      ],
+      "notes": "Added JSON envelope and fixed exit code model. Patched --json parse errors to emit JSON and exit 2. Audit passed."
+    },
+    {
+      "stage": "006",
+      "status": "VERIFIED",
+      "requirements": [
+        "REQ-PROD-002",
+        "REQ-STORAGE-001"
+      ],
+      "notes": "Added pure user-level path resolver. Audit passed."
+    },
+    {
+      "stage": "007",
+      "status": "VERIFIED",
+      "requirements": [
+        "REQ-STORAGE-001"
+      ],
+      "notes": "Added deterministic workspace key generation. Audit passed."
+    },
+    {
+      "stage": "008",
+      "status": "VERIFIED",
+      "requirements": [
+        "REQ-PROD-002",
+        "REQ-STORAGE-001"
+      ],
+      "notes": "Added global/workspace directory creation. Audit passed."
+    },
+    {
+      "stage": "009",
+      "status": "VERIFIED",
+      "requirements": [
+        "REQ-STORAGE-001"
+      ],
+      "notes": "Added SQLite connection and required pragmas. Audit passed."
+    },
+    {
+      "stage": "010",
+      "status": "VERIFIED",
+      "requirements": [
+        "REQ-STORAGE-004"
+      ],
+      "notes": "Added migration system and schema v1 skeleton. Audit passed."
+    },
+    {
+      "stage": "011",
+      "status": "VERIFIED",
+      "requirements": [
+        "REQ-STORAGE-004",
+        "REQ-CLI-005"
+      ],
+      "notes": "Implemented nodes table and node create/get/list. Audit passed."
+    },
+    {
+      "stage": "012",
+      "status": "VERIFIED",
+      "requirements": [
+        "REQ-STORAGE-004"
+      ],
+      "notes": "Implemented links table and link add/list. Audit passed."
+    },
+    {
+      "stage": "013",
+      "status": "VERIFIED",
+      "requirements": [
+        "REQ-STORAGE-004"
+      ],
+      "notes": "Implemented aliases/tags/sources tables and minimal add/list commands. Audit passed."
+    },
+    {
+      "stage": "014",
+      "status": "VERIFIED",
+      "requirements": [
+        "REQ-STORAGE-005"
+      ],
+      "notes": "Implemented events table and audit API for node/link creation events. Patched storage auto-recording for successful node/link creation. Audit passed."
+    },
+    {
+      "stage": "015",
+      "status": "VERIFIED",
+      "requirements": [
+        "REQ-TOOLS-002",
+        "REQ-TOOLS-005"
+      ],
+      "notes": "Implemented registries base and minimal MCP profile add/get/list. Audit passed."
+    },
+    {
+      "stage": "016",
+      "status": "VERIFIED",
+      "requirements": [
+        "REQ-STORAGE-003"
+      ],
+      "notes": "Added FTS5 table and node create/alias indexing hooks. Audit passed."
+    },
+    {
+      "stage": "017",
+      "status": "VERIFIED",
+      "requirements": [
+        "REQ-MEM-002"
+      ],
+      "notes": "Implemented structured recall base for project profiles, gates, and workflows by status. No FTS/BM25 or graph traversal added. Audit passed."
+    },
+    {
+      "stage": "018",
+      "status": "VERIFIED",
+      "requirements": [
+        "REQ-MEM-002"
+      ],
+      "notes": "Implemented recall graph traversal through existing links. Audit passed after user-approved scope patch."
+    },
+    {
+      "stage": "019",
+      "status": "VERIFIED",
+      "requirements": [
+        "REQ-STORAGE-003",
+        "REQ-MEM-002"
+      ],
+      "notes": "Implemented FTS/BM25 fallback with DERC dependency scope for minimal storage API and CLI recall wiring. Audit passed."
+    },
+    {
+      "stage": "020",
+      "status": "VERIFIED",
+      "requirements": [
+        "REQ-MEM-003"
+      ],
+      "notes": "Implemented deterministic hunch selection from FTS fallback candidates with source node ids, linked signal metadata, rank, and hotness. Audit passed."
+    },
+    {
+      "stage": "021",
+      "status": "VERIFIED",
+      "requirements": [
+        "REQ-MEM-002",
+        "REQ-MEM-003"
+      ],
+      "notes": "Implemented additive compact recall bundle shaping with deterministic section limits, source refs, confidence, trust markers, and max hunch count tests. Audit passed."
+    },
+    {
+      "stage": "022",
+      "status": "VERIFIED",
+      "requirements": [
+        "REQ-MEM-004"
+      ],
+      "notes": "Implemented normal recall exclusion for deprecated/superseded nodes in structured sections, traversal, and FTS fallback while keeping grouped status shape for later lint/audit modes. Audit passed after bookkeeping patch."
+    },
+    {
+      "stage": "023",
+      "status": "VERIFIED",
+      "requirements": [
+        "REQ-INSTALL-005"
+      ],
+      "notes": "Implemented adapter managed block seed for Codex/OpenAI AGENTS.md with optional explicit file path, safe in-place block replacement, missing-file creation, and focused tests. Audit passed."
+    },
+    {
+      "stage": "024",
+      "status": "VERIFIED",
+      "requirements": [
+        "REQ-INSTALL-005",
+        "REQ-VERIFY-005"
+      ],
+      "notes": "Implemented adapter sync/status/drift detection with managed block state inspection and minimal Adapter -> CLI AUTO_PATCH_WINDOW wiring. Audit passed."
+    },
+    {
+      "stage": "025",
+      "status": "VERIFIED",
+      "requirements": [
+        "REQ-PROD-002",
+        "REQ-INSTALL-001"
+      ],
+      "notes": "Implemented minimal global install status for dirs, binary, and templates, and wired aopmem status with focused tests. Audit passed."
+    },
+    {
+      "stage": "026",
+      "status": "VERIFIED",
+      "requirements": [
+        "REQ-INSTALL-001",
+        "REQ-STORAGE-001"
+      ],
+      "notes": "Implemented workspace init with workspace dir/DB creation, base seed nodes, and CLI init wiring. Patched the Stage 026 shared test-process lock finding in src/storage/mod.rs so install/cli/storage env-current-dir mutation tests share one process-wide lock. cargo test and RUST_TEST_THREADS=1 cargo test both passed."
+    },
+    {
+      "stage": "027",
+      "status": "VERIFIED",
+      "requirements": [
+        "REQ-INSTALL-001",
+        "REQ-INSTALL-002",
+        "REQ-INSTALL-003",
+        "REQ-INSTALL-004"
+      ],
+      "notes": "Implemented interactive install flow with only the 5 semantic question blocks, silent technical detection, semantic answer seeding into SQLite, and stable JSON init output. Audit passed."
+    },
+    {
+      "stage": "028",
+      "status": "VERIFIED",
+      "requirements": [
+        "REQ-INSTALL-003"
+      ],
+      "notes": "Implemented .understand.docs creation only when Understand Anything is enabled, added repo-local exclude support through .git/info/exclude, created the required SCHEMA.md and directory scaffold, and added focused install tests. Audit passed."
+    },
+    {
+      "stage": "029",
+      "status": "VERIFIED",
+      "requirements": [
+        "REQ-INSTALL-003"
+      ],
+      "notes": "Implemented Understand registry/profile with installed or missing status during install, kept it best-effort so MCP profile write failure does not fail AOPMem install, added focused install tests, and passed the cumulative audit at STAGE_030."
+    },
+    {
+      "stage": "030",
+      "status": "VERIFIED",
+      "requirements": [
+        "REQ-INSTALL-004"
+      ],
+      "notes": "Implemented Codebase Memory MCP registry/profile with installed or missing status during install, kept it best-effort so MCP profile write failure does not fail AOPMem install, added focused install tests, and passed the cumulative audit at STAGE_030."
+    },
+    {
+      "stage": "031",
+      "status": "VERIFIED",
+      "requirements": [
+        "REQ-TOOLS-005"
+      ],
+      "notes": "Completed corporate MCP registry create/get/list/add coverage, kept the registry allowed to be empty, verified corporate kind persistence for side_effects and approval_requirement, passed local checks, and passed the cumulative audit at STAGE_035."
+    },
+    {
+      "stage": "032",
+      "status": "VERIFIED",
+      "requirements": [
+        "REQ-TOOLS-001",
+        "REQ-TOOLS-002",
+        "REQ-TOOLS-003"
+      ],
+      "notes": "Implemented tool contract registry create/get/list helpers over SQLite, added tool.json read/write helpers under workspace tools/<tool-id>/, added focused round-trip tests, passed local checks, and passed the cumulative audit at STAGE_035."
+    },
+    {
+      "stage": "033",
+      "status": "VERIFIED",
+      "requirements": [
+        "REQ-TOOLS-001",
+        "REQ-TOOLS-003"
+      ],
+      "notes": "Implemented aopmem tool create-draft with draft-only status, workspace tools/<tool-id>/ layout, tool.json template generation, canonical SQLite registration, focused CLI/tool tests, and passed the cumulative audit at STAGE_035."
+    },
+    {
+      "stage": "034",
+      "status": "VERIFIED",
+      "requirements": [
+        "REQ-TOOLS-003"
+      ],
+      "notes": "Implemented aopmem tool validate with positional tool id parsing, tool.json contract validation, local executable existence checks, minimal CLI AUTO_PATCH_WINDOW wiring, focused CLI/tool tests, and passed the cumulative audit at STAGE_035."
+    },
+    {
+      "stage": "035",
+      "status": "VERIFIED",
+      "requirements": [
+        "REQ-TOOLS-004"
+      ],
+      "notes": "Implemented aopmem tool run with trailing args parsing, runtime execution via registered tool.json metadata, safe-only approval policy, unsafe-action blocking, canonical SQLite drift enforcement for validate/run, focused CLI/tool tests, and passed the cumulative audit rerun at STAGE_035."
+    },
+    {
+      "stage": "036",
+      "status": "VERIFIED",
+      "requirements": [
+        "REQ-ART-001",
+        "REQ-ART-002",
+        "REQ-ART-003",
+        "REQ-ART-004"
+      ],
+      "notes": "Implemented artifact day parsing and folder creation under workspace artifacts/YYYY-MM-DD, added local-only cleanup that deletes only within artifacts/ by 7 retained calendar days or 1 GB per workspace, wired aopmem artifacts cleanup, added focused artifacts and CLI tests, and passed the cumulative audit rerun at STAGE_040."
+    },
+    {
+      "stage": "037",
+      "status": "VERIFIED",
+      "requirements": [
+        "REQ-STORAGE-005"
+      ],
+      "notes": "Implemented deterministic audit-git SQL snapshot dumping to workspace audit-git/memory.sql, refreshed the text snapshot after successful CLI memory writes including init-path coverage, added focused audit and CLI tests, did not edit src/storage/**, and passed the cumulative audit rerun at STAGE_040."
+    },
+    {
+      "stage": "038",
+      "status": "VERIFIED",
+      "requirements": [
+        "REQ-VERIFY-003"
+      ],
+      "notes": "Implemented doctor health checks for global dirs, workspace, DB, schema, FTS, adapter block, artifacts dirs, and tools dirs, added stable JSON health output, added focused verify and CLI tests including missing JSON path coverage, and passed the cumulative audit rerun at STAGE_040."
+    },
+    {
+      "stage": "039",
+      "status": "VERIFIED",
+      "requirements": [
+        "REQ-MEM-005"
+      ],
+      "notes": "Implemented aopmem remember as a user-triggered helper on top of existing node creation logic, with default raw_note draft writes, explicit structured node field mapping, focused parse/e2e/no-classification tests, and passed the cumulative audit rerun at STAGE_040."
+    },
+    {
+      "stage": "040",
+      "status": "VERIFIED",
+      "requirements": [
+        "REQ-MEM-005"
+      ],
+      "notes": "Implemented teach session storage with deterministic start/add/propose/apply CLI flows on top of existing node/link/metadata storage, added focused parse and end-to-end teach tests, and passed the cumulative audit rerun at STAGE_040."
+    },
+    {
+      "stage": "041",
+      "status": "VERIFIED",
+      "requirements": [
+        "REQ-REFLECT-001",
+        "REQ-REFLECT-003"
+      ],
+      "notes": "Implemented aopmem reflect inventory through src/reflection/** and src/cli/**, tracked reflected session ids only from strict owned reflection record summaries, recorded inventory status snapshots as raw_note records, added focused reflection and CLI tests, and passed the cumulative audit at STAGE_045."
+    },
+    {
+      "stage": "042",
+      "status": "VERIFIED",
+      "requirements": [
+        "REQ-REFLECT-002",
+        "REQ-REFLECT-003"
+      ],
+      "notes": "Implemented structured reflection proposal schema in src/reflection/**, validated deterministic low/high risk item types, stored strict reflection proposal records with tracked session ids, added minimal src/cli/** AUTO_PATCH_WINDOW wiring for --proposal-file intake, added focused reflection and CLI tests, and passed the cumulative audit at STAGE_045."
+    },
+    {
+      "stage": "043",
+      "status": "VERIFIED",
+      "requirements": [
+        "REQ-REFLECT-004",
+        "REQ-MEM-005"
+      ],
+      "notes": "Implemented reflection apply risk policy in src/reflection/**, auto-applied low-risk proposal items, kept high-risk and unresolved dependent items draft, stored strict reflection_apply_v1 receipts with tracked session ids, added minimal src/cli/** AUTO_PATCH_WINDOW wiring for command execution, added focused reflection and CLI tests, and passed the cumulative audit at STAGE_045."
+    },
+    {
+      "stage": "044",
+      "status": "VERIFIED",
+      "requirements": [
+        "REQ-CLI-004"
+      ],
+      "notes": "Implemented approval flag handling for aopmem tool run, added global --approved intake that accepts any text containing +++, blocked external/high-risk runs when approval is missing, preserved safe local runs and contract drift checks, added focused CLI/tool tests, and passed the cumulative audit at STAGE_045."
+    },
+    {
+      "stage": "045",
+      "status": "VERIFIED",
+      "requirements": [
+        "REQ-MEM-002",
+        "REQ-TOOLS-005"
+      ],
+      "notes": "Implemented derived source hierarchy parsing in src/storage/**, exposed least-privilege metadata for MCP profiles and node-backed tool/MCP records, updated recall compact output and FTS/hunch ordering to respect source priorities, added focused storage and recall tests, and passed the cumulative audit at STAGE_045."
+    },
+    {
+      "stage": "046",
+      "status": "VERIFIED",
+      "requirements": [
+        "REQ-VERIFY-005"
+      ],
+      "notes": "Implemented aopmem verify lint command in src/verify/** and src/cli/**, added checks for duplicate ids, broken links, deprecated active links, missing source, missing summary, and missing gates, added focused clean/dirty lint tests, and passed the cumulative audit at STAGE_050."
+    },
+    {
+      "stage": "047",
+      "status": "VERIFIED",
+      "requirements": [
+        "REQ-VERIFY-004"
+      ],
+      "notes": "Implemented negative CLI scenario coverage in src/cli/mod.rs for missing workspace, bad node type, bad status, duplicate id, broken link, unsafe tool run, and deprecated recall exclusion, and passed the cumulative audit at STAGE_050."
+    },
+    {
+      "stage": "048",
+      "status": "VERIFIED",
+      "requirements": [
+        "REQ-VERIFY-005"
+      ],
+      "notes": "Implemented drift checks in src/verify/mod.rs for adapter managed block drift, schema drift, and forbidden feature terms, added focused unit tests, and passed the cumulative audit at STAGE_050."
+    },
+    {
+      "stage": "049",
+      "status": "VERIFIED",
+      "requirements": [
+        "REQ-VERIFY-001",
+        "REQ-VERIFY-002",
+        "REQ-VERIFY-003",
+        "REQ-VERIFY-004",
+        "REQ-VERIFY-005"
+      ],
+      "notes": "Implemented scripts/dev_verify.sh for deterministic local build/test, clean CLI proof, negative checks, and drift check scenarios, and passed the cumulative audit at STAGE_050."
+    },
+    {
+      "stage": "050",
+      "status": "VERIFIED",
+      "requirements": [
+        "REQ-VERIFY-003"
+      ],
+      "notes": "Extended scripts/dev_verify.sh with runtime proof scenario coverage for init workspace, node create, recall, isolated hunch fixture, tool create-draft, artifacts cleanup, doctor, negative checks, and drift check, and passed the cumulative audit at STAGE_050."
+    },
+    {
+      "stage": "051",
+      "status": "VERIFIED",
+      "requirements": [
+        "REQ-INSTALL-001",
+        "REQ-INSTALL-002"
+      ],
+      "notes": "Added install/v0.1/install_prompt.md with silent technical detection and 5 semantic questions only, confirmed the file exists, and passed the cumulative audit at STAGE_055."
+    },
+    {
+      "stage": "052",
+      "status": "VERIFIED",
+      "requirements": [
+        "REQ-INSTALL-005"
+      ],
+      "notes": "Added managed block, .understand.docs schema, and Memory Keeper skill contract templates plus a short docs index, and passed the cumulative audit at STAGE_055."
+    },
+    {
+      "stage": "053",
+      "status": "VERIFIED",
+      "requirements": [
+        "REQ-PROD-004"
+      ],
+      "notes": "Added scripts/build_macos_arm.sh, produced dist/aopmem-darwin-arm64/aopmem, verified the output file exists and reports as Mach-O 64-bit arm64, and passed the cumulative audit at STAGE_055."
+    },
+    {
+      "stage": "054",
+      "status": "VERIFIED",
+      "requirements": [
+        "REQ-DERC-001",
+        "REQ-DERC-002",
+        "REQ-DERC-003",
+        "REQ-DERC-004",
+        "REQ-DERC-005"
+      ],
+      "notes": "Expanded the requirements matrix with full stage coverage through STAGE_054, added the final 15x traceability proof, recorded clean drift status, and passed the cumulative audit at STAGE_055."
+    },
+    {
+      "stage": "055",
+      "status": "VERIFIED",
+      "requirements": [
+        "REQ-VERIFY-003"
+      ],
+      "notes": "Ran the final release-candidate local proof via bash scripts/dev_verify.sh, kept the stage inside proof/.devplan scope, wrote the Stage 055 handoff, and passed the cumulative audit at STAGE_055."
+    }
+  ]
+}
