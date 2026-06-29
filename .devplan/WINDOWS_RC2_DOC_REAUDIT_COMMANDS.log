@@ -1,0 +1,251 @@
+# Windows RC2 Doc Re-Audit Commands Log
+cwd: /Users/arkadijcukavin/PycharmProjects/aopmem-cli
+
+Read inputs:
+
+- .devplan/WINDOWS_RC2_MAC_AUDIT_REPORT.md
+- .devplan/WINDOWS_RC2_MAC_AUDIT_COMMANDS.log
+- docs/WINDOWS_NATIVE_POWERSHELL_SMOKE.md
+- .devplan/RELEASE_CANDIDATE_v0.1.0-rc2.md
+- .devplan/WINDOWS_RC2_DOC_PATCH.md
+- .devplan/PROOF_LOG.md
+- install/v0.1/install_prompt.md
+
+$ git status --short
+```text
+ M .devplan/PROOF_LOG.md
+ M install/v0.1/install_prompt.md
+?? .devplan/RELEASE_CANDIDATE_v0.1.0-rc2.md
+?? .devplan/WINDOWS_BUILD_PROOF.md
+?? .devplan/WINDOWS_RC2_DOC_PATCH.md
+?? .devplan/WINDOWS_RC2_MAC_AUDIT_COMMANDS.log
+?? .devplan/WINDOWS_RC2_MAC_AUDIT_REPORT.md
+?? dist/aopmem-windows-x86_64/
+?? docs/WINDOWS_NATIVE_POWERSHELL_SMOKE.md
+?? scripts/build_windows_x64_from_macos.sh
+```
+exit: 0
+
+$ git diff --name-only
+```text
+.devplan/PROOF_LOG.md
+install/v0.1/install_prompt.md
+```
+exit: 0
+
+$ git diff --check
+```text
+```
+exit: 0
+
+$ test -f docs/WINDOWS_NATIVE_POWERSHELL_SMOKE.md
+```text
+```
+exit: 0
+
+$ test -f .devplan/RELEASE_CANDIDATE_v0.1.0-rc2.md
+```text
+```
+exit: 0
+
+$ test -f .devplan/WINDOWS_RC2_DOC_PATCH.md
+```text
+```
+exit: 0
+
+$ rg -n "Windows 11|PowerShell|aopmem-windows-x86_64|AOPMEM_HOME|adapter seed|adapter status|doctor|recall|Test-Path" docs/WINDOWS_NATIVE_POWERSHELL_SMOKE.md
+```text
+1:# Windows Native PowerShell Smoke
+5:- Windows 11
+7:- native PowerShell only
+15:dist\aopmem-windows-x86_64\aopmem.exe
+29:Copy-Item ".\dist\aopmem-windows-x86_64\aopmem.exe" "$InstallDir\aopmem.exe" -Force
+40:$env:AOPMEM_HOME = "$env:TEMP\aopmem-rc2-home"
+59:Remove-Item -Recurse -Force -Path $env:AOPMEM_HOME, $Repo -ErrorAction SilentlyContinue
+60:New-Item -ItemType Directory -Force -Path $env:AOPMEM_HOME, $Repo | Out-Null
+82:  $AdapterSeedJson = & "$InstallDir\aopmem.exe" --json adapter seed --file .\AGENTS.md
+83:  if ($LASTEXITCODE -ne 0) { throw "adapter seed failed" }
+84:  $AdapterSeed = Assert-JsonOk "adapter seed" $AdapterSeedJson
+86:  $AdapterStatusJson = & "$InstallDir\aopmem.exe" --json adapter status --file .\AGENTS.md
+87:  if ($LASTEXITCODE -ne 0) { throw "adapter status failed" }
+88:  $AdapterStatus = Assert-JsonOk "adapter status" $AdapterStatusJson
+90:    throw "adapter status did not report managed_block=in_sync"
+93:  $DoctorJson = & "$InstallDir\aopmem.exe" --json doctor
+94:  if ($LASTEXITCODE -ne 0) { throw "doctor failed" }
+95:  $Doctor = Assert-JsonOk "doctor" $DoctorJson
+97:  $RecallJson = & "$InstallDir\aopmem.exe" --json recall
+98:  if ($LASTEXITCODE -ne 0) { throw "recall failed" }
+99:  $Recall = Assert-JsonOk "recall" $RecallJson
+101:  $WorkspacesDir = Join-Path $env:AOPMEM_HOME "workspaces"
+104:    throw "expected exactly one workspace under AOPMEM_HOME"
+106:  if ($WorkspaceDirs[0].FullName -notlike "$env:AOPMEM_HOME*") {
+107:    throw "workspace is outside AOPMEM_HOME"
+109:  if (-not (Test-Path (Join-Path $WorkspaceDirs[0].FullName "aopmem.sqlite"))) {
+113:  $RepoAopmemExists = Test-Path "$Repo\.aopmem"
+127:  Write-Output "PASS Test-Path `"$Repo\.aopmem`" returns False"
+128:  Write-Output "PASS workspace under AOPMEM_HOME"
+142:  - `adapter status` returns `managed_block=in_sync`.
+143:- `Test-Path "$Repo\.aopmem"` returns `False`.
+144:- `$env:AOPMEM_HOME\workspaces\...` exists.
+```
+exit: 0
+
+$ rg -n "Status|Scope|Evidence|Windows native proof|Explicitly out of scope|Release recommendation|Windows VDI" .devplan/RELEASE_CANDIDATE_v0.1.0-rc2.md
+```text
+3:## Status
+9:## Scope
+24:## Evidence
+84:- Status: pending user VDI run.
+105:- Ready for Windows VDI smoke: yes.
+```
+exit: 0
+
+$ rg -n "WSL|bash|cargo build|npm|Node.js|GitHub Actions|CI" docs/WINDOWS_NATIVE_POWERSHELL_SMOKE.md .devplan/RELEASE_CANDIDATE_v0.1.0-rc2.md
+```text
+.devplan/RELEASE_CANDIDATE_v0.1.0-rc2.md:55:PASS rtk cargo build
+.devplan/RELEASE_CANDIDATE_v0.1.0-rc2.md:65:PASS no Node.js rewrite or npm start runtime found
+.devplan/RELEASE_CANDIDATE_v0.1.0-rc2.md:66:PASS no WSL primary install path found
+.devplan/RELEASE_CANDIDATE_v0.1.0-rc2.md:78:PASS WSL is explicitly not the Windows install path
+.devplan/RELEASE_CANDIDATE_v0.1.0-rc2.md:98:- WSL.
+.devplan/RELEASE_CANDIDATE_v0.1.0-rc2.md:99:- Node.js rewrite.
+.devplan/RELEASE_CANDIDATE_v0.1.0-rc2.md:100:- CI/GitHub Actions.
+docs/WINDOWS_NATIVE_POWERSHELL_SMOKE.md:8:- no WSL
+docs/WINDOWS_NATIVE_POWERSHELL_SMOKE.md:9:- no bash
+docs/WINDOWS_NATIVE_POWERSHELL_SMOKE.md:10:- no `cargo build`
+```
+exit: 0
+
+Extra focused checks:
+
+$ rg -n -- "USERPROFILE|aopmem-rc2-repo|--version|--help|--json init|ok=true|managed AOPMem|AOPMEM:BEGIN|AOPMEM:END|aopmem 0.1.0" docs/WINDOWS_NATIVE_POWERSHELL_SMOKE.md
+```text
+21:$env:USERPROFILE\.aopmem\bin\aopmem.exe
+27:$InstallDir = "$env:USERPROFILE\.aopmem\bin"
+31:& "$InstallDir\aopmem.exe" --version
+32:& "$InstallDir\aopmem.exe" --help
+41:$Repo = "$env:TEMP\aopmem-rc2-repo"
+53:    throw "$Name did not return ok=true"
+78:  $InitJson = $InitAnswers | & "$InstallDir\aopmem.exe" --json init
+119:  if ($AgentsText -notmatch "<!-- AOPMEM:BEGIN managed block -->") {
+120:    throw "AGENTS.md missing managed AOPMem begin marker"
+122:  if ($AgentsText -notmatch "<!-- AOPMEM:END managed block -->") {
+123:    throw "AGENTS.md missing managed AOPMem end marker"
+126:  Write-Output "PASS JSON commands returned ok=true"
+130:  Write-Output "PASS AGENTS.md contains managed AOPMem block"
+139:- `--version` prints `aopmem 0.1.0`.
+140:- `--help` prints CLI help.
+141:- JSON commands return `ok=true`, or documented healthy equivalent:
+145:- AGENTS.md contains managed AOPMem block.
+```
+exit: 0
+
+$ rg -n -- "RC ready|macOS ARM|Windows x64|install prompt|PowerShell smoke|dist/aopmem-darwin-arm64|dist/aopmem-windows-x86_64|Mach-O|PE32|798af|d7d11|cargo build|cargo test|drift|pending user VDI|Linux|Windows ARM|WSL|Node.js rewrite|CI/GitHub Actions|New runtime features|Ready for Windows VDI smoke|Ready to tag rc2" .devplan/RELEASE_CANDIDATE_v0.1.0-rc2.md
+```text
+5:RC ready.
+7:Native Windows runtime proof is pending user VDI run.
+11:- macOS ARM artifact:
+12:  `dist/aopmem-darwin-arm64/aopmem`.
+13:- Windows x64 artifact:
+14:  `dist/aopmem-windows-x86_64/aopmem.exe`.
+16:  - macOS Apple Silicon uses `dist/aopmem-darwin-arm64/aopmem`.
+17:  - Windows x64 native PowerShell uses
+19:- Windows native PowerShell smoke doc:
+26:macOS ARM binary path:
+29:dist/aopmem-darwin-arm64/aopmem
+32:Windows x64 binary path:
+35:dist/aopmem-windows-x86_64/aopmem.exe
+41:dist/aopmem-darwin-arm64/aopmem: Mach-O 64-bit executable arm64
+42:dist/aopmem-windows-x86_64/aopmem.exe: PE32+ executable (console) x86-64, for MS Windows
+48:798af720030081367969fb36a2913de98956d700fbdd6e87ae176d4e05caaefc  dist/aopmem-darwin-arm64/aopmem
+49:d7d11a863c65877a31a203626764e3aaa2cc58c1403fbb37d6c1d22cdb17db0e  dist/aopmem-windows-x86_64/aopmem.exe
+55:PASS rtk cargo build
+56:PASS rtk cargo test: 164 passed
+57:PASS rtk cargo test --tests: 164 passed
+65:PASS no Node.js rewrite or npm start runtime found
+66:PASS no WSL primary install path found
+67:PASS no Linux support claim found
+74:PASS macOS ARM branch installs from dist/aopmem-darwin-arm64/aopmem
+75:PASS Windows x64 branch installs from dist\aopmem-windows-x86_64\aopmem.exe
+78:PASS WSL is explicitly not the Windows install path
+84:- Status: pending user VDI run.
+96:- Linux.
+97:- Windows ARM.
+98:- WSL.
+99:- Node.js rewrite.
+100:- CI/GitHub Actions.
+101:- New runtime features.
+105:- Ready for Windows VDI smoke: yes.
+106:- Ready to tag rc2 after Windows smoke: yes, if native Windows smoke passes.
+```
+exit: 0
+
+$ git status --short -- src tests Cargo.toml Cargo.lock install scripts dist docs .devplan
+```text
+ M .devplan/PROOF_LOG.md
+ M install/v0.1/install_prompt.md
+?? .devplan/RELEASE_CANDIDATE_v0.1.0-rc2.md
+?? .devplan/WINDOWS_BUILD_PROOF.md
+?? .devplan/WINDOWS_RC2_DOC_PATCH.md
+?? .devplan/WINDOWS_RC2_MAC_AUDIT_COMMANDS.log
+?? .devplan/WINDOWS_RC2_MAC_AUDIT_REPORT.md
+?? dist/aopmem-windows-x86_64/
+?? docs/WINDOWS_NATIVE_POWERSHELL_SMOKE.md
+?? scripts/build_windows_x64_from_macos.sh
+```
+exit: 0
+
+$ git diff --name-status
+```text
+M	.devplan/PROOF_LOG.md
+M	install/v0.1/install_prompt.md
+```
+exit: 0
+
+$ rg -n -i "Windows native proof|Explicitly out of scope|Release recommendation" .devplan/RELEASE_CANDIDATE_v0.1.0-rc2.md
+```text
+82:## Windows Native Proof
+94:## Explicitly Out Of Scope
+103:## Release Recommendation
+```
+exit: 0
+
+$ rg -n "^## (Windows Native Proof|Explicitly Out Of Scope|Release Recommendation)" .devplan/RELEASE_CANDIDATE_v0.1.0-rc2.md
+```text
+82:## Windows Native Proof
+94:## Explicitly Out Of Scope
+103:## Release Recommendation
+```
+exit: 0
+
+$ rg -n -F '$env:TEMP\aopmem-rc2-home' docs/WINDOWS_NATIVE_POWERSHELL_SMOKE.md
+```text
+40:$env:AOPMEM_HOME = "$env:TEMP\aopmem-rc2-home"
+```
+exit: 0
+
+$ rg -n -F '$env:TEMP\aopmem-rc2-repo' docs/WINDOWS_NATIVE_POWERSHELL_SMOKE.md
+```text
+41:$Repo = "$env:TEMP\aopmem-rc2-repo"
+```
+exit: 0
+
+$ rg -n -F '$env:AOPMEM_HOME\workspaces\...' docs/WINDOWS_NATIVE_POWERSHELL_SMOKE.md
+```text
+144:- `$env:AOPMEM_HOME\workspaces\...` exists.
+```
+exit: 0
+
+$ rg -n -F 'Test-Path "$Repo\.aopmem"' docs/WINDOWS_NATIVE_POWERSHELL_SMOKE.md
+```text
+113:  $RepoAopmemExists = Test-Path "$Repo\.aopmem"
+143:- `Test-Path "$Repo\.aopmem"` returns `False`.
+```
+exit: 0
+
+$ rg -n -- "No runtime behavior changed|no runtime behavior changed" .devplan/RELEASE_CANDIDATE_v0.1.0-rc2.md .devplan/WINDOWS_RC2_DOC_PATCH.md .devplan/PROOF_LOG.md
+```text
+.devplan/WINDOWS_RC2_DOC_PATCH.md:13:No runtime behavior changed.
+.devplan/PROOF_LOG.md:4918:PASS rc2 report explicitly says no runtime behavior changed.
+.devplan/RELEASE_CANDIDATE_v0.1.0-rc2.md:22:No runtime behavior changed from rc1.
+```
+exit: 0

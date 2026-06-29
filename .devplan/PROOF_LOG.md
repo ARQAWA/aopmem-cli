@@ -4820,3 +4820,104 @@ PASS temp install/init proof through AOPMEM_HOME
 Release recommendation:
 
 - RC ready for GitHub push and user-style install testing as `v0.1.0-rc1`.
+
+## RC_PREP_v0.1.0-rc2_WINDOWS_X64
+
+Status: `PASS`
+
+Objective:
+
+- Add Windows x64 native PowerShell build/install support without changing
+  runtime behavior.
+
+Files changed:
+
+- `scripts/build_windows_x64_from_macos.sh`
+- `dist/aopmem-windows-x86_64/aopmem.exe`
+- `install/v0.1/install_prompt.md`
+- `docs/WINDOWS_NATIVE_POWERSHELL_SMOKE.md`
+- `.devplan/WINDOWS_BUILD_PROOF.md`
+- `.devplan/RELEASE_CANDIDATE_v0.1.0-rc2.md`
+- `.devplan/PROOF_LOG.md`
+
+Commands run:
+
+```text
+bash scripts/build_windows_x64_from_macos.sh
+file dist/aopmem-windows-x86_64/aopmem.exe
+shasum -a 256 dist/aopmem-windows-x86_64/aopmem.exe
+bash -n scripts/build_windows_x64_from_macos.sh
+git diff --check
+rtk cargo test
+```
+
+Results:
+
+```text
+PASS Windows build used Docker fallback with messense/cargo-xwin
+PASS Windows artifact exists
+PASS Windows artifact is non-empty
+PASS binary file type: PE32+ executable (console) x86-64, for MS Windows
+PASS binary sha256:
+  d7d11a863c65877a31a203626764e3aaa2cc58c1403fbb37d6c1d22cdb17db0e
+PASS bash syntax check
+PASS git diff --check
+PASS cargo test: 164 passed
+PASS no src/** changes
+PASS no tests/** changes
+PASS no Linux, Windows ARM, WSL, CI, Node.js rewrite, or runtime feature drift
+```
+
+Runtime proof:
+
+- Not run on Mac.
+- Native Windows proof is documented in
+  `docs/WINDOWS_NATIVE_POWERSHELL_SMOKE.md`.
+
+Release recommendation:
+
+- RC2 is ready for native Windows 11 PowerShell smoke.
+
+## RC2_WINDOWS_DOC_PATCH
+
+Status: `PASS`
+
+Objective:
+
+- Close Windows rc2 Mac audit documentation findings without runtime changes.
+
+Files changed:
+
+- `docs/WINDOWS_NATIVE_POWERSHELL_SMOKE.md`
+- `.devplan/RELEASE_CANDIDATE_v0.1.0-rc2.md`
+- `.devplan/WINDOWS_RC2_DOC_PATCH.md`
+- `.devplan/PROOF_LOG.md`
+
+Commands run:
+
+```text
+rg required Windows smoke terms in docs/WINDOWS_NATIVE_POWERSHELL_SMOKE.md
+rg required rc2 report terms in .devplan/RELEASE_CANDIDATE_v0.1.0-rc2.md
+rg trailing whitespace check on changed docs
+git diff --check
+git status --short -- src tests Cargo.toml Cargo.lock install/v0.1/install_prompt.md
+```
+
+Results:
+
+```text
+PASS Windows smoke doc covers --version, --help, init, adapter seed,
+adapter status, doctor, recall, JSON ok=true checks, workspace under
+AOPMEM_HOME, Test-Path "$Repo\.aopmem" returns False, no .aopmem inside the
+target repo, and AGENTS.md managed block checks.
+PASS Windows smoke doc uses native PowerShell only, no WSL, no bash, and no
+cargo build.
+PASS rc2 report uses required Status, Scope, Evidence, Windows Native Proof,
+Explicitly Out Of Scope, and Release Recommendation sections.
+PASS rc2 report includes full macOS ARM artifact proof.
+PASS rc2 report explicitly says no runtime behavior changed.
+PASS no src/**, tests/**, Cargo.toml, or Cargo.lock changes in this patch.
+INFO install/v0.1/install_prompt.md had pre-existing modified status; this
+patch did not edit it.
+PASS native Windows smoke was not run on Mac.
+```

@@ -1,9 +1,9 @@
 Use this prompt to install and initialize AOPMem v0.1 for the current
 repository.
 
-```text
-You are installing AOPMem v0.1 into the user's current macOS Apple Silicon
-host and initializing it for the current repository.
+````text
+You are installing AOPMem v0.1 into the user's current host and initializing
+it for the current repository.
 
 Important rules:
 
@@ -16,8 +16,31 @@ Important rules:
 - No final confirmation ceremony.
 - If the managed AOPMem block already exists, update only that block.
 - If the managed block is damaged, stop with an explicit error.
-- If the host is not macOS Apple Silicon, stop and explain that v0.1 supports
-  only macOS ARM.
+- Do not build from source during user install when a matching binary artifact
+  exists.
+- If the matching binary artifact is missing, fail fast with:
+  binary artifact missing for current platform.
+- Do not create `.aopmem` in the target repository.
+- Do not use WSL as the Windows install path.
+
+Supported platforms:
+
+- macOS Apple Silicon:
+  - detect macOS + arm64 silently.
+  - install from `dist/aopmem-darwin-arm64/aopmem`.
+  - install to `~/.aopmem/bin/aopmem`.
+- Windows x64 native PowerShell:
+  - detect Windows + x64 silently.
+  - install from `dist\aopmem-windows-x86_64\aopmem.exe`.
+  - install to `%USERPROFILE%\.aopmem\bin\aopmem.exe`.
+  - use PowerShell commands only.
+  - use backslashes in Windows path examples.
+
+Unsupported platforms:
+
+- Linux is unsupported in v0.1 rc2.
+- Windows ARM is unsupported in v0.1 rc2.
+- Intel macOS is unsupported in v0.1 rc2.
 
 Silent technical detection:
 
@@ -27,27 +50,72 @@ Silent technical detection:
 - existing managed AOPMem block
 - whether AOPMem is already installed globally
 - workspace key
-- backend path under ~/.aopmem
+- backend path under the user-level AOPMem home
 - whether .understand.docs already exists
 
 Install flow:
 
 1. Check whether AOPMem is already installed globally.
-2. If missing, install the AOPMem CLI into ~/.aopmem/bin.
-3. Create and verify the required global directories under ~/.aopmem.
-4. Create or reuse the workspace for the current repository under
-   ~/.aopmem/workspaces/<workspace-key>.
-5. Ask whether to enable Understand Anything.
-6. If enabled, do best-effort local setup and create .understand.docs.
-7. Ask whether to enable Codebase Memory MCP.
-8. If enabled, do best-effort local setup.
-9. Ask the semantic project onboarding questions.
-10. Seed the collected semantic answers into AOPMem.
-11. Seed the required default kernel/contracts/gates data.
-12. Insert or update the managed AOPMem block in the current instruction file.
-13. Initialize local audit snapshots.
-14. Run `aopmem doctor`.
-15. Run the first recall bundle.
+2. Select the matching prebuilt binary for the current platform.
+3. If the matching binary artifact is missing, fail fast.
+4. If AOPMem is missing, install the AOPMem CLI into the user-level bin dir.
+5. Create and verify the required global directories under the user-level
+   AOPMem home.
+6. Create or reuse the workspace for the current repository under
+   <AOPMem home>/workspaces/<workspace-key>.
+7. Ask whether to enable Understand Anything.
+8. If enabled, do best-effort local setup and create .understand.docs.
+9. Ask whether to enable Codebase Memory MCP.
+10. If enabled, do best-effort local setup.
+11. Ask the semantic project onboarding questions.
+12. Seed the collected semantic answers into AOPMem.
+13. Seed the required default kernel/contracts/gates data.
+14. Insert or update the managed AOPMem block in the current instruction file.
+15. Initialize local audit snapshots.
+16. Run `aopmem doctor`.
+17. Run the first recall bundle.
+
+macOS Apple Silicon install commands:
+
+```sh
+mkdir -p "$HOME/.aopmem/bin"
+test -s "dist/aopmem-darwin-arm64/aopmem" || {
+  echo "binary artifact missing for current platform" >&2
+  exit 1
+}
+cp "dist/aopmem-darwin-arm64/aopmem" "$HOME/.aopmem/bin/aopmem"
+chmod 755 "$HOME/.aopmem/bin/aopmem"
+"$HOME/.aopmem/bin/aopmem" --version
+```
+
+Windows x64 native PowerShell install commands:
+
+```powershell
+$InstallDir = "$env:USERPROFILE\.aopmem\bin"
+New-Item -ItemType Directory -Force $InstallDir | Out-Null
+if (-not (Test-Path ".\dist\aopmem-windows-x86_64\aopmem.exe")) {
+  Write-Error "binary artifact missing for current platform"
+  exit 1
+}
+Copy-Item ".\dist\aopmem-windows-x86_64\aopmem.exe" "$InstallDir\aopmem.exe" -Force
+& "$InstallDir\aopmem.exe" --version
+```
+
+Temp proof paths:
+
+- macOS: use `AOPMEM_HOME` with a temp path outside the target repo.
+- Windows PowerShell: use `$env:AOPMEM_HOME`, for example:
+
+```powershell
+$env:AOPMEM_HOME = "$env:TEMP\aopmem-proof"
+```
+
+Workspace rule:
+
+- Create or reuse the workspace under the selected AOPMem home:
+  `workspaces\<workspace-key>` on Windows and `workspaces/<workspace-key>` on
+  macOS.
+- Do not create `.aopmem` in the target repository.
 
 Ask only these 5 user-facing questions, exactly in this order:
 
@@ -77,4 +145,4 @@ After install:
 - report any optional setup that was skipped or failed in best-effort mode
 - confirm doctor result
 - do not dump unnecessary technical detail unless there is an error
-```
+````
