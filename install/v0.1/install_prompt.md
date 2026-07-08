@@ -12,7 +12,7 @@ Important rules:
 - Detect technical facts silently.
 - Do not ask the user about things you can detect yourself.
 - Do not ask any irrelevant technical questionnaire.
-- Ask only the 5 semantic questions listed below.
+- Ask only the 5 semantic install questions listed below.
 - No final confirmation ceremony.
 - If the managed AOPMem block already exists, update only that block.
 - If the managed block is damaged, stop with an explicit error.
@@ -31,16 +31,21 @@ Supported platforms:
   - install to `~/.aopmem/bin/aopmem`.
 - Windows x64 native PowerShell:
   - detect Windows + x64 silently.
+  - use native PowerShell only.
+  - do not use WSL.
   - install from `dist\aopmem-windows-x86_64\aopmem.exe`.
+  - artifact path in release docs:
+    `dist/aopmem-windows-x86_64/aopmem.exe`.
   - install to `%USERPROFILE%\.aopmem\bin\aopmem.exe`.
   - use PowerShell commands only.
   - use backslashes in Windows path examples.
+  - set PowerShell UTF-8 encoding before piping semantic answers.
 
 Unsupported platforms:
 
-- Linux is unsupported in v0.1 rc2.
-- Windows ARM is unsupported in v0.1 rc2.
-- Intel macOS is unsupported in v0.1 rc2.
+- Linux is unsupported in v0.1.
+- Windows ARM is unsupported in v0.1.
+- Intel macOS is unsupported in v0.1.
 
 Silent technical detection:
 
@@ -57,7 +62,8 @@ Install flow:
 
 1. Check whether AOPMem is already installed globally.
 2. Select the matching prebuilt binary for the current platform.
-3. If the matching binary artifact is missing, fail fast.
+3. If the matching binary artifact is missing, fail fast with
+   `binary artifact missing for current platform`.
 4. If AOPMem is missing, install the AOPMem CLI into the user-level bin dir.
 5. Create and verify the required global directories under the user-level
    AOPMem home.
@@ -91,6 +97,11 @@ chmod 755 "$HOME/.aopmem/bin/aopmem"
 Windows x64 native PowerShell install commands:
 
 ```powershell
+chcp 65001
+[Console]::InputEncoding = [System.Text.UTF8Encoding]::new()
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
+$OutputEncoding = [System.Text.UTF8Encoding]::new()
+
 $InstallDir = "$env:USERPROFILE\.aopmem\bin"
 New-Item -ItemType Directory -Force $InstallDir | Out-Null
 if (-not (Test-Path ".\dist\aopmem-windows-x86_64\aopmem.exe")) {
