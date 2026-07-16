@@ -402,24 +402,12 @@ pub(crate) fn tools(
     );
     let after_id = decode_numeric_cursor(query.cursor.as_deref(), "tools", &scope)?;
     with_operational_read(context, |transaction| {
+        let (sql, parameters) = tools_page_sql(after_id, query, fetch_limit(query.limit)?);
         let mut statement = transaction
-            .prepare(
-                "SELECT tool_id, name, status, owner_workflow,
-                        side_effects, approval_requirement, id
-                 FROM tool_contracts
-                 WHERE id > ?1
-                   AND (?2 IS NULL OR status = ?2)
-                   AND (?3 IS NULL OR side_effects = ?3)
-                 ORDER BY id ASC LIMIT ?4",
-            )
+            .prepare(&sql)
             .map_err(|_| ApiError::data_unavailable())?;
         let mut rows = statement
-            .query(params![
-                after_id,
-                query.status.as_deref(),
-                query.side_effects.as_deref(),
-                fetch_limit(query.limit)?
-            ])
+            .query(rusqlite::params_from_iter(parameters))
             .map_err(|_| ApiError::data_unavailable())?;
         let mut items = Vec::new();
         while let Some(row) = rows.next().map_err(|_| ApiError::data_unavailable())? {
@@ -478,24 +466,12 @@ pub(crate) fn mcp(context: &UiDataContext, query: &McpQuery) -> Result<McpRespon
         return Err(ApiError::invalid_cursor());
     }
     with_operational_read(context, |transaction| {
+        let (sql, parameters) = mcp_page_sql(after_id.as_deref(), query, fetch_limit(query.limit)?);
         let mut statement = transaction
-            .prepare(
-                "SELECT id, name, kind, status, read_operations,
-                        write_operations, side_effects, approval_requirement
-                 FROM mcp_profiles
-                 WHERE (?1 IS NULL OR id > ?1)
-                   AND (?2 IS NULL OR status = ?2)
-                   AND (?3 IS NULL OR kind = ?3)
-                 ORDER BY id ASC LIMIT ?4",
-            )
+            .prepare(&sql)
             .map_err(|_| ApiError::data_unavailable())?;
         let mut rows = statement
-            .query(params![
-                after_id.as_deref(),
-                query.status.as_deref(),
-                query.kind.as_deref(),
-                fetch_limit(query.limit)?
-            ])
+            .query(rusqlite::params_from_iter(parameters))
             .map_err(|_| ApiError::data_unavailable())?;
         let mut items = Vec::new();
         while let Some(row) = rows.next().map_err(|_| ApiError::data_unavailable())? {
@@ -661,19 +637,21 @@ pub(crate) fn graph(
         return Err(ApiError::bad_request());
     }
     with_operational_read(context, |transaction| {
-        let page = match query.center {
-            Some(center) => load_center_graph_page(transaction, query, center)?,
-            None => load_memory_page(transaction, &memory_query, "graph")?,
-        };
-        let center_node = query
+        // Read once before cursor decoding so read and not-found errors keep precedence.
+        let stored_center_node = query
             .center
             .map(|center| {
                 storage::get_node(transaction, center)
                     .map_err(|_| ApiError::data_unavailable())?
                     .ok_or_else(ApiError::node_not_found)
-                    .map(memory_list_item_from_node)
             })
             .transpose()?;
+        let page = match query.center {
+            Some(center) => load_center_graph_page(transaction, query, center)?,
+            None => load_memory_page(transaction, &memory_query, "graph")?,
+        };
+        // Keep semantic validation after page loading, matching the existing error order.
+        let center_node = stored_center_node.map(memory_list_item_from_node);
         if let Some(center_node) = center_node.as_ref() {
             validate_memory_items(std::slice::from_ref(center_node))?;
         }
@@ -719,35 +697,13 @@ fn load_memory_page(
         Some(search) => Some(storage::fts_match_query(search).ok_or_else(ApiError::bad_request)?),
         None => None,
     };
-    let sql = if match_query.is_some() {
-        "SELECT nodes.id, nodes.node_type, nodes.status, nodes.title,
-                nodes.summary, nodes.source_ref, nodes.confidence,
-                nodes.trust_level, nodes.created_at, nodes.updated_at
-         FROM fts_nodes JOIN nodes ON nodes.id = fts_nodes.rowid
-         WHERE fts_nodes MATCH ?4 AND nodes.id > ?1
-           AND (?2 IS NULL OR nodes.node_type = ?2)
-           AND (?3 IS NULL OR nodes.status = ?3)
-         ORDER BY nodes.id ASC LIMIT ?5"
-    } else {
-        "SELECT id, node_type, status, title, summary, source_ref,
-                confidence, trust_level, created_at, updated_at
-         FROM nodes
-         WHERE id > ?1 AND (?2 IS NULL OR node_type = ?2)
-           AND (?3 IS NULL OR status = ?3)
-         ORDER BY id ASC LIMIT ?5"
-    };
+    let (sql, parameters) = memory_page_sql(after_id, query, match_query.as_deref(), fetch_limit);
     let mut statement = transaction
-        .prepare(sql)
+        .prepare(&sql)
         .map_err(|_| ApiError::data_unavailable())?;
     let mut items = statement
         .query_map(
-            params![
-                after_id,
-                query.node_type.as_deref(),
-                query.status.as_deref(),
-                match_query.as_deref(),
-                fetch_limit
-            ],
+            rusqlite::params_from_iter(parameters),
             row_to_memory_list_item,
         )
         .map_err(|_| ApiError::data_unavailable())?
@@ -769,18 +725,117 @@ fn load_memory_page(
     })
 }
 
+fn tools_page_sql(
+    after_id: i64,
+    query: &ToolsQuery,
+    fetch_limit: i64,
+) -> (String, Vec<rusqlite::types::Value>) {
+    let mut sql = String::from(
+        "SELECT tool_id, name, status, owner_workflow,
+                side_effects, approval_requirement, id
+         FROM tool_contracts
+         WHERE id > ?",
+    );
+    let mut parameters = vec![rusqlite::types::Value::Integer(after_id)];
+    if let Some(status) = query.status.as_deref() {
+        sql.push_str(" AND status = ?");
+        parameters.push(rusqlite::types::Value::Text(status.to_string()));
+    }
+    if let Some(side_effects) = query.side_effects.as_deref() {
+        sql.push_str(" AND side_effects = ?");
+        parameters.push(rusqlite::types::Value::Text(side_effects.to_string()));
+    }
+    sql.push_str(" ORDER BY id ASC LIMIT ?");
+    parameters.push(rusqlite::types::Value::Integer(fetch_limit));
+    (sql, parameters)
+}
+
+fn mcp_page_sql(
+    after_id: Option<&str>,
+    query: &McpQuery,
+    fetch_limit: i64,
+) -> (String, Vec<rusqlite::types::Value>) {
+    let mut sql = String::from(
+        "SELECT id, name, kind, status, read_operations,
+                write_operations, side_effects, approval_requirement
+         FROM mcp_profiles
+         WHERE 1 = 1",
+    );
+    let mut parameters = Vec::new();
+    if let Some(after_id) = after_id {
+        sql.push_str(" AND id > ?");
+        parameters.push(rusqlite::types::Value::Text(after_id.to_string()));
+    }
+    if let Some(status) = query.status.as_deref() {
+        sql.push_str(" AND status = ?");
+        parameters.push(rusqlite::types::Value::Text(status.to_string()));
+    }
+    if let Some(kind) = query.kind.as_deref() {
+        sql.push_str(" AND kind = ?");
+        parameters.push(rusqlite::types::Value::Text(kind.to_string()));
+    }
+    sql.push_str(" ORDER BY id ASC LIMIT ?");
+    parameters.push(rusqlite::types::Value::Integer(fetch_limit));
+    (sql, parameters)
+}
+
+fn memory_page_sql(
+    after_id: i64,
+    query: &MemoryQuery,
+    match_query: Option<&str>,
+    fetch_limit: i64,
+) -> (String, Vec<rusqlite::types::Value>) {
+    let (mut sql, mut parameters) = if let Some(match_query) = match_query {
+        (
+            String::from(
+                "SELECT nodes.id, nodes.node_type, nodes.status, nodes.title,
+                        nodes.summary, nodes.source_ref, nodes.confidence,
+                        nodes.trust_level, nodes.created_at, nodes.updated_at
+                 FROM fts_nodes JOIN nodes ON nodes.id = fts_nodes.rowid
+                 WHERE fts_nodes MATCH ? AND nodes.id > ?",
+            ),
+            vec![
+                rusqlite::types::Value::Text(match_query.to_string()),
+                rusqlite::types::Value::Integer(after_id),
+            ],
+        )
+    } else {
+        (
+            String::from(
+                "SELECT id, node_type, status, title, summary, source_ref,
+                        confidence, trust_level, created_at, updated_at
+                 FROM nodes
+                 WHERE id > ?",
+            ),
+            vec![rusqlite::types::Value::Integer(after_id)],
+        )
+    };
+    let prefix = if match_query.is_some() { "nodes." } else { "" };
+    if let Some(node_type) = query.node_type.as_deref() {
+        sql.push_str(" AND ");
+        sql.push_str(prefix);
+        sql.push_str("node_type = ?");
+        parameters.push(rusqlite::types::Value::Text(node_type.to_string()));
+    }
+    if let Some(status) = query.status.as_deref() {
+        sql.push_str(" AND ");
+        sql.push_str(prefix);
+        sql.push_str("status = ?");
+        parameters.push(rusqlite::types::Value::Text(status.to_string()));
+    }
+    sql.push_str(" ORDER BY ");
+    sql.push_str(prefix);
+    sql.push_str("id ASC LIMIT ?");
+    parameters.push(rusqlite::types::Value::Integer(fetch_limit));
+    (sql, parameters)
+}
+
 fn load_center_graph_page(
     transaction: &Transaction<'_>,
     query: &GraphQuery,
     center: i64,
 ) -> Result<MemoryPage, ApiError> {
     let page_limit = query.limit.min(MAX_GRAPH_NODES.saturating_sub(1));
-    if storage::get_node(transaction, center)
-        .map_err(|_| ApiError::data_unavailable())?
-        .is_none()
-    {
-        return Err(ApiError::node_not_found());
-    }
     let scope = format!(
         "type={};status={};center={center}",
         query.node_type.as_deref().unwrap_or(""),
@@ -1214,4 +1269,101 @@ fn validate_links<'a>(links: impl Iterator<Item = &'a storage::Link>) -> Result<
 
 fn valid_timestamp(value: &str) -> bool {
     !value.is_empty() && value.len() <= 64 && !value.chars().any(char::is_control)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    fn query_plan(
+        connection: &Connection,
+        sql: &str,
+        parameters: Vec<rusqlite::types::Value>,
+    ) -> String {
+        let explain = format!("EXPLAIN QUERY PLAN {sql}");
+        let mut statement = connection
+            .prepare(&explain)
+            .expect("UI query plan should prepare");
+        statement
+            .query_map(rusqlite::params_from_iter(parameters), |row| {
+                row.get::<_, String>(3)
+            })
+            .expect("UI query plan should run")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("UI query plan should collect")
+            .join("\n")
+    }
+
+    #[test]
+    fn filtered_ui_page_queries_use_existing_targeted_indexes() {
+        let mut connection =
+            Connection::open_in_memory().expect("in-memory UI query-plan DB should open");
+        crate::schema::apply_migrations(&mut connection)
+            .expect("UI query-plan schema should migrate");
+
+        for (query, expected_index) in [
+            (
+                MemoryQuery {
+                    limit: 10,
+                    node_type: Some("workflow".to_string()),
+                    ..MemoryQuery::default()
+                },
+                "idx_nodes_type",
+            ),
+            (
+                MemoryQuery {
+                    limit: 10,
+                    status: Some("active".to_string()),
+                    ..MemoryQuery::default()
+                },
+                "idx_nodes_status",
+            ),
+        ] {
+            let (sql, parameters) = memory_page_sql(0, &query, None, 11);
+            let plan = query_plan(&connection, &sql, parameters);
+            assert!(
+                plan.contains(expected_index),
+                "memory query must use {expected_index}, got: {plan}"
+            );
+        }
+
+        let tools_query = ToolsQuery {
+            limit: 10,
+            status: Some("active".to_string()),
+            ..ToolsQuery::default()
+        };
+        let (sql, parameters) = tools_page_sql(0, &tools_query, 11);
+        let plan = query_plan(&connection, &sql, parameters);
+        assert!(
+            plan.contains("idx_tool_contracts_status"),
+            "tools query must use idx_tool_contracts_status, got: {plan}"
+        );
+
+        for (query, expected_index) in [
+            (
+                McpQuery {
+                    limit: 10,
+                    status: Some("installed".to_string()),
+                    ..McpQuery::default()
+                },
+                "idx_mcp_profiles_status",
+            ),
+            (
+                McpQuery {
+                    limit: 10,
+                    kind: Some("stdio".to_string()),
+                    ..McpQuery::default()
+                },
+                "idx_mcp_profiles_kind",
+            ),
+        ] {
+            let (sql, parameters) = mcp_page_sql(None, &query, 11);
+            let plan = query_plan(&connection, &sql, parameters);
+            assert!(
+                plan.contains(expected_index),
+                "MCP query must use {expected_index}, got: {plan}"
+            );
+        }
+    }
 }

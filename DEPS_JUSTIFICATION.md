@@ -1,6 +1,6 @@
 # Dependencies Justification
 
-AOPMem v0.2.0-rc1 keeps one native Rust binary and a local-only runtime.
+AOPMem v0.2.0-rc2 keeps one native Rust binary and a local-only runtime.
 Every direct dependency in `Cargo.toml` is listed below. Release builds use
 `Cargo.lock` through `cargo build --locked`.
 

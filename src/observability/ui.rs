@@ -348,34 +348,19 @@ fn activity_in_transaction(
     scope: &str,
     cursor: Option<(String, String)>,
 ) -> Result<ActivityResponse, UiReadError> {
-    let (cursor_timestamp, cursor_id) = cursor
-        .map(|(timestamp, id)| (Some(timestamp), Some(id)))
-        .unwrap_or((None, None));
+    let (sql, parameters) = activity_page_sql(
+        workspace_key,
+        query,
+        cursor
+            .as_ref()
+            .map(|(timestamp, id)| (timestamp.as_str(), id.as_str())),
+        fetch_limit(query.limit)?,
+    );
     let mut statement = transaction
-        .prepare(
-            "SELECT id, timestamp, product_version, workspace_key, event_type,
-                    command, correlation_id, bundle_id, duration_ms, outcome,
-                    error_code, payload_json
-             FROM observability_events
-             WHERE workspace_key = ?1
-               AND (?2 IS NULL OR event_type = ?2)
-               AND (?3 IS NULL OR outcome = ?3)
-               AND (?4 IS NULL OR command = ?4)
-               AND (?5 IS NULL OR timestamp < ?5
-                    OR (timestamp = ?5 AND id < ?6))
-             ORDER BY timestamp DESC, id DESC LIMIT ?7",
-        )
+        .prepare(&sql)
         .map_err(|_| UiReadError::Unavailable)?;
     let mut rows = statement
-        .query(params![
-            workspace_key,
-            query.event_type.as_deref(),
-            query.outcome.as_deref(),
-            query.command.as_deref(),
-            cursor_timestamp.as_deref(),
-            cursor_id.as_deref(),
-            fetch_limit(query.limit)?
-        ])
+        .query(rusqlite::params_from_iter(parameters))
         .map_err(|_| UiReadError::Unavailable)?;
     let mut items = Vec::new();
     while let Some(row) = rows.next().map_err(|_| UiReadError::Unavailable)? {
@@ -397,6 +382,43 @@ fn activity_in_transaction(
         next_cursor,
         complete: !more_results,
     })
+}
+
+fn activity_page_sql(
+    workspace_key: &str,
+    query: &ActivityQuery,
+    cursor: Option<(&str, &str)>,
+    fetch_limit: i64,
+) -> (String, Vec<rusqlite::types::Value>) {
+    let mut sql = String::from(
+        "SELECT id, timestamp, product_version, workspace_key, event_type,
+                command, correlation_id, bundle_id, duration_ms, outcome,
+                error_code, payload_json
+         FROM observability_events
+         WHERE workspace_key = ?",
+    );
+    let mut parameters = vec![rusqlite::types::Value::Text(workspace_key.to_string())];
+    if let Some(event_type) = query.event_type.as_deref() {
+        sql.push_str(" AND event_type = ?");
+        parameters.push(rusqlite::types::Value::Text(event_type.to_string()));
+    }
+    if let Some(outcome) = query.outcome.as_deref() {
+        sql.push_str(" AND outcome = ?");
+        parameters.push(rusqlite::types::Value::Text(outcome.to_string()));
+    }
+    if let Some(command) = query.command.as_deref() {
+        sql.push_str(" AND command = ?");
+        parameters.push(rusqlite::types::Value::Text(command.to_string()));
+    }
+    if let Some((timestamp, id)) = cursor {
+        sql.push_str(" AND (timestamp < ? OR (timestamp = ? AND id < ?))");
+        parameters.push(rusqlite::types::Value::Text(timestamp.to_string()));
+        parameters.push(rusqlite::types::Value::Text(timestamp.to_string()));
+        parameters.push(rusqlite::types::Value::Text(id.to_string()));
+    }
+    sql.push_str(" ORDER BY timestamp DESC, id DESC LIMIT ?");
+    parameters.push(rusqlite::types::Value::Integer(fetch_limit));
+    (sql, parameters)
 }
 
 fn activity_item_from_row(
@@ -430,21 +452,56 @@ fn activity_item_from_row(
     })
 }
 
+const LATEST_ERRORS_SQL: &str = r#"
+WITH
+failure AS (
+    SELECT id, timestamp, product_version, workspace_key, event_type,
+           command, correlation_id, bundle_id, duration_ms, outcome,
+           error_code, payload_json
+    FROM observability_events
+    WHERE workspace_key = ?1 AND outcome = 'failure'
+    ORDER BY timestamp DESC, id DESC
+    LIMIT ?2
+),
+timeout AS (
+    SELECT id, timestamp, product_version, workspace_key, event_type,
+           command, correlation_id, bundle_id, duration_ms, outcome,
+           error_code, payload_json
+    FROM observability_events
+    WHERE workspace_key = ?1 AND outcome = 'timeout'
+    ORDER BY timestamp DESC, id DESC
+    LIMIT ?2
+),
+overflow AS (
+    SELECT id, timestamp, product_version, workspace_key, event_type,
+           command, correlation_id, bundle_id, duration_ms, outcome,
+           error_code, payload_json
+    FROM observability_events
+    WHERE workspace_key = ?1 AND outcome = 'overflow'
+    ORDER BY timestamp DESC, id DESC
+    LIMIT ?2
+)
+SELECT id, timestamp, product_version, workspace_key, event_type,
+       command, correlation_id, bundle_id, duration_ms, outcome,
+       error_code, payload_json
+FROM (
+    SELECT * FROM failure
+    UNION ALL
+    SELECT * FROM timeout
+    UNION ALL
+    SELECT * FROM overflow
+)
+ORDER BY timestamp DESC, id DESC
+LIMIT ?2
+"#;
+
 fn load_latest_errors(
     transaction: &Transaction<'_>,
     workspace_key: &str,
     limit: usize,
 ) -> Result<(Vec<ActivityItem>, bool), UiReadError> {
     let mut statement = transaction
-        .prepare(
-            "SELECT id, timestamp, product_version, workspace_key, event_type,
-                    command, correlation_id, bundle_id, duration_ms, outcome,
-                    error_code, payload_json
-             FROM observability_events
-             WHERE workspace_key = ?1
-               AND outcome IN ('failure', 'timeout', 'overflow')
-             ORDER BY timestamp DESC, id DESC LIMIT ?2",
-        )
+        .prepare(LATEST_ERRORS_SQL)
         .map_err(|_| UiReadError::Unavailable)?;
     let mut rows = statement
         .query(params![workspace_key, fetch_limit(limit)?])
@@ -755,4 +812,235 @@ fn valid_identifier(value: &str) -> bool {
 
 fn ui_to_sql_error(_error: UiReadError) -> rusqlite::Error {
     rusqlite::Error::InvalidQuery
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    const LEGACY_LATEST_ERRORS_SQL: &str =
+        "SELECT id, timestamp, product_version, workspace_key, event_type,
+                command, correlation_id, bundle_id, duration_ms, outcome,
+                error_code, payload_json
+         FROM observability_events
+         WHERE workspace_key = ?1
+           AND outcome IN ('failure', 'timeout', 'overflow')
+         ORDER BY timestamp DESC, id DESC LIMIT ?2";
+
+    fn query_plan(connection: &Connection, query: &ActivityQuery) -> String {
+        let cursor = Some((
+            "2026-01-02T03:04:05.000Z",
+            "550e8400-e29b-41d4-a716-446655440000",
+        ));
+        let (sql, parameters) = activity_page_sql("workspace", query, cursor, 11);
+        let explain = format!("EXPLAIN QUERY PLAN {sql}");
+        let mut statement = connection
+            .prepare(&explain)
+            .expect("activity query plan should prepare");
+        statement
+            .query_map(rusqlite::params_from_iter(parameters), |row| {
+                row.get::<_, String>(3)
+            })
+            .expect("activity query plan should run")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("activity query plan should collect")
+            .join("\n")
+    }
+
+    fn latest_error_rows(
+        connection: &Connection,
+        sql: &str,
+        workspace_key: &str,
+        limit: i64,
+    ) -> Vec<(String, String, String, String)> {
+        let mut statement = connection
+            .prepare(sql)
+            .expect("latest-errors query should prepare");
+        statement
+            .query_map(rusqlite::params![workspace_key, limit], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(3)?, row.get(9)?))
+            })
+            .expect("latest-errors query should run")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("latest-errors rows should collect")
+    }
+
+    fn insert_latest_error_fixture(
+        connection: &Connection,
+        id: &str,
+        timestamp: &str,
+        workspace_key: &str,
+        outcome: &str,
+    ) {
+        connection
+            .execute(
+                "INSERT INTO observability_events (
+                    id, timestamp, product_version, workspace_key, event_type,
+                    command, correlation_id, bundle_id, duration_ms, outcome,
+                    error_code, payload_json
+                 ) VALUES (?1, ?2, 'test', ?3, 'doctor', 'fixture', ?4,
+                           NULL, 1, ?5, 'TEST_ERROR', '{}')",
+                rusqlite::params![
+                    id,
+                    timestamp,
+                    workspace_key,
+                    format!("correlation-{id}"),
+                    outcome
+                ],
+            )
+            .expect("latest-errors fixture should insert");
+    }
+
+    #[test]
+    fn filtered_activity_queries_use_existing_targeted_indexes() {
+        let connection =
+            Connection::open_in_memory().expect("in-memory activity query-plan DB should open");
+        connection
+            .execute_batch(super::super::EVENTS_TABLE_SQL)
+            .expect("activity query-plan table should create");
+        for (name, sql) in super::super::INDEX_DEFINITIONS {
+            if name.starts_with("idx_observability_events_") {
+                connection
+                    .execute_batch(sql)
+                    .expect("activity query-plan index should create");
+            }
+        }
+
+        for (query, expected_index) in [
+            (
+                ActivityQuery {
+                    limit: 10,
+                    event_type: Some("doctor".to_string()),
+                    ..ActivityQuery::default()
+                },
+                "idx_observability_events_event_type",
+            ),
+            (
+                ActivityQuery {
+                    limit: 10,
+                    outcome: Some("failure".to_string()),
+                    ..ActivityQuery::default()
+                },
+                "idx_observability_events_outcome",
+            ),
+            (
+                ActivityQuery {
+                    limit: 10,
+                    command: Some("ui-test".to_string()),
+                    ..ActivityQuery::default()
+                },
+                "idx_observability_events_command",
+            ),
+        ] {
+            let plan = query_plan(&connection, &query);
+            assert!(
+                plan.contains(expected_index),
+                "activity query must use {expected_index}, got: {plan}"
+            );
+        }
+    }
+
+    #[test]
+    fn latest_errors_bounded_union_matches_legacy_and_excludes_non_errors() {
+        let connection =
+            Connection::open_in_memory().expect("in-memory latest-errors DB should open");
+        connection
+            .execute_batch(super::super::EVENTS_TABLE_SQL)
+            .expect("latest-errors table should create");
+        for (id, timestamp, workspace_key, outcome) in [
+            ("z-tie", "2026-01-05T00:00:00.000Z", "workspace", "failure"),
+            ("y-tie", "2026-01-05T00:00:00.000Z", "workspace", "timeout"),
+            ("x-tie", "2026-01-05T00:00:00.000Z", "workspace", "overflow"),
+            (
+                "failure-4",
+                "2026-01-04T00:00:00.000Z",
+                "workspace",
+                "failure",
+            ),
+            (
+                "timeout-3",
+                "2026-01-03T00:00:00.000Z",
+                "workspace",
+                "timeout",
+            ),
+            (
+                "overflow-2",
+                "2026-01-02T00:00:00.000Z",
+                "workspace",
+                "overflow",
+            ),
+            (
+                "failure-1",
+                "2026-01-01T00:00:00.000Z",
+                "workspace",
+                "failure",
+            ),
+            (
+                "overflow-0",
+                "2025-12-31T00:00:00.000Z",
+                "workspace",
+                "overflow",
+            ),
+            ("foreign", "2026-01-09T00:00:00.000Z", "other", "failure"),
+            (
+                "success",
+                "2026-01-08T00:00:00.000Z",
+                "workspace",
+                "success",
+            ),
+        ] {
+            insert_latest_error_fixture(&connection, id, timestamp, workspace_key, outcome);
+        }
+
+        for limit in [1, 2, 3, 5, 8, 20] {
+            assert_eq!(
+                latest_error_rows(&connection, LATEST_ERRORS_SQL, "workspace", limit),
+                latest_error_rows(&connection, LEGACY_LATEST_ERRORS_SQL, "workspace", limit),
+                "bounded query changed rows for limit {limit}"
+            );
+        }
+
+        let rows = latest_error_rows(&connection, LATEST_ERRORS_SQL, "workspace", 20);
+        assert_eq!(rows.len(), 8);
+        assert!(rows.iter().all(|(_, _, workspace_key, outcome)| {
+            workspace_key == "workspace"
+                && matches!(outcome.as_str(), "failure" | "timeout" | "overflow")
+        }));
+        assert!(rows.windows(2).all(|pair| {
+            pair[0].1 > pair[1].1 || (pair[0].1 == pair[1].1 && pair[0].0 > pair[1].0)
+        }));
+    }
+
+    #[test]
+    fn latest_errors_bounded_union_uses_outcome_index_per_branch() {
+        let connection =
+            Connection::open_in_memory().expect("in-memory latest-errors plan DB should open");
+        connection
+            .execute_batch(super::super::EVENTS_TABLE_SQL)
+            .expect("latest-errors plan table should create");
+        connection
+            .execute_batch(
+                "CREATE INDEX idx_observability_events_outcome
+                 ON observability_events(outcome, timestamp)",
+            )
+            .expect("latest-errors outcome index should create");
+        let explain = format!("EXPLAIN QUERY PLAN {LATEST_ERRORS_SQL}");
+        let mut statement = connection
+            .prepare(&explain)
+            .expect("latest-errors query plan should prepare");
+        let plan = statement
+            .query_map(rusqlite::params!["workspace", 11], |row| {
+                row.get::<_, String>(3)
+            })
+            .expect("latest-errors query plan should run")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("latest-errors query plan should collect")
+            .join("\n");
+
+        assert!(
+            plan.matches("idx_observability_events_outcome").count() >= 3,
+            "each outcome branch must use the outcome index, got: {plan}"
+        );
+    }
 }

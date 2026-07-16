@@ -38,6 +38,15 @@ const SQL_WRITE_CHUNK_BYTES: usize = 8 * 1024;
 const HEX_INPUT_CHUNK_BYTES: usize = SQL_WRITE_CHUNK_BYTES / 2;
 const HEX_DIGITS: &[u8; 16] = b"0123456789ABCDEF";
 const MAX_AUDIT_GIT_METADATA_ENTRIES: usize = 200_000;
+const INSERT_EVENT_SQL: &str = "
+    INSERT INTO events (type, source, subject_kind, subject_id)
+    VALUES (?1, ?2, ?3, ?4);
+";
+const GET_EVENT_SQL: &str = "
+    SELECT id, type, timestamp, source, subject_kind, subject_id
+    FROM events
+    WHERE id = ?1;
+";
 
 /// Process-wide and cross-process serialization for snapshot publication.
 ///
@@ -622,13 +631,9 @@ fn record_event(
 ) -> Result<Event, AuditError> {
     validate_event(event_type, source, subject_kind, subject_id)?;
 
-    connection.execute(
-        "
-        INSERT INTO events (type, source, subject_kind, subject_id)
-        VALUES (?1, ?2, ?3, ?4);
-        ",
-        params![event_type, source, subject_kind, subject_id],
-    )?;
+    connection
+        .prepare_cached(INSERT_EVENT_SQL)?
+        .execute(params![event_type, source, subject_kind, subject_id])?;
 
     let id = connection.last_insert_rowid();
     get_event(connection, id)?.ok_or(AuditError::Db(rusqlite::Error::QueryReturnedNoRows))
@@ -659,17 +664,8 @@ fn validate_event(
 }
 
 fn get_event(connection: &Connection, id: i64) -> rusqlite::Result<Option<Event>> {
-    connection
-        .query_row(
-            "
-            SELECT id, type, timestamp, source, subject_kind, subject_id
-            FROM events
-            WHERE id = ?1;
-            ",
-            [id],
-            row_to_event,
-        )
-        .optional()
+    let mut statement = connection.prepare_cached(GET_EVENT_SQL)?;
+    statement.query_row([id], row_to_event).optional()
 }
 
 fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {

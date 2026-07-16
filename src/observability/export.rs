@@ -685,22 +685,27 @@ fn open_optional_observability_reader(
     }
 }
 
+const DETERMINISTIC_REFERENCE_SQL: &str = r#"
+SELECT MAX(timestamp) FROM (
+    SELECT MAX(timestamp) AS timestamp FROM observability_events
+    UNION ALL
+    SELECT MAX(timestamp) FROM recall_bundles
+    UNION ALL
+    SELECT MAX(first_seen_at) FROM bundle_nodes
+    UNION ALL
+    SELECT MAX(timestamp) FROM feedback
+    UNION ALL
+    SELECT MAX(last_retention_at) FROM collector_state
+    UNION ALL
+    SELECT MAX(retention_floor_at) FROM collector_state
+)
+"#;
+
 fn deterministic_reference_at(
     transaction: &Transaction<'_>,
 ) -> Result<ReportTimestamp, ExportError> {
     let value: Option<String> = transaction
-        .query_row(
-            "SELECT MAX(timestamp) FROM (
-                SELECT timestamp FROM observability_events
-                UNION ALL SELECT timestamp FROM recall_bundles
-                UNION ALL SELECT first_seen_at AS timestamp FROM bundle_nodes
-                UNION ALL SELECT timestamp FROM feedback
-                UNION ALL SELECT last_retention_at AS timestamp FROM collector_state
-                UNION ALL SELECT retention_floor_at AS timestamp FROM collector_state
-             )",
-            [],
-            |row| row.get(0),
-        )
+        .query_row(DETERMINISTIC_REFERENCE_SQL, [], |row| row.get(0))
         .map_err(|_| ExportError::Observability(ObserveReadError::ReadFailed))?;
     ReportTimestamp::parse(value.as_deref().unwrap_or(FIXED_EMPTY_REFERENCE_AT))
         .map_err(ExportError::Observability)
@@ -1601,6 +1606,14 @@ mod tests {
     const BUNDLE_ID: &str = "33333333-3333-4333-8333-333333333333";
     const FEEDBACK_ID: &str = "44444444-4444-4444-8444-444444444444";
     const DOCTOR_ID: &str = "55555555-5555-4555-8555-555555555555";
+    const LEGACY_DETERMINISTIC_REFERENCE_SQL: &str = "SELECT MAX(timestamp) FROM (
+            SELECT timestamp FROM observability_events
+            UNION ALL SELECT timestamp FROM recall_bundles
+            UNION ALL SELECT first_seen_at AS timestamp FROM bundle_nodes
+            UNION ALL SELECT timestamp FROM feedback
+            UNION ALL SELECT last_retention_at AS timestamp FROM collector_state
+            UNION ALL SELECT retention_floor_at AS timestamp FROM collector_state
+         )";
 
     struct TestWorkspace {
         paths: WorkspacePaths,
@@ -1916,6 +1929,130 @@ mod tests {
                 },
             )
             .expect("observability counts should read")
+    }
+
+    fn reference_value(connection: &Connection, sql: &str) -> Option<String> {
+        connection
+            .query_row(sql, [], |row| row.get(0))
+            .expect("reference timestamp query should read")
+    }
+
+    #[test]
+    fn deterministic_reference_max_per_branch_matches_legacy_null_semantics() {
+        let workspace = TestWorkspace::new("reference-parity");
+        initialize_observability(&workspace);
+        mutate_database(workspace.paths.observability_db(), |connection| {
+            assert_eq!(
+                reference_value(connection, DETERMINISTIC_REFERENCE_SQL),
+                reference_value(connection, LEGACY_DETERMINISTIC_REFERENCE_SQL)
+            );
+            assert_eq!(
+                reference_value(connection, DETERMINISTIC_REFERENCE_SQL),
+                None
+            );
+
+            connection
+                .execute(
+                    "INSERT INTO observability_events (
+                        id, timestamp, product_version, workspace_key, event_type,
+                        command, correlation_id, bundle_id, duration_ms, outcome,
+                        error_code, payload_json
+                     ) VALUES (?1, '2026-01-01T00:00:00.000Z', 'test', ?2,
+                               'install.completed', 'fixture', ?3, NULL, 1,
+                               'success', NULL, ?4)",
+                    params![
+                        EVENT_ID,
+                        workspace.key,
+                        CORRELATION_ID,
+                        r#"{"kind":"empty"}"#
+                    ],
+                )
+                .expect("reference event should insert");
+            connection
+                .execute(
+                    "INSERT INTO recall_bundles (
+                        bundle_id, timestamp, product_version, workspace_key,
+                        correlation_id, outcome, error_code, duration_ms,
+                        more_results, continuation_count
+                     ) VALUES (?1, '2026-01-02T00:00:00.000Z', 'test', ?2,
+                               ?3, 'success', NULL, 1, 0, 0)",
+                    params![BUNDLE_ID, workspace.key, CORRELATION_ID],
+                )
+                .expect("reference bundle should insert");
+            connection
+                .execute(
+                    "INSERT INTO bundle_nodes (
+                        bundle_id, node_id, first_seen_at, node_type, node_title,
+                        bounded_summary, source_ref, trust_level, confidence,
+                        score, selection_reasons_json
+                     ) VALUES (?1, 1, '2026-01-03T00:00:00.000Z', 'workflow',
+                               'Reference workflow', NULL, NULL, NULL, NULL,
+                               NULL, ?2)",
+                    params![BUNDLE_ID, r#"["typed_root"]"#],
+                )
+                .expect("reference bundle node should insert");
+            connection
+                .execute(
+                    "INSERT INTO feedback (id, timestamp, bundle_id, outcome, reason)
+                     VALUES (?1, '2026-01-06T00:00:00.000Z', ?2, 'useful', NULL)",
+                    params![FEEDBACK_ID, BUNDLE_ID],
+                )
+                .expect("reference feedback should insert");
+            connection
+                .execute(
+                    "UPDATE collector_state
+                     SET last_retention_at = '2026-01-06T00:00:00.000Z',
+                         retention_floor_at = '2026-01-04T00:00:00.000Z'
+                     WHERE singleton_id = 1",
+                    [],
+                )
+                .expect("reference collector state should update");
+
+            let optimized = reference_value(connection, DETERMINISTIC_REFERENCE_SQL);
+            assert_eq!(
+                optimized,
+                reference_value(connection, LEGACY_DETERMINISTIC_REFERENCE_SQL)
+            );
+            assert_eq!(optimized.as_deref(), Some("2026-01-06T00:00:00.000Z"));
+            let transaction = connection
+                .unchecked_transaction()
+                .expect("reference transaction should start");
+            let reference = deterministic_reference_at(&transaction)
+                .expect("optimized deterministic reference should read");
+            assert_eq!(reference.as_str(), "2026-01-06T00:00:00.000Z");
+            transaction
+                .commit()
+                .expect("reference transaction should commit");
+        });
+    }
+
+    #[test]
+    fn deterministic_reference_max_per_branch_uses_timestamp_indexes() {
+        let workspace = TestWorkspace::new("reference-plan");
+        initialize_observability(&workspace);
+        mutate_database(workspace.paths.observability_db(), |connection| {
+            let explain = format!("EXPLAIN QUERY PLAN {DETERMINISTIC_REFERENCE_SQL}");
+            let mut statement = connection
+                .prepare(&explain)
+                .expect("reference query plan should prepare");
+            let plan = statement
+                .query_map([], |row| row.get::<_, String>(3))
+                .expect("reference query plan should run")
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .expect("reference query plan should collect")
+                .join("\n");
+            for index in [
+                "idx_observability_events_timestamp",
+                "idx_recall_bundles_timestamp",
+                "idx_bundle_nodes_first_seen_at",
+                "idx_feedback_timestamp",
+            ] {
+                assert!(
+                    plan.contains(index),
+                    "reference query plan did not use {index}: {plan}"
+                );
+            }
+        });
     }
 
     #[test]

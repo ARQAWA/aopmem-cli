@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::env;
 use std::ffi::OsStr;
 use std::fmt;
@@ -39,6 +39,85 @@ const TEACH_PROPOSAL_LINK_TYPE: &str = "teach_has_proposal";
 const TEACH_APPLY_LINK_TYPE: &str = "teach_has_apply";
 const TEACH_CREATED_LINK_TYPE: &str = "teach_created_node";
 const TEACH_APPLY_SAVEPOINT: &str = "aopmem_teach_apply";
+const INSERT_NODE_SQL: &str = "
+    INSERT INTO nodes (
+        node_type,
+        status,
+        title,
+        summary,
+        body,
+        source_ref,
+        confidence,
+        trust_level
+    )
+    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8);
+";
+const GET_NODE_SQL: &str = "
+    SELECT
+        id,
+        node_type,
+        status,
+        title,
+        summary,
+        body,
+        source_ref,
+        confidence,
+        trust_level,
+        created_at,
+        updated_at
+    FROM nodes
+    WHERE id = ?1;
+";
+const INSERT_LINK_SQL: &str = "
+    INSERT INTO links (source_node_id, target_node_id, link_type)
+    VALUES (?1, ?2, ?3);
+";
+const GET_LINK_SQL: &str = "
+    SELECT id, source_node_id, target_node_id, link_type, created_at
+    FROM links
+    WHERE id = ?1;
+";
+const INSERT_ALIAS_SQL: &str = "
+    INSERT INTO aliases (node_id, alias)
+    VALUES (?1, ?2);
+";
+const GET_ALIAS_SQL: &str = "
+    SELECT id, node_id, alias, created_at
+    FROM aliases
+    WHERE id = ?1;
+";
+const INSERT_TAG_SQL: &str = "
+    INSERT INTO tags (node_id, tag)
+    VALUES (?1, ?2);
+";
+const GET_TAG_SQL: &str = "
+    SELECT id, node_id, tag, created_at
+    FROM tags
+    WHERE id = ?1;
+";
+const INSERT_SOURCE_SQL: &str = "
+    INSERT INTO sources (node_id, source_ref)
+    VALUES (?1, ?2);
+";
+const GET_SOURCE_SQL: &str = "
+    SELECT id, node_id, source_ref, created_at
+    FROM sources
+    WHERE id = ?1;
+";
+const FTS_ALIASES_SQL: &str = "
+    SELECT COALESCE(group_concat(alias, ' '), '')
+    FROM (
+        SELECT alias
+        FROM aliases
+        WHERE node_id = ?1
+        ORDER BY id ASC, alias ASC
+    ) AS ordered_aliases;
+";
+const DELETE_FTS_NODE_SQL: &str = "DELETE FROM fts_nodes WHERE rowid = ?1;";
+const INSERT_FTS_NODE_SQL: &str = "
+    INSERT INTO fts_nodes(rowid, title, summary, body, aliases)
+    VALUES (?1, ?2, ?3, ?4, ?5);
+";
 
 /// Upper bounds keep one memory record from making normal reads, FTS refreshes,
 /// or audit snapshots unexpectedly large. Limits are measured in UTF-8 bytes.
@@ -151,6 +230,33 @@ pub struct NewNode {
     pub source_ref: Option<String>,
     pub confidence: Option<f64>,
     pub trust_level: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BorrowedNodeInput<'a> {
+    pub node_type: &'a str,
+    pub status: &'a str,
+    pub title: &'a str,
+    pub summary: Option<&'a str>,
+    pub body: Option<&'a str>,
+    pub source_ref: Option<&'a str>,
+    pub confidence: Option<f64>,
+    pub trust_level: Option<&'a str>,
+}
+
+impl<'a> From<&'a NewNode> for BorrowedNodeInput<'a> {
+    fn from(node: &'a NewNode) -> Self {
+        Self {
+            node_type: &node.node_type,
+            status: &node.status,
+            title: &node.title,
+            summary: node.summary.as_deref(),
+            body: node.body.as_deref(),
+            source_ref: node.source_ref.as_deref(),
+            confidence: node.confidence,
+            trust_level: node.trust_level.as_deref(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1376,33 +1482,27 @@ fn canonical_db_open_path(workspace_paths: &WorkspacePaths) -> io::Result<PathBu
 }
 
 pub fn create_node(connection: &Connection, node: &NewNode) -> Result<Node, NodeStorageError> {
-    validate_new_node(node)?;
+    create_node_borrowed(connection, node.into())
+}
 
-    connection.execute(
-        "
-            INSERT INTO nodes (
-                node_type,
-                status,
-                title,
-                summary,
-                body,
-                source_ref,
-                confidence,
-                trust_level
-            )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8);
-            ",
-        params![
-            &node.node_type,
-            &node.status,
-            &node.title,
-            &node.summary,
-            &node.body,
-            &node.source_ref,
+pub(crate) fn create_node_borrowed(
+    connection: &Connection,
+    node: BorrowedNodeInput<'_>,
+) -> Result<Node, NodeStorageError> {
+    validate_node_input(node)?;
+
+    connection
+        .prepare_cached(INSERT_NODE_SQL)?
+        .execute(params![
+            node.node_type,
+            node.status,
+            node.title,
+            node.summary,
+            node.body,
+            node.source_ref,
             node.confidence,
-            &node.trust_level
-        ],
-    )?;
+            node.trust_level
+        ])?;
 
     let id = connection.last_insert_rowid();
     let created = get_node(connection, id)?
@@ -1415,19 +1515,19 @@ pub fn create_node(connection: &Connection, node: &NewNode) -> Result<Node, Node
 }
 
 pub fn validate_new_node_input(node: &NewNode) -> Result<(), NodeValidationError> {
-    validate_new_node(node)
+    validate_node_input(node.into())
 }
 
 pub fn validate_node_update_input(update: &NodeUpdate) -> Result<(), NodeValidationError> {
-    validate_new_node(&NewNode {
-        node_type: "raw_note".to_string(),
-        status: update.status.clone(),
-        title: update.title.clone(),
-        summary: update.summary.clone(),
-        body: update.body.clone(),
-        source_ref: update.source_ref.clone(),
+    validate_node_input(BorrowedNodeInput {
+        node_type: "raw_note",
+        status: &update.status,
+        title: &update.title,
+        summary: update.summary.as_deref(),
+        body: update.body.as_deref(),
+        source_ref: update.source_ref.as_deref(),
         confidence: update.confidence,
-        trust_level: update.trust_level.clone(),
+        trust_level: update.trust_level.as_deref(),
     })
 }
 
@@ -1439,15 +1539,15 @@ pub fn update_node(
         Some(node) => node,
         None => return Ok(None),
     };
-    validate_new_node(&NewNode {
-        node_type: existing.node_type,
-        status: update.status.clone(),
-        title: update.title.clone(),
-        summary: update.summary.clone(),
-        body: update.body.clone(),
-        source_ref: update.source_ref.clone(),
+    validate_node_input(BorrowedNodeInput {
+        node_type: &existing.node_type,
+        status: &update.status,
+        title: &update.title,
+        summary: update.summary.as_deref(),
+        body: update.body.as_deref(),
+        source_ref: update.source_ref.as_deref(),
         confidence: update.confidence,
-        trust_level: update.trust_level.clone(),
+        trust_level: update.trust_level.as_deref(),
     })?;
 
     connection.execute(
@@ -1486,28 +1586,8 @@ pub fn update_node(
 }
 
 pub fn get_node(connection: &Connection, id: i64) -> rusqlite::Result<Option<Node>> {
-    connection
-        .query_row(
-            "
-            SELECT
-                id,
-                node_type,
-                status,
-                title,
-                summary,
-                body,
-                source_ref,
-                confidence,
-                trust_level,
-                created_at,
-                updated_at
-            FROM nodes
-            WHERE id = ?1;
-            ",
-            [id],
-            row_to_node,
-        )
-        .optional()
+    let mut statement = connection.prepare_cached(GET_NODE_SQL)?;
+    statement.query_row([id], row_to_node).optional()
 }
 
 pub fn list_nodes(connection: &Connection) -> rusqlite::Result<Vec<Node>> {
@@ -1734,7 +1814,7 @@ pub fn load_task_typed_roots_page(
 ) -> rusqlite::Result<TaskRecallLayerPage<Node>> {
     let fetch_limit = page_fetch_limit(limit)?;
     let offset = i64::try_from(offset).map_err(|_| rusqlite::Error::InvalidQuery)?;
-    let mut statement = connection.prepare(
+    let mut statement = connection.prepare_cached(
         "
         WITH exact_ids(id) AS (
             SELECT id FROM nodes WHERE title = ?1 COLLATE NOCASE
@@ -1797,7 +1877,7 @@ pub fn load_task_fts_page(
     };
     let fetch_limit = page_fetch_limit(limit)?;
     let offset = i64::try_from(offset).map_err(|_| rusqlite::Error::InvalidQuery)?;
-    let mut statement = connection.prepare(
+    let mut statement = connection.prepare_cached(
         "
         SELECT
             nodes.id, nodes.node_type, nodes.status, nodes.title, nodes.summary,
@@ -1905,7 +1985,7 @@ pub fn load_task_direct_page(
         .iter()
         .map(|(root_id, _)| *root_id)
         .chain([fetch_limit, offset]);
-    let mut statement = connection.prepare(&sql)?;
+    let mut statement = connection.prepare_cached(&sql)?;
     let mut items = statement
         .query_map(rusqlite::params_from_iter(parameters), |row| {
             Ok(DirectRecallNode {
@@ -2035,7 +2115,7 @@ pub fn load_task_graph_page(
             rusqlite::types::Value::Integer(fetch_limit),
             rusqlite::types::Value::Integer(offset),
         ]);
-    let mut statement = connection.prepare(&sql)?;
+    let mut statement = connection.prepare_cached(&sql)?;
     let mut items = statement
         .query_map(rusqlite::params_from_iter(parameters), |row| {
             let depth = usize::try_from(row.get::<_, i64>(3)?).map_err(|error| {
@@ -2904,17 +2984,13 @@ fn row_to_bounded_recall_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<(Node
 pub fn create_link(connection: &Connection, link: &NewLink) -> Result<Link, LinkStorageError> {
     validate_new_link(connection, link)?;
 
-    connection.execute(
-        "
-            INSERT INTO links (
-                source_node_id,
-                target_node_id,
-                link_type
-            )
-            VALUES (?1, ?2, ?3);
-            ",
-        params![link.source_node_id, link.target_node_id, &link.link_type],
-    )?;
+    connection
+        .prepare_cached(INSERT_LINK_SQL)?
+        .execute(params![
+            link.source_node_id,
+            link.target_node_id,
+            &link.link_type
+        ])?;
 
     let id = connection.last_insert_rowid();
     let created = get_link(connection, id)?
@@ -3012,13 +3088,9 @@ pub(crate) fn create_alias_deferred_fts(
 ) -> Result<Alias, MetadataStorageError> {
     validate_node_metadata(connection, alias.node_id, &alias.alias, MetadataKind::Alias)?;
 
-    connection.execute(
-        "
-            INSERT INTO aliases (node_id, alias)
-            VALUES (?1, ?2);
-            ",
-        params![alias.node_id, &alias.alias],
-    )?;
+    connection
+        .prepare_cached(INSERT_ALIAS_SQL)?
+        .execute(params![alias.node_id, &alias.alias])?;
 
     let id = connection.last_insert_rowid();
     let created = get_alias(connection, id)?.ok_or(MetadataStorageError::Db(
@@ -3105,13 +3177,9 @@ pub fn list_aliases_page(
 pub fn create_tag(connection: &Connection, tag: &NewTag) -> Result<Tag, MetadataStorageError> {
     validate_node_metadata(connection, tag.node_id, &tag.tag, MetadataKind::Tag)?;
 
-    connection.execute(
-        "
-            INSERT INTO tags (node_id, tag)
-            VALUES (?1, ?2);
-            ",
-        params![tag.node_id, &tag.tag],
-    )?;
+    connection
+        .prepare_cached(INSERT_TAG_SQL)?
+        .execute(params![tag.node_id, &tag.tag])?;
 
     let id = connection.last_insert_rowid();
     get_tag(connection, id)?.ok_or(MetadataStorageError::Db(
@@ -3204,13 +3272,9 @@ pub fn create_source(
         MetadataKind::Source,
     )?;
 
-    connection.execute(
-        "
-            INSERT INTO sources (node_id, source_ref)
-            VALUES (?1, ?2);
-            ",
-        params![source.node_id, &source.source_ref],
-    )?;
+    connection
+        .prepare_cached(INSERT_SOURCE_SQL)?
+        .execute(params![source.node_id, &source.source_ref])?;
 
     let id = connection.last_insert_rowid();
     get_source(connection, id)?.ok_or(MetadataStorageError::Db(
@@ -3301,9 +3365,9 @@ pub fn create_teach_session(
 ) -> Result<TeachSession, TeachStorageError> {
     validate_new_teach_session_input(session)?;
 
-    let record = TeachSessionRecord {
-        session_title: session.title.clone(),
-        session_summary: session.summary.clone(),
+    let record = TeachSessionRecordRef {
+        session_title: &session.title,
+        session_summary: session.summary.as_deref(),
     };
     let node = create_teach_record_node(
         connection,
@@ -3328,9 +3392,9 @@ pub fn validate_new_teach_session_input(
         return Err(TeachValidationError::MissingSessionTitle.into());
     }
 
-    let record = TeachSessionRecord {
-        session_title: session.title.clone(),
-        session_summary: session.summary.clone(),
+    let record = TeachSessionRecordRef {
+        session_title: &session.title,
+        session_summary: session.summary.as_deref(),
     };
     let body = serde_json::to_string(&record)?;
     validate_new_node_input(&NewNode {
@@ -3353,9 +3417,9 @@ pub fn add_teach_material(
     payload: &Value,
 ) -> Result<TeachMaterial, TeachStorageError> {
     let session = require_teach_session(connection, session_id)?;
-    let record = TeachMaterialRecord {
+    let record = TeachMaterialRecordRef {
         session_id,
-        payload: payload.clone(),
+        payload,
     };
     let node = create_teach_record_node(
         connection,
@@ -3388,9 +3452,9 @@ pub fn store_teach_proposal(
     validate_teach_proposal_input(session_id, proposal)?;
     let session = require_teach_session(connection, session_id)?;
 
-    let record = TeachProposalRecord {
+    let record = TeachProposalRecordRef {
         session_id,
-        items: proposal.items.clone(),
+        items: &proposal.items,
     };
     let node = create_teach_record_node(
         connection,
@@ -3420,9 +3484,9 @@ pub fn validate_teach_proposal_input(
     proposal: &TeachProposalInput,
 ) -> Result<(), TeachStorageError> {
     validate_teach_proposal(proposal)?;
-    let record = TeachProposalRecord {
+    let record = TeachProposalRecordRef {
         session_id,
-        items: proposal.items.clone(),
+        items: &proposal.items,
     };
     let body = serde_json::to_string(&record)?;
     validate_new_node_input(&NewNode {
@@ -3482,7 +3546,7 @@ fn apply_teach_proposal_in_transaction(
         .into());
     }
 
-    let mut resolved_node_refs = std::collections::BTreeMap::new();
+    let mut resolved_node_refs = HashMap::with_capacity(proposal.items.len());
     let mut created_node_ids = Vec::new();
     let mut created_alias_ids = Vec::new();
     let mut created_tag_ids = Vec::new();
@@ -3509,17 +3573,17 @@ fn apply_teach_proposal_in_transaction(
                     }
                 }
 
-                let created = create_node(
+                let created = create_node_borrowed(
                     connection,
-                    &NewNode {
-                        node_type: node_type.clone(),
-                        status: status.clone(),
-                        title: title.clone(),
-                        summary: summary.clone(),
-                        body: body.clone(),
-                        source_ref: source_ref.clone(),
+                    BorrowedNodeInput {
+                        node_type,
+                        status,
+                        title,
+                        summary: summary.as_deref(),
+                        body: body.as_deref(),
+                        source_ref: source_ref.as_deref(),
                         confidence: *confidence,
-                        trust_level: trust_level.clone(),
+                        trust_level: trust_level.as_deref(),
                     },
                 )?;
                 if let Some(node_ref) = node_ref {
@@ -3606,14 +3670,14 @@ fn apply_teach_proposal_in_transaction(
         }
     }
 
-    let receipt = TeachApplyReceiptRecord {
+    let receipt = TeachApplyReceiptRecordRef {
         session_id,
         proposal_id,
-        created_node_ids: created_node_ids.clone(),
-        created_alias_ids: created_alias_ids.clone(),
-        created_tag_ids: created_tag_ids.clone(),
-        created_source_ids: created_source_ids.clone(),
-        created_link_ids: created_link_ids.clone(),
+        created_node_ids: &created_node_ids,
+        created_alias_ids: &created_alias_ids,
+        created_tag_ids: &created_tag_ids,
+        created_source_ids: &created_source_ids,
+        created_link_ids: &created_link_ids,
     };
     let receipt_node = create_teach_record_node(
         connection,
@@ -3874,10 +3938,23 @@ struct TeachSessionRecord {
     session_summary: Option<String>,
 }
 
+#[derive(Serialize)]
+struct TeachSessionRecordRef<'a> {
+    session_title: &'a str,
+    session_summary: Option<&'a str>,
+}
+
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct TeachMaterialRecord {
     session_id: i64,
     payload: Value,
+}
+
+#[derive(Serialize)]
+struct TeachMaterialRecordRef<'a> {
+    session_id: i64,
+    payload: &'a Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -3886,6 +3963,13 @@ struct TeachProposalRecord {
     items: Vec<TeachProposalItem>,
 }
 
+#[derive(Serialize)]
+struct TeachProposalRecordRef<'a> {
+    session_id: i64,
+    items: &'a [TeachProposalItem],
+}
+
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct TeachApplyReceiptRecord {
     session_id: i64,
@@ -3895,6 +3979,17 @@ struct TeachApplyReceiptRecord {
     created_tag_ids: Vec<i64>,
     created_source_ids: Vec<i64>,
     created_link_ids: Vec<i64>,
+}
+
+#[derive(Serialize)]
+struct TeachApplyReceiptRecordRef<'a> {
+    session_id: i64,
+    proposal_id: i64,
+    created_node_ids: &'a [i64],
+    created_alias_ids: &'a [i64],
+    created_tag_ids: &'a [i64],
+    created_source_ids: &'a [i64],
+    created_link_ids: &'a [i64],
 }
 
 fn create_teach_record_node<T: Serialize>(
@@ -4042,7 +4137,7 @@ fn validate_teach_node_target(
 fn resolve_teach_node_target(
     node_id: Option<i64>,
     node_ref: Option<&str>,
-    resolved_node_refs: &std::collections::BTreeMap<String, i64>,
+    resolved_node_refs: &HashMap<String, i64>,
 ) -> Result<i64, TeachStorageError> {
     validate_teach_node_target(node_id, node_ref)?;
     match (node_id, node_ref) {
@@ -4055,37 +4150,29 @@ fn resolve_teach_node_target(
     }
 }
 
-fn validate_new_node(node: &NewNode) -> Result<(), NodeValidationError> {
-    if !ALLOWED_NODE_TYPES.contains(&node.node_type.as_str()) {
-        return Err(NodeValidationError::InvalidType(node.node_type.clone()));
+fn validate_node_input(node: BorrowedNodeInput<'_>) -> Result<(), NodeValidationError> {
+    if !ALLOWED_NODE_TYPES.contains(&node.node_type) {
+        return Err(NodeValidationError::InvalidType(node.node_type.to_string()));
     }
-    if !ALLOWED_NODE_STATUSES.contains(&node.status.as_str()) {
-        return Err(NodeValidationError::InvalidStatus(node.status.clone()));
+    if !ALLOWED_NODE_STATUSES.contains(&node.status) {
+        return Err(NodeValidationError::InvalidStatus(node.status.to_string()));
     }
     if node.title.trim().is_empty() {
         return Err(NodeValidationError::MissingTitle);
     }
-    validate_node_field_size("title", &node.title, MAX_NODE_TITLE_BYTES)?;
-    validate_optional_node_field_size("summary", node.summary.as_deref(), MAX_NODE_SUMMARY_BYTES)?;
-    validate_optional_node_field_size("body", node.body.as_deref(), MAX_NODE_BODY_BYTES)?;
-    validate_optional_node_field_size(
-        "source_ref",
-        node.source_ref.as_deref(),
-        MAX_NODE_SOURCE_REF_BYTES,
-    )?;
-    validate_optional_node_field_size(
-        "trust_level",
-        node.trust_level.as_deref(),
-        MAX_NODE_TRUST_LEVEL_BYTES,
-    )?;
+    validate_node_field_size("title", node.title, MAX_NODE_TITLE_BYTES)?;
+    validate_optional_node_field_size("summary", node.summary, MAX_NODE_SUMMARY_BYTES)?;
+    validate_optional_node_field_size("body", node.body, MAX_NODE_BODY_BYTES)?;
+    validate_optional_node_field_size("source_ref", node.source_ref, MAX_NODE_SOURCE_REF_BYTES)?;
+    validate_optional_node_field_size("trust_level", node.trust_level, MAX_NODE_TRUST_LEVEL_BYTES)?;
     if node.status == "active" {
-        if node.source_ref.as_deref().unwrap_or("").trim().is_empty() {
+        if node.source_ref.unwrap_or("").trim().is_empty() {
             return Err(NodeValidationError::MissingActiveSourceRef);
         }
         if node.confidence.is_none() {
             return Err(NodeValidationError::MissingActiveConfidence);
         }
-        if node.trust_level.as_deref().unwrap_or("").trim().is_empty() {
+        if node.trust_level.unwrap_or("").trim().is_empty() {
             return Err(NodeValidationError::MissingActiveTrustLevel);
         }
     }
@@ -4266,20 +4353,18 @@ fn refresh_fts_node(connection: &Connection, node_id: i64) -> rusqlite::Result<(
     let node = get_node(connection, node_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
     let aliases = aliases_for_fts(connection, node_id)?;
 
-    connection.execute("DELETE FROM fts_nodes WHERE rowid = ?1;", [node_id])?;
-    connection.execute(
-        "
-        INSERT INTO fts_nodes(rowid, title, summary, body, aliases)
-        VALUES (?1, ?2, ?3, ?4, ?5);
-        ",
-        params![
+    connection
+        .prepare_cached(DELETE_FTS_NODE_SQL)?
+        .execute([node_id])?;
+    connection
+        .prepare_cached(INSERT_FTS_NODE_SQL)?
+        .execute(params![
             node.id,
             node.title,
             node.summary.unwrap_or_default(),
             node.body.unwrap_or_default(),
             aliases
-        ],
-    )?;
+        ])?;
 
     Ok(())
 }
@@ -4296,19 +4381,8 @@ pub(crate) fn refresh_fts_nodes(
 }
 
 fn aliases_for_fts(connection: &Connection, node_id: i64) -> rusqlite::Result<String> {
-    connection.query_row(
-        "
-        SELECT COALESCE(group_concat(alias, ' '), '')
-        FROM (
-            SELECT alias
-            FROM aliases
-            WHERE node_id = ?1
-            ORDER BY id ASC, alias ASC
-        ) AS ordered_aliases;
-        ",
-        [node_id],
-        |row| row.get(0),
-    )
+    let mut statement = connection.prepare_cached(FTS_ALIASES_SQL)?;
+    statement.query_row([node_id], |row| row.get(0))
 }
 
 pub(crate) fn fts_match_query(query: &str) -> Option<String> {
@@ -4389,22 +4463,8 @@ fn row_to_node_at(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result<No
 }
 
 fn get_link(connection: &Connection, id: i64) -> rusqlite::Result<Option<Link>> {
-    connection
-        .query_row(
-            "
-            SELECT
-                id,
-                source_node_id,
-                target_node_id,
-                link_type,
-                created_at
-            FROM links
-            WHERE id = ?1;
-            ",
-            [id],
-            row_to_link,
-        )
-        .optional()
+    let mut statement = connection.prepare_cached(GET_LINK_SQL)?;
+    statement.query_row([id], row_to_link).optional()
 }
 
 fn row_to_link(row: &rusqlite::Row<'_>) -> rusqlite::Result<Link> {
@@ -4418,17 +4478,8 @@ fn row_to_link(row: &rusqlite::Row<'_>) -> rusqlite::Result<Link> {
 }
 
 fn get_alias(connection: &Connection, id: i64) -> rusqlite::Result<Option<Alias>> {
-    connection
-        .query_row(
-            "
-            SELECT id, node_id, alias, created_at
-            FROM aliases
-            WHERE id = ?1;
-            ",
-            [id],
-            row_to_alias,
-        )
-        .optional()
+    let mut statement = connection.prepare_cached(GET_ALIAS_SQL)?;
+    statement.query_row([id], row_to_alias).optional()
 }
 
 fn row_to_alias(row: &rusqlite::Row<'_>) -> rusqlite::Result<Alias> {
@@ -4441,17 +4492,8 @@ fn row_to_alias(row: &rusqlite::Row<'_>) -> rusqlite::Result<Alias> {
 }
 
 fn get_tag(connection: &Connection, id: i64) -> rusqlite::Result<Option<Tag>> {
-    connection
-        .query_row(
-            "
-            SELECT id, node_id, tag, created_at
-            FROM tags
-            WHERE id = ?1;
-            ",
-            [id],
-            row_to_tag,
-        )
-        .optional()
+    let mut statement = connection.prepare_cached(GET_TAG_SQL)?;
+    statement.query_row([id], row_to_tag).optional()
 }
 
 fn row_to_tag(row: &rusqlite::Row<'_>) -> rusqlite::Result<Tag> {
@@ -4464,17 +4506,8 @@ fn row_to_tag(row: &rusqlite::Row<'_>) -> rusqlite::Result<Tag> {
 }
 
 fn get_source(connection: &Connection, id: i64) -> rusqlite::Result<Option<Source>> {
-    connection
-        .query_row(
-            "
-            SELECT id, node_id, source_ref, created_at
-            FROM sources
-            WHERE id = ?1;
-            ",
-            [id],
-            row_to_source,
-        )
-        .optional()
+    let mut statement = connection.prepare_cached(GET_SOURCE_SQL)?;
+    statement.query_row([id], row_to_source).optional()
 }
 
 fn row_to_source(row: &rusqlite::Row<'_>) -> rusqlite::Result<Source> {
@@ -4891,6 +4924,88 @@ mod tests {
                 None => env::remove_var(self.key),
             }
         }
+    }
+
+    #[test]
+    fn borrowed_teach_records_preserve_exact_json() {
+        let owned_session = TeachSessionRecord {
+            session_title: "Teach session".to_string(),
+            session_summary: Some("Summary".to_string()),
+        };
+        let borrowed_session = TeachSessionRecordRef {
+            session_title: "Teach session",
+            session_summary: Some("Summary"),
+        };
+        assert_eq!(
+            serde_json::to_vec(&borrowed_session).expect("borrowed session should serialize"),
+            serde_json::to_vec(&owned_session).expect("owned session should serialize")
+        );
+
+        let payload = serde_json::json!({"text": "material", "weight": 2});
+        let owned_material = TeachMaterialRecord {
+            session_id: 3,
+            payload: payload.clone(),
+        };
+        let borrowed_material = TeachMaterialRecordRef {
+            session_id: 3,
+            payload: &payload,
+        };
+        assert_eq!(
+            serde_json::to_vec(&borrowed_material).expect("borrowed material should serialize"),
+            serde_json::to_vec(&owned_material).expect("owned material should serialize")
+        );
+
+        let items = vec![TeachProposalItem::CreateNode {
+            node_ref: Some("lesson".to_string()),
+            node_type: "lesson".to_string(),
+            status: "draft".to_string(),
+            title: "Learned lesson".to_string(),
+            summary: None,
+            body: Some("Body".to_string()),
+            source_ref: None,
+            confidence: Some(0.8),
+            trust_level: Some("verified".to_string()),
+        }];
+        let owned_proposal = TeachProposalRecord {
+            session_id: 3,
+            items: items.clone(),
+        };
+        let borrowed_proposal = TeachProposalRecordRef {
+            session_id: 3,
+            items: &items,
+        };
+        assert_eq!(
+            serde_json::to_vec(&borrowed_proposal).expect("borrowed proposal should serialize"),
+            serde_json::to_vec(&owned_proposal).expect("owned proposal should serialize")
+        );
+
+        let created_node_ids = vec![10, 11];
+        let created_alias_ids = vec![20];
+        let created_tag_ids = vec![30];
+        let created_source_ids = vec![40];
+        let created_link_ids = vec![50];
+        let owned_receipt = TeachApplyReceiptRecord {
+            session_id: 3,
+            proposal_id: 4,
+            created_node_ids: created_node_ids.clone(),
+            created_alias_ids: created_alias_ids.clone(),
+            created_tag_ids: created_tag_ids.clone(),
+            created_source_ids: created_source_ids.clone(),
+            created_link_ids: created_link_ids.clone(),
+        };
+        let borrowed_receipt = TeachApplyReceiptRecordRef {
+            session_id: 3,
+            proposal_id: 4,
+            created_node_ids: &created_node_ids,
+            created_alias_ids: &created_alias_ids,
+            created_tag_ids: &created_tag_ids,
+            created_source_ids: &created_source_ids,
+            created_link_ids: &created_link_ids,
+        };
+        assert_eq!(
+            serde_json::to_vec(&borrowed_receipt).expect("borrowed receipt should serialize"),
+            serde_json::to_vec(&owned_receipt).expect("owned receipt should serialize")
+        );
     }
 
     #[test]
@@ -5655,6 +5770,30 @@ mod tests {
             .expect("FTS aliases should read");
 
         assert_eq!(aliases, "first second");
+    }
+
+    #[test]
+    fn batch_fts_refresh_stops_at_missing_node_after_preserving_prior_refresh() {
+        let mut connection = Connection::open_in_memory()
+            .expect("in-memory DB should open for batch FTS boundary test");
+        schema::apply_migrations(&mut connection).expect("migrations should apply");
+        let node = create_node(&connection, &draft_node("Before batch refresh"))
+            .expect("node should create");
+        connection
+            .execute(
+                "UPDATE nodes SET title = 'After batch refresh' WHERE id = ?1",
+                [node.id],
+            )
+            .expect("node title should change without refreshing FTS");
+        let missing_id = node.id + 1;
+        let node_ids = BTreeSet::from([node.id, missing_id]);
+
+        let error = refresh_fts_nodes(&connection, &node_ids)
+            .expect_err("missing second node should stop the batch");
+
+        assert!(matches!(error, rusqlite::Error::QueryReturnedNoRows));
+        assert_eq!(count_fts_matches(&connection, "before"), 0);
+        assert_eq!(count_fts_matches(&connection, "after"), 1);
     }
 
     #[test]

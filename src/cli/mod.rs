@@ -1,6 +1,7 @@
 use clap::{error::ErrorKind, Args, Parser, Subcommand};
 use serde::Serialize;
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
@@ -5189,6 +5190,24 @@ fn validate_recall_cursor_revision(
     }
 }
 
+fn insert_continuation_seen_node(
+    state: &mut recall::RecallContinuationState,
+    seen_node_ids: &mut HashSet<i64>,
+    node_id: i64,
+) -> Result<(), recall::RecallCursorError> {
+    if node_id <= 0 {
+        return Err(recall::RecallCursorError::InvalidNodeId);
+    }
+    if seen_node_ids.insert(node_id) {
+        state.seen_node_ids.push(node_id);
+    }
+    Ok(())
+}
+
+fn canonicalize_continuation_seen_nodes(state: &mut recall::RecallContinuationState) {
+    state.seen_node_ids.sort_unstable();
+}
+
 fn build_task_recall_response(
     connection: &rusqlite::Connection,
     query: &str,
@@ -5207,6 +5226,13 @@ fn build_task_recall_response(
         }
     };
     let bundle_id = state.bundle_id().map_err(CliError::invalid_recall_cursor)?;
+    let mut root_ids = state
+        .roots
+        .iter()
+        .map(|root| root.node_id)
+        .collect::<HashSet<_>>();
+    let mut seen_node_ids = state.seen_node_ids.iter().copied().collect::<HashSet<_>>();
+    let candidate_selector = recall::TaskRecallCandidateSelector::new(&mandatory_context.section);
     let mut page_nodes = Vec::new();
     let mut retrieval_complete = false;
 
@@ -5215,18 +5241,22 @@ fn build_task_recall_response(
         if remaining_items == 0 {
             break;
         }
-        let (candidates, candidate_count, layer_more_results) =
-            load_continuation_candidate_page(connection, query, &mut state, remaining_items)?;
+        let (candidates, candidate_count, layer_more_results) = load_continuation_candidate_page(
+            connection,
+            query,
+            &mut state,
+            &mut root_ids,
+            remaining_items,
+        )?;
         state.offset = state
             .offset
             .checked_add(candidate_count as u64)
             .ok_or_else(|| {
                 CliError::invalid_recall_cursor(recall::RecallCursorError::InvalidShape)
             })?;
-        let selected =
-            recall::select_task_recall_candidates(candidates, &mandatory_context.section);
+        let selected = candidate_selector.select(candidates);
         for selected_node in selected {
-            if state.contains_node(selected_node.node.id) {
+            if seen_node_ids.contains(&selected_node.node.id) {
                 continue;
             }
             let selected_bytes =
@@ -5255,8 +5285,7 @@ fn build_task_recall_response(
             state.emitted_count = state.emitted_count.checked_add(1).ok_or_else(|| {
                 CliError::invalid_recall_cursor(recall::RecallCursorError::InvalidShape)
             })?;
-            state
-                .insert_seen_node(selected_node.node.id)
+            insert_continuation_seen_node(&mut state, &mut seen_node_ids, selected_node.node.id)
                 .map_err(CliError::invalid_recall_cursor)?;
             page_nodes.push(selected_node);
         }
@@ -5286,10 +5315,14 @@ fn build_task_recall_response(
         retrieval_complete = !probe_more_relevant_task_memory(
             connection,
             query,
-            &mandatory_context.section,
+            &candidate_selector,
+            &seen_node_ids,
             &mut state,
+            &mut root_ids,
         )?;
     }
+
+    canonicalize_continuation_seen_nodes(&mut state);
 
     let more_results = state.exhausted || !retrieval_complete;
     let task_used_bytes = state
@@ -5336,6 +5369,7 @@ fn load_continuation_candidate_page(
     connection: &rusqlite::Connection,
     query: &str,
     state: &mut recall::RecallContinuationState,
+    root_ids: &mut HashSet<i64>,
     limit: usize,
 ) -> Result<(storage::TaskRecallCandidates, usize, bool), CliError> {
     let mut candidates = storage::TaskRecallCandidates::default();
@@ -5345,7 +5379,7 @@ fn load_continuation_candidate_page(
                 .map_err(CliError::db_schema)?;
             for node in &page.items {
                 state
-                    .insert_root(node)
+                    .insert_root_indexed(node, root_ids)
                     .map_err(CliError::invalid_recall_cursor)?;
             }
             let count = page.items.len();
@@ -5357,7 +5391,7 @@ fn load_continuation_candidate_page(
                 .map_err(CliError::db_schema)?;
             for result in &page.items {
                 state
-                    .insert_root(&result.node)
+                    .insert_root_indexed(&result.node, root_ids)
                     .map_err(CliError::invalid_recall_cursor)?;
             }
             let count = page.items.len();
@@ -5384,24 +5418,51 @@ fn load_continuation_candidate_page(
     Ok((candidates, candidate_count, more_results))
 }
 
+struct RecallProbeCheckpoint {
+    phase: recall::RecallContinuationPhase,
+    offset: u64,
+    roots_len: usize,
+}
+
+impl RecallProbeCheckpoint {
+    fn capture(state: &recall::RecallContinuationState) -> Self {
+        Self {
+            phase: state.phase,
+            offset: state.offset,
+            roots_len: state.roots.len(),
+        }
+    }
+
+    fn restore(self, state: &mut recall::RecallContinuationState, root_ids: &mut HashSet<i64>) {
+        state.phase = self.phase;
+        state.offset = self.offset;
+        for root in &state.roots[self.roots_len..] {
+            root_ids.remove(&root.node_id);
+        }
+        state.roots.truncate(self.roots_len);
+    }
+}
+
 /// Skips candidates already emitted by earlier layers. On success with more
 /// data, state points immediately before the next new task node.
 fn probe_more_relevant_task_memory(
     connection: &rusqlite::Connection,
     query: &str,
-    mandatory: &recall::RecallSection,
+    candidate_selector: &recall::TaskRecallCandidateSelector,
+    seen_node_ids: &HashSet<i64>,
     state: &mut recall::RecallContinuationState,
+    root_ids: &mut HashSet<i64>,
 ) -> Result<bool, CliError> {
     loop {
-        let state_before_candidate = state.clone();
+        let checkpoint = RecallProbeCheckpoint::capture(state);
         let (candidates, candidate_count, layer_more_results) =
-            load_continuation_candidate_page(connection, query, state, 1)?;
-        let selected = recall::select_task_recall_candidates(candidates, mandatory);
+            load_continuation_candidate_page(connection, query, state, root_ids, 1)?;
+        let selected = candidate_selector.select(candidates);
         if let Some(next) = selected
             .iter()
-            .find(|selected| !state_before_candidate.contains_node(selected.node.id))
+            .find(|selected| !seen_node_ids.contains(&selected.node.id))
         {
-            *state = state_before_candidate;
+            checkpoint.restore(state, root_ids);
             let selected_bytes =
                 recall::canonical_json_byte_len(next).map_err(CliError::recall_model)?;
             let separator_bytes = usize::from(state.emitted_count > 0);
@@ -8636,7 +8697,7 @@ mod tests {
         assert_eq!(envelope["data"], serde_json::json!({}));
         assert_eq!(envelope["warnings"], serde_json::json!([]));
         assert_eq!(envelope["errors"], serde_json::json!([]));
-        assert_eq!(envelope["meta"]["version"], "0.2.0-rc1");
+        assert_eq!(envelope["meta"]["version"], "0.2.0-rc2");
     }
 
     #[test]
@@ -8658,7 +8719,7 @@ mod tests {
             envelope["errors"][0]["message"],
             "command is not implemented yet: node_create"
         );
-        assert_eq!(envelope["meta"]["version"], "0.2.0-rc1");
+        assert_eq!(envelope["meta"]["version"], "0.2.0-rc2");
     }
 
     #[test]
@@ -8794,7 +8855,7 @@ mod tests {
             envelope["errors"][0]["fix_hint"],
             "run `aopmem --help` to see supported commands"
         );
-        assert_eq!(envelope["meta"]["version"], "0.2.0-rc1");
+        assert_eq!(envelope["meta"]["version"], "0.2.0-rc2");
     }
 
     #[test]
@@ -11637,6 +11698,179 @@ mod tests {
     }
 
     #[test]
+    fn continuation_seen_index_preserves_exact_canonical_cursor_bytes() {
+        let mut reference_state = recall::RecallContinuationState::new_with_bundle_id(
+            "seen index cursor proof",
+            "0123456789abcdef0123456789abcdef".to_string(),
+            recall::RecallBundleId::parse("550e8400-e29b-41d4-a716-446655440002")
+                .expect("fixture should be a canonical UUID v4"),
+        )
+        .expect("reference state should build");
+        let mut indexed_state = reference_state.clone();
+        let mut seen_node_ids = HashSet::new();
+
+        for node_id in [19, 3, 11, 3] {
+            reference_state
+                .insert_seen_node(node_id)
+                .expect("reference insertion should succeed");
+            insert_continuation_seen_node(&mut indexed_state, &mut seen_node_ids, node_id)
+                .expect("indexed insertion should succeed");
+        }
+        reference_state.emitted_count = reference_state.seen_node_ids.len() as u64;
+        indexed_state.emitted_count = indexed_state.seen_node_ids.len() as u64;
+        reference_state.task_node_bytes = 321;
+        indexed_state.task_node_bytes = 321;
+
+        assert_eq!(indexed_state.seen_node_ids, vec![19, 3, 11]);
+        assert_eq!(seen_node_ids, HashSet::from([3, 11, 19]));
+        canonicalize_continuation_seen_nodes(&mut indexed_state);
+
+        assert_eq!(indexed_state.seen_node_ids, vec![3, 11, 19]);
+        assert_eq!(indexed_state, reference_state);
+        assert_eq!(
+            recall::encode_recall_continuation_cursor(&indexed_state)
+                .expect("indexed cursor should encode"),
+            recall::encode_recall_continuation_cursor(&reference_state)
+                .expect("reference cursor should encode")
+        );
+    }
+
+    #[test]
+    fn continuation_probe_restores_exact_state_and_cursor_before_new_candidate() {
+        let mut connection = rusqlite::Connection::open_in_memory()
+            .expect("in-memory DB should open for probe rollback proof");
+        crate::schema::apply_migrations(&mut connection).expect("migrations should apply");
+        storage::create_node(
+            &connection,
+            &storage::NewNode {
+                node_type: "workflow".to_string(),
+                status: "draft".to_string(),
+                title: "probe exact cursor".to_string(),
+                summary: None,
+                body: Some("next continuation candidate".to_string()),
+                source_ref: None,
+                confidence: None,
+                trust_level: None,
+            },
+        )
+        .expect("probe candidate should create");
+        storage::prepare_task_recall_connection(&connection)
+            .expect("recall scalar should register");
+        let mandatory = recall::build_mandatory_recall_context(Vec::new())
+            .expect("empty mandatory section should fit");
+        let candidate_selector = recall::TaskRecallCandidateSelector::new(&mandatory.section);
+        let mut state = recall::RecallContinuationState::new_with_bundle_id(
+            "probe exact cursor",
+            "0123456789abcdef0123456789abcdef".to_string(),
+            recall::RecallBundleId::parse("550e8400-e29b-41d4-a716-446655440000")
+                .expect("fixture should be a canonical UUID v4"),
+        )
+        .expect("continuation state should build");
+        let mut root_ids = HashSet::new();
+        let seen_node_ids = HashSet::new();
+        let expected_state = state.clone();
+        let expected_cursor = recall::encode_recall_continuation_cursor(&expected_state)
+            .expect("expected cursor should encode");
+
+        assert!(probe_more_relevant_task_memory(
+            &connection,
+            "probe exact cursor",
+            &candidate_selector,
+            &seen_node_ids,
+            &mut state,
+            &mut root_ids,
+        )
+        .expect("probe should succeed"));
+
+        assert_eq!(state, expected_state);
+        assert!(root_ids.is_empty());
+        assert_eq!(
+            recall::encode_recall_continuation_cursor(&state).expect("actual cursor should encode"),
+            expected_cursor
+        );
+    }
+
+    #[test]
+    fn continuation_probe_skips_duplicates_and_preserves_order_phase_and_budget() {
+        let query = "probe duplicate phase";
+        let mut connection = rusqlite::Connection::open_in_memory()
+            .expect("in-memory DB should open for duplicate probe proof");
+        crate::schema::apply_migrations(&mut connection).expect("migrations should apply");
+        for index in 0..2 {
+            storage::create_node(
+                &connection,
+                &storage::NewNode {
+                    node_type: "workflow".to_string(),
+                    status: "draft".to_string(),
+                    title: query.to_string(),
+                    summary: Some(format!("duplicate probe {index}")),
+                    body: Some(query.to_string()),
+                    source_ref: None,
+                    confidence: None,
+                    trust_level: None,
+                },
+            )
+            .expect("duplicate probe candidate should create");
+        }
+        storage::prepare_task_recall_connection(&connection)
+            .expect("recall scalar should register");
+        let ordered_roots = storage::load_task_typed_roots_page(&connection, query, 0, 10)
+            .expect("typed roots should load")
+            .items;
+        assert_eq!(ordered_roots.len(), 2);
+        let mandatory = recall::build_mandatory_recall_context(Vec::new())
+            .expect("empty mandatory section should fit");
+        let candidate_selector = recall::TaskRecallCandidateSelector::new(&mandatory.section);
+        let mut state = recall::RecallContinuationState::new_with_bundle_id(
+            query,
+            "0123456789abcdef0123456789abcdef".to_string(),
+            recall::RecallBundleId::parse("550e8400-e29b-41d4-a716-446655440001")
+                .expect("fixture should be a canonical UUID v4"),
+        )
+        .expect("continuation state should build");
+        for node in &ordered_roots {
+            state.insert_root(node).expect("ordered root should insert");
+            state
+                .insert_seen_node(node.id)
+                .expect("seen node should insert");
+        }
+        state.offset = ordered_roots.len() as u64;
+        state.emitted_count = ordered_roots.len() as u64;
+        state.task_node_bytes = 128;
+        let seen_node_ids = state.seen_node_ids.iter().copied().collect::<HashSet<_>>();
+        let mut root_ids = state
+            .roots
+            .iter()
+            .map(|root| root.node_id)
+            .collect::<HashSet<_>>();
+        let root_ids_before_probe = root_ids.clone();
+        let roots_before_probe = state.roots.clone();
+        let mut expected_state = state.clone();
+        expected_state.phase = recall::RecallContinuationPhase::Graph;
+        expected_state.offset = 0;
+        let expected_cursor = recall::encode_recall_continuation_cursor(&expected_state)
+            .expect("expected cursor should encode");
+
+        assert!(!probe_more_relevant_task_memory(
+            &connection,
+            query,
+            &candidate_selector,
+            &seen_node_ids,
+            &mut state,
+            &mut root_ids,
+        )
+        .expect("duplicate probe should succeed"));
+
+        assert_eq!(state, expected_state);
+        assert_eq!(state.roots, roots_before_probe);
+        assert_eq!(root_ids, root_ids_before_probe);
+        assert_eq!(
+            recall::encode_recall_continuation_cursor(&state).expect("actual cursor should encode"),
+            expected_cursor
+        );
+    }
+
+    #[test]
     fn task_recall_continues_three_pages_with_same_bundle_exact_dedup_and_budget() {
         let mut connection = rusqlite::Connection::open_in_memory()
             .expect("in-memory DB should open for continuation proof");
@@ -11750,10 +11984,19 @@ mod tests {
                     .continuation_cursor
                     .as_deref()
                     .expect("more results must always carry a cursor");
-                continuation = Some(
+                let next_state =
                     recall::decode_recall_continuation_cursor(cursor, "continuation proof")
-                        .expect("next cursor should decode"),
+                        .expect("next cursor should decode");
+                assert!(next_state
+                    .seen_node_ids
+                    .windows(2)
+                    .all(|ids| ids[0] < ids[1]));
+                assert_eq!(
+                    recall::encode_recall_continuation_cursor(&next_state)
+                        .expect("decoded cursor state should remain canonical"),
+                    cursor
                 );
+                continuation = Some(next_state);
             } else {
                 assert!(response.continuation_cursor.is_none());
                 assert!(response.task.complete);

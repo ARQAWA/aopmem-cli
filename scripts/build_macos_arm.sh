@@ -28,9 +28,8 @@ cp "$built_bin" "$dist_bin"
 chmod 755 "$dist_bin"
 
 file "$dist_bin"
-otool -l "$dist_bin" | awk '
-  $1 == "cmd" && $2 == "LC_BUILD_VERSION" { in_version = 1; next }
-  in_version && $1 == "minos" { print "minimum macOS " $2; exit }
+vtool -show-build "$dist_bin" | awk '
+  $1 == "minos" { print "minimum macOS " $2; exit }
 '
 shasum -a 256 "$dist_bin"
 

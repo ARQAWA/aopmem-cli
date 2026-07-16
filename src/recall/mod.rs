@@ -373,6 +373,23 @@ impl RecallContinuationState {
         Ok(())
     }
 
+    pub(crate) fn insert_root_indexed(
+        &mut self,
+        node: &Node,
+        root_ids: &mut HashSet<i64>,
+    ) -> Result<(), RecallCursorError> {
+        if node.id <= 0 {
+            return Err(RecallCursorError::InvalidNodeId);
+        }
+        if root_ids.insert(node.id) {
+            self.roots.push(RecallContinuationRoot {
+                node_id: node.id,
+                node_type: node.node_type.clone(),
+            });
+        }
+        Ok(())
+    }
+
     pub fn task_used_bytes(&self, complete: bool) -> Result<usize, RecallModelError> {
         let envelope_bytes = empty_task_section_byte_len(complete)?;
         let node_bytes = usize::try_from(self.task_node_bytes)
@@ -1075,6 +1092,29 @@ pub fn build_task_recall_context(
     })
 }
 
+/// Reusable mandatory-node filter for paged task-recall selection.
+pub(crate) struct TaskRecallCandidateSelector {
+    mandatory_ids: HashSet<i64>,
+}
+
+impl TaskRecallCandidateSelector {
+    #[must_use]
+    pub(crate) fn new(mandatory: &RecallSection) -> Self {
+        Self {
+            mandatory_ids: mandatory
+                .nodes
+                .iter()
+                .map(|selected| selected.node.id)
+                .collect(),
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn select(&self, candidates: TaskRecallCandidates) -> Vec<SelectedRecallNode> {
+        select_task_recall_candidates_with_mandatory_ids(candidates, &self.mandatory_ids)
+    }
+}
+
 /// Applies v0.2 layer priority, global node deduplication, and typed reasons
 /// without doing page or budget packing.
 #[must_use]
@@ -1082,11 +1122,13 @@ pub fn select_task_recall_candidates(
     candidates: TaskRecallCandidates,
     mandatory: &RecallSection,
 ) -> Vec<SelectedRecallNode> {
-    let mandatory_ids = mandatory
-        .nodes
-        .iter()
-        .map(|selected| selected.node.id)
-        .collect::<HashSet<_>>();
+    TaskRecallCandidateSelector::new(mandatory).select(candidates)
+}
+
+fn select_task_recall_candidates_with_mandatory_ids(
+    candidates: TaskRecallCandidates,
+    mandatory_ids: &HashSet<i64>,
+) -> Vec<SelectedRecallNode> {
     let mut selected_nodes = Vec::with_capacity(
         candidates.typed_roots.len()
             + candidates.fts_results.len()
@@ -1101,7 +1143,7 @@ pub fn select_task_recall_candidates(
         merge_task_candidate(
             &mut selected_nodes,
             &mut selected_positions,
-            &mandatory_ids,
+            mandatory_ids,
             node,
             reason,
             TaskRetrievalTier::TypedRoot,
@@ -1111,7 +1153,7 @@ pub fn select_task_recall_candidates(
         merge_task_candidate(
             &mut selected_nodes,
             &mut selected_positions,
-            &mandatory_ids,
+            mandatory_ids,
             result.node,
             RecallSelectionReason::FtsBm25 { rank: result.rank },
             TaskRetrievalTier::Fts,
@@ -1121,7 +1163,7 @@ pub fn select_task_recall_candidates(
         merge_task_candidate(
             &mut selected_nodes,
             &mut selected_positions,
-            &mandatory_ids,
+            mandatory_ids,
             linked.node,
             RecallSelectionReason::DirectLink {
                 source_node_id: linked.root_node_id,
@@ -1137,7 +1179,7 @@ pub fn select_task_recall_candidates(
         merge_task_candidate(
             &mut selected_nodes,
             &mut selected_positions,
-            &mandatory_ids,
+            mandatory_ids,
             traversed.node,
             RecallSelectionReason::GraphTraversal {
                 root_node_id: traversed.root_node_id,
@@ -1649,24 +1691,20 @@ pub fn build_structured_bundle_with_links(
 }
 
 pub fn needs_fts_fallback(bundle: &StructuredRecallBundle) -> bool {
-    structured_node_count(bundle) < STRUCTURED_RECALL_SUFFICIENT_NODE_COUNT
+    !has_at_least_structured_nodes(bundle, STRUCTURED_RECALL_SUFFICIENT_NODE_COUNT)
 }
 
 pub fn derive_fts_fallback_query(bundle: &StructuredRecallBundle) -> Option<String> {
-    let mut titles = Vec::new();
-    collect_status_titles(&mut titles, &bundle.project_profiles);
-    collect_status_titles(&mut titles, &bundle.gates);
-    collect_status_titles(&mut titles, &bundle.workflows);
-    titles.extend(
-        bundle
-            .linked_nodes
-            .iter()
-            .map(|linked| linked.node.title.as_str()),
-    );
-    titles.extend(bundle.context_nodes.iter().map(|node| node.title.as_str()));
-
-    titles
-        .into_iter()
+    status_titles(&bundle.project_profiles)
+        .chain(status_titles(&bundle.gates))
+        .chain(status_titles(&bundle.workflows))
+        .chain(
+            bundle
+                .linked_nodes
+                .iter()
+                .map(|linked| linked.node.title.as_str()),
+        )
+        .chain(bundle.context_nodes.iter().map(|node| node.title.as_str()))
         .map(str::trim)
         .find(|title| !title.is_empty())
         .map(ToOwned::to_owned)
@@ -1702,36 +1740,34 @@ pub fn build_bounded_query_recall(results: Vec<FtsNodeSearchResult>) -> BoundedQ
 }
 
 fn build_compact_bundle(bundle: &StructuredRecallBundle) -> CompactRecallBundle {
+    let node_index = BundleNodeIndex::new(bundle);
     let mut compact = CompactRecallBundle {
         applicable_workflows: collect_compact_nodes(
-            bundle_nodes_by_type(bundle, "workflow"),
+            node_index.nodes_by_type("workflow"),
             MAX_COMPACT_APPLICABLE_WORKFLOWS,
         ),
         active_gates: collect_compact_nodes(
-            active_status_nodes(&bundle.gates),
+            bundle.gates.active.iter().collect(),
             MAX_COMPACT_SECTION_NODES,
         ),
         tool_contracts: collect_compact_nodes(
-            bundle_nodes_by_type(bundle, "tool_contract"),
+            node_index.nodes_by_type("tool_contract"),
             MAX_COMPACT_SECTION_NODES,
         ),
-        rules: collect_compact_nodes(
-            bundle_nodes_by_type(bundle, "rule"),
-            MAX_COMPACT_SECTION_NODES,
-        ),
+        rules: collect_compact_nodes(node_index.nodes_by_type("rule"), MAX_COMPACT_SECTION_NODES),
         mcp_profiles: collect_compact_nodes(
-            bundle_nodes_by_type(bundle, "mcp_profile"),
+            node_index.nodes_by_type("mcp_profile"),
             MAX_COMPACT_SECTION_NODES,
         ),
         project_profile_facts: collect_compact_nodes(
-            active_status_nodes(&bundle.project_profiles),
+            bundle.project_profiles.active.iter().collect(),
             MAX_COMPACT_SECTION_NODES,
         ),
         relevant_corrections_lessons: collect_compact_nodes(
-            bundle_nodes_by_types(bundle, &["correction", "lesson"]),
+            node_index.nodes_by_types(&["correction", "lesson"]),
             MAX_COMPACT_SECTION_NODES,
         ),
-        hunches: collect_compact_hunches(bundle, MAX_HUNCHES),
+        hunches: collect_compact_hunches(bundle, &node_index, MAX_HUNCHES),
         source_refs: Vec::new(),
         limits: CompactRecallLimits::default(),
     };
@@ -1769,13 +1805,17 @@ fn collect_compact_nodes(nodes: Vec<&Node>, limit: usize) -> Vec<CompactNodeRef>
         .collect()
 }
 
-fn collect_compact_hunches(bundle: &StructuredRecallBundle, limit: usize) -> Vec<CompactHunch> {
+fn collect_compact_hunches(
+    bundle: &StructuredRecallBundle,
+    node_index: &BundleNodeIndex<'_>,
+    limit: usize,
+) -> Vec<CompactHunch> {
     bundle
         .hunches
         .iter()
         .take(limit)
         .map(|hunch| {
-            let source = find_node_in_bundle(bundle, hunch.source_node_id);
+            let source = node_index.node_by_id(hunch.source_node_id);
             CompactHunch {
                 source_node_id: hunch.source_node_id,
                 title: hunch.title.clone(),
@@ -1843,45 +1883,59 @@ fn compact_node_refs(compact: &CompactRecallBundle) -> impl Iterator<Item = &Com
         .chain(compact.relevant_corrections_lessons.iter())
 }
 
-fn bundle_nodes_by_type<'a>(bundle: &'a StructuredRecallBundle, node_type: &str) -> Vec<&'a Node> {
-    bundle_nodes_by_types(bundle, &[node_type])
+struct BundleNodeIndex<'a> {
+    all: Vec<&'a Node>,
+    by_type: HashMap<&'a str, Vec<&'a Node>>,
+    by_id: HashMap<i64, &'a Node>,
 }
 
-fn bundle_nodes_by_types<'a>(
-    bundle: &'a StructuredRecallBundle,
-    node_types: &[&str],
-) -> Vec<&'a Node> {
-    all_bundle_nodes(bundle)
-        .into_iter()
-        .filter(|node| node_types.contains(&node.node_type.as_str()))
-        .collect()
+impl<'a> BundleNodeIndex<'a> {
+    fn new(bundle: &'a StructuredRecallBundle) -> Self {
+        let all = all_bundle_nodes(bundle).collect::<Vec<_>>();
+        let mut by_type = HashMap::<&str, Vec<&Node>>::new();
+        let mut by_id = HashMap::new();
+        for &node in &all {
+            by_type
+                .entry(node.node_type.as_str())
+                .or_default()
+                .push(node);
+            by_id.entry(node.id).or_insert(node);
+        }
+        Self {
+            all,
+            by_type,
+            by_id,
+        }
+    }
+
+    fn nodes_by_type(&self, node_type: &str) -> Vec<&'a Node> {
+        self.by_type.get(node_type).cloned().unwrap_or_default()
+    }
+
+    fn nodes_by_types(&self, node_types: &[&str]) -> Vec<&'a Node> {
+        self.all
+            .iter()
+            .copied()
+            .filter(|node| node_types.contains(&node.node_type.as_str()))
+            .collect()
+    }
+
+    fn node_by_id(&self, node_id: i64) -> Option<&'a Node> {
+        self.by_id.get(&node_id).copied()
+    }
 }
 
-fn all_bundle_nodes(bundle: &StructuredRecallBundle) -> Vec<&Node> {
-    let mut nodes = Vec::new();
-    collect_status_nodes(&mut nodes, &bundle.workflows);
-    collect_status_nodes(&mut nodes, &bundle.gates);
-    collect_status_nodes(&mut nodes, &bundle.project_profiles);
-    nodes.extend(bundle.context_nodes.iter());
-    nodes.extend(bundle.linked_nodes.iter().map(|linked| &linked.node));
-    nodes.extend(bundle.fts_fallback.iter().map(|result| &result.node));
-    nodes
+fn all_bundle_nodes(bundle: &StructuredRecallBundle) -> impl Iterator<Item = &Node> {
+    status_nodes(&bundle.workflows)
+        .chain(status_nodes(&bundle.gates))
+        .chain(status_nodes(&bundle.project_profiles))
+        .chain(&bundle.context_nodes)
+        .chain(bundle.linked_nodes.iter().map(|linked| &linked.node))
+        .chain(bundle.fts_fallback.iter().map(|result| &result.node))
 }
 
-fn active_status_nodes(nodes: &RecallNodesByStatus) -> Vec<&Node> {
-    nodes.active.iter().collect()
-}
-
-fn collect_status_nodes<'a>(nodes: &mut Vec<&'a Node>, grouped: &'a RecallNodesByStatus) {
-    nodes.extend(grouped.active.iter());
-    nodes.extend(grouped.draft.iter());
-    nodes.extend(grouped.broken.iter());
-}
-
-fn find_node_in_bundle(bundle: &StructuredRecallBundle, node_id: i64) -> Option<&Node> {
-    all_bundle_nodes(bundle)
-        .into_iter()
-        .find(|node| node.id == node_id)
+fn status_nodes(nodes: &RecallNodesByStatus) -> impl Iterator<Item = &Node> {
+    nodes.active.iter().chain(&nodes.draft).chain(&nodes.broken)
 }
 
 fn select_hunches(bundle: &StructuredRecallBundle) -> Vec<RecallHunch> {
@@ -2055,32 +2109,52 @@ fn traverse_links(nodes: &[Node], links: &[Link]) -> Vec<RecallLinkedNode> {
     linked_nodes
 }
 
-fn structured_node_count(bundle: &StructuredRecallBundle) -> usize {
-    structured_node_ids(bundle).len()
+fn has_at_least_structured_nodes(bundle: &StructuredRecallBundle, minimum: usize) -> bool {
+    if minimum == 0 {
+        return true;
+    }
+
+    let mut ids = HashSet::with_capacity(minimum);
+    for id in structured_node_id_iter(bundle) {
+        ids.insert(id);
+        if ids.len() >= minimum {
+            return true;
+        }
+    }
+
+    false
 }
 
 fn structured_node_ids(bundle: &StructuredRecallBundle) -> HashSet<i64> {
-    let mut ids = HashSet::new();
-    collect_status_ids(&mut ids, &bundle.project_profiles);
-    collect_status_ids(&mut ids, &bundle.gates);
-    collect_status_ids(&mut ids, &bundle.workflows);
-    ids.extend(bundle.context_nodes.iter().map(|node| node.id));
-    ids.extend(bundle.linked_nodes.iter().map(|linked| linked.node.id));
-    ids
+    structured_node_id_iter(bundle).collect()
 }
 
-fn collect_status_ids(ids: &mut HashSet<i64>, nodes: &RecallNodesByStatus) {
-    ids.extend(nodes.draft.iter().map(|node| node.id));
-    ids.extend(nodes.active.iter().map(|node| node.id));
-    ids.extend(nodes.deprecated.iter().map(|node| node.id));
-    ids.extend(nodes.superseded.iter().map(|node| node.id));
-    ids.extend(nodes.broken.iter().map(|node| node.id));
+fn structured_node_id_iter(bundle: &StructuredRecallBundle) -> impl Iterator<Item = i64> + '_ {
+    status_node_ids(&bundle.project_profiles)
+        .chain(status_node_ids(&bundle.gates))
+        .chain(status_node_ids(&bundle.workflows))
+        .chain(bundle.context_nodes.iter().map(|node| node.id))
+        .chain(bundle.linked_nodes.iter().map(|linked| linked.node.id))
 }
 
-fn collect_status_titles<'a>(titles: &mut Vec<&'a str>, nodes: &'a RecallNodesByStatus) {
-    titles.extend(nodes.active.iter().map(|node| node.title.as_str()));
-    titles.extend(nodes.draft.iter().map(|node| node.title.as_str()));
-    titles.extend(nodes.broken.iter().map(|node| node.title.as_str()));
+fn status_node_ids(nodes: &RecallNodesByStatus) -> impl Iterator<Item = i64> + '_ {
+    nodes
+        .draft
+        .iter()
+        .chain(&nodes.active)
+        .chain(&nodes.deprecated)
+        .chain(&nodes.superseded)
+        .chain(&nodes.broken)
+        .map(|node| node.id)
+}
+
+fn status_titles(nodes: &RecallNodesByStatus) -> impl Iterator<Item = &str> {
+    nodes
+        .active
+        .iter()
+        .chain(&nodes.draft)
+        .chain(&nodes.broken)
+        .map(|node| node.title.as_str())
 }
 
 fn is_traversal_root(node: &Node) -> bool {
@@ -2375,6 +2449,84 @@ mod tests {
         assert!(String::from_utf8(serialized)
             .expect("JSON should be UTF-8")
             .contains("Полное тело памяти"));
+    }
+
+    #[test]
+    fn reusable_task_selector_matches_public_wrapper_exact_json_and_order() {
+        let mandatory_node = node(1, "rule", "active", "Mandatory rule");
+        let mandatory = build_mandatory_recall_context(vec![mandatory_node.clone()])
+            .expect("mandatory fixture should fit");
+        let typed = node(2, "workflow", "draft", "Deploy release");
+        let fts_only = node(3, "raw_note", "draft", "Release notes");
+        let candidates = TaskRecallCandidates {
+            typed_roots: vec![typed.clone()],
+            fts_results: vec![
+                FtsNodeSearchResult {
+                    rank: -1.0,
+                    node: typed,
+                },
+                FtsNodeSearchResult {
+                    rank: -100.0,
+                    node: mandatory_node,
+                },
+                FtsNodeSearchResult {
+                    rank: -2.0,
+                    node: fts_only,
+                },
+            ],
+            ..TaskRecallCandidates::default()
+        };
+        let selector = TaskRecallCandidateSelector::new(&mandatory.section);
+
+        let wrapper_selected =
+            select_task_recall_candidates(candidates.clone(), &mandatory.section);
+        let first_selected = selector.select(candidates.clone());
+        let repeated_selected = selector.select(candidates);
+
+        assert_eq!(first_selected, wrapper_selected);
+        assert_eq!(repeated_selected, wrapper_selected);
+        assert_eq!(
+            serde_json::to_value(&wrapper_selected).expect("selection should serialize"),
+            serde_json::json!([
+                {
+                    "node": {
+                        "id": 2,
+                        "node_type": "workflow",
+                        "status": "draft",
+                        "title": "Deploy release",
+                        "summary": null,
+                        "body": null,
+                        "source_ref": null,
+                        "confidence": null,
+                        "trust_level": null,
+                        "created_at": "2026-01-01T00:00:00Z",
+                        "updated_at": "2026-01-01T00:00:00Z"
+                    },
+                    "selection_reasons": [
+                        {"kind": "typed_root", "node_type": "workflow"},
+                        {"kind": "fts_bm25", "rank": -1.0}
+                    ]
+                },
+                {
+                    "node": {
+                        "id": 3,
+                        "node_type": "raw_note",
+                        "status": "draft",
+                        "title": "Release notes",
+                        "summary": null,
+                        "body": null,
+                        "source_ref": null,
+                        "confidence": null,
+                        "trust_level": null,
+                        "created_at": "2026-01-01T00:00:00Z",
+                        "updated_at": "2026-01-01T00:00:00Z"
+                    },
+                    "selection_reasons": [
+                        {"kind": "fts_bm25", "rank": -2.0}
+                    ]
+                }
+            ])
+        );
     }
 
     #[test]
@@ -3021,6 +3173,32 @@ mod tests {
     }
 
     #[test]
+    fn compact_node_index_preserves_bundle_order_and_first_id_match() {
+        let bundle = build_structured_bundle(vec![
+            node(7, "gate", "active", "Later gate"),
+            node(7, "workflow", "active", "First workflow"),
+            node(8, "project_profile", "active", "Profile"),
+        ]);
+        let index = BundleNodeIndex::new(&bundle);
+
+        assert_eq!(
+            index
+                .node_by_id(7)
+                .expect("duplicate id should resolve")
+                .title,
+            "First workflow"
+        );
+        assert_eq!(
+            index
+                .nodes_by_types(&["workflow", "gate"])
+                .into_iter()
+                .map(|node| node.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["First workflow", "Later gate"]
+        );
+    }
+
+    #[test]
     fn structured_bundle_excludes_deprecated_and_superseded_from_normal_sections() {
         let bundle = build_structured_bundle(vec![
             node(1, "project_profile", "deprecated", "Old profile"),
@@ -3116,12 +3294,32 @@ mod tests {
             node(2, "gate", "active", "Two"),
             node(3, "project_profile", "active", "Three"),
         ]);
+        let duplicate_ids = build_structured_bundle(vec![
+            node(1, "workflow", "active", "One"),
+            node(1, "gate", "active", "Duplicate one"),
+            node(2, "project_profile", "active", "Two"),
+        ]);
 
         assert!(needs_fts_fallback(&small));
         assert!(!needs_fts_fallback(&enough));
+        assert!(needs_fts_fallback(&duplicate_ids));
         assert_eq!(
             derive_fts_fallback_query(&small),
             Some("Needle".to_string())
+        );
+    }
+
+    #[test]
+    fn fts_fallback_query_preserves_status_and_section_priority() {
+        let bundle = build_structured_bundle(vec![
+            node(1, "project_profile", "active", "  "),
+            node(2, "project_profile", "draft", " Draft profile "),
+            node(3, "gate", "active", "Active gate"),
+        ]);
+
+        assert_eq!(
+            derive_fts_fallback_query(&bundle),
+            Some("Draft profile".to_string())
         );
     }
 

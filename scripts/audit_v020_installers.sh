@@ -73,7 +73,7 @@ write_new_stub() {
     printf '%s\n' 'fi'
     printf '%s\n' 'case "$*" in'
     printf '%s\n' '  "--version")'
-    printf '%s\n' '    printf "%s\n" "aopmem 0.2.0-rc1"'
+    printf '%s\n' '    printf "%s\n" "aopmem 0.2.0-rc2"'
     printf '%s\n' '    ;;'
     printf '%s\n' '  "upgrade plan --all-workspaces --json")'
     printf '%s\n' '    if [ "${AOPMEM_STUB_PLAN_NOT_READY:-0}" = "1" ]; then'
@@ -442,7 +442,7 @@ test_path_rejections() {
 
   setup_case recovery-destination-symlink
   install_old_binary
-  recovery_path="$AOPMEM_HOME_PATH/bin/aopmem-v0.2.0-rc1-recovery-424242"
+  recovery_path="$AOPMEM_HOME_PATH/bin/aopmem-v0.2.0-rc2-recovery-424242"
   ln -s "$CASE_ROOT/outside-recovery-target" "$recovery_path"
   expect_failure AOPMEM_INSTALL_TEST_RUN_ID=424242
   [ -L "$recovery_path" ] || fail "installer removed pre-existing recovery symlink"

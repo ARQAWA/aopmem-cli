@@ -1,7 +1,7 @@
 # Windows native update
 
 This path supports Windows 11 x64 with native Windows PowerShell 5.1.
-It updates AOPMem v0.1.0-rc3 to v0.2.0-rc1.
+It updates AOPMem v0.1.0-rc3 to v0.2.0-rc2.
 
 ## Rules
 
@@ -102,7 +102,7 @@ uses `System.IO.File.Replace` in `%USERPROFILE%\.aopmem\bin`.
 The final line is short:
 
 ```text
-AOPMem 0.2.0-rc1 updated. doctor=ok verify=ok
+AOPMem 0.2.0-rc2 updated. doctor=ok verify=ok
 binary_backup=<path> upgrade_backup=<path>
 ```
 
@@ -132,7 +132,7 @@ For an apply or atomic publication failure, the script prints and preserves:
 - the exact verified v0.2 recovery binary path;
 - the durable installer binary backup path;
 - upgrade-run backups under
-  `%USERPROFILE%\.aopmem\backups\upgrade-0.2.0-rc1-*`;
+  `%USERPROFILE%\.aopmem\backups\upgrade-0.2.0-rc2-*`;
 - the exact command or workspace error.
 
 Keep these files. Fix the reported cause. Then use the printed v0.2 recovery

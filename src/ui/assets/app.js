@@ -153,6 +153,37 @@
     "configured_unverified",
   ]);
 
+  const BADGE_CLASS_BY_VALUE = new Map([
+    ["active", "badge-success"],
+    ["success", "badge-success"],
+    ["installed", "badge-success"],
+    ["configured", "badge-success"],
+    ["useful", "badge-success"],
+    ["applied", "badge-success"],
+    ["recorded", "badge-success"],
+    ["ready", "badge-success"],
+    ["completed", "badge-success"],
+    ["draft", "badge-warning"],
+    ["warning", "badge-warning"],
+    ["pending", "badge-warning"],
+    ["partial", "badge-warning"],
+    ["configured_unverified", "badge-warning"],
+    ["proposed", "badge-warning"],
+    ["drafted", "badge-warning"],
+    ["started", "badge-warning"],
+    ["truncated", "badge-warning"],
+    ["broken", "badge-danger"],
+    ["failure", "badge-danger"],
+    ["failed", "badge-danger"],
+    ["missing", "badge-danger"],
+    ["wrong", "badge-danger"],
+    ["timeout", "badge-danger"],
+    ["overflow", "badge-danger"],
+    ["blocked", "badge-danger"],
+    ["deprecated", "badge-accent"],
+    ["superseded", "badge-accent"],
+  ]);
+
   const elements = Object.freeze({
     workspaceName: document.getElementById("workspace-name"),
     productVersion: document.getElementById("product-version"),
@@ -448,25 +479,8 @@
 
   function makeBadge(value) {
     const normalized = displayValue(value, "unknown").toLowerCase();
-    let className = "badge";
-    if ([
-      "active", "success", "installed", "configured", "useful", "applied",
-      "recorded", "ready", "completed",
-    ].includes(normalized)) {
-      className += " badge-success";
-    } else if ([
-      "draft", "warning", "pending", "partial", "configured_unverified",
-      "proposed", "drafted", "started", "truncated",
-    ].includes(normalized)) {
-      className += " badge-warning";
-    } else if ([
-      "broken", "failure", "failed", "missing", "wrong", "timeout",
-      "overflow", "blocked",
-    ].includes(normalized)) {
-      className += " badge-danger";
-    } else if (["deprecated", "superseded"].includes(normalized)) {
-      className += " badge-accent";
-    }
+    const badgeClass = BADGE_CLASS_BY_VALUE.get(normalized);
+    const className = badgeClass ? `badge ${badgeClass}` : "badge";
     return makeElement("span", className, normalized.replaceAll("_", " "));
   }
 
@@ -1154,10 +1168,9 @@
       );
     }
     const nodes = Array.from(deduplicated.values()).sort(compareNodes);
-    const nodeIds = new Set(nodes.map((node) => Number(node.id)));
     const visibleEdges = edges
-      .filter((edge) => nodeIds.has(Number(edge.source_node_id))
-        && nodeIds.has(Number(edge.target_node_id)))
+      .filter((edge) => deduplicated.has(Number(edge.source_node_id))
+        && deduplicated.has(Number(edge.target_node_id)))
       .sort(compareEdges);
     return {
       nodes,
@@ -1293,7 +1306,7 @@
         adjacency.get(target).add(source);
       }
     }
-    const sortedNodes = [...nodes].sort(compareNodes);
+    const sortedNodes = nodes;
     const rootId = centerId && nodeMap.has(centerId)
       ? centerId
       : Number(sortedNodes[0].id);
@@ -1452,7 +1465,7 @@
     const details = makeElement("details", "graph-accessible-list");
     details.append(makeElement("summary", "", "Accessible node list"));
     const list = makeElement("ul", "graph-node-list");
-    for (const node of [...nodes].sort(compareNodes)) {
+    for (const node of nodes) {
       const item = makeElement("li");
       const suffix = Number(node.id) === centerId ? " (center)" : "";
       item.append(makeButton(

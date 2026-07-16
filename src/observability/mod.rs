@@ -2319,30 +2319,63 @@ impl RetentionDeletion {
     }
 }
 
+const RETENTION_ROOTS_BEFORE_SQL: &str = "SELECT kind, id, timestamp FROM (
+        SELECT 0 AS kind_order, 'event' AS kind, id, timestamp
+        FROM observability_events
+        WHERE timestamp < ?1
+        UNION ALL
+        SELECT 1, 'feedback', id, timestamp
+        FROM feedback
+        WHERE timestamp < ?1
+        UNION ALL
+        SELECT 2, 'bundle', bundle_id, timestamp
+        FROM recall_bundles AS bundle
+        WHERE bundle.timestamp < ?1
+          AND NOT EXISTS (
+              SELECT 1 FROM feedback WHERE feedback.bundle_id = bundle.bundle_id
+          )
+     )
+     ORDER BY timestamp, kind_order, id
+     LIMIT ?2";
+
+const RETENTION_ROOTS_ALL_SQL: &str = "SELECT kind, id, timestamp FROM (
+        SELECT 0 AS kind_order, 'event' AS kind, id, timestamp
+        FROM observability_events
+        UNION ALL
+        SELECT 1, 'feedback', id, timestamp
+        FROM feedback
+        UNION ALL
+        SELECT 2, 'bundle', bundle_id, timestamp
+        FROM recall_bundles AS bundle
+        WHERE NOT EXISTS (
+            SELECT 1 FROM feedback WHERE feedback.bundle_id = bundle.bundle_id
+        )
+     )
+     ORDER BY timestamp, kind_order, id
+     LIMIT ?1";
+
 fn load_oldest_retention_roots(
     connection: &Connection,
     before: Option<&str>,
     limit: i64,
 ) -> rusqlite::Result<Vec<RetentionRoot>> {
-    let mut statement = connection.prepare(
-        "SELECT kind, id, timestamp FROM (
-            SELECT 0 AS kind_order, 'event' AS kind, id, timestamp
-            FROM observability_events
-            UNION ALL
-            SELECT 1, 'feedback', id, timestamp
-            FROM feedback
-            UNION ALL
-            SELECT 2, 'bundle', bundle_id, timestamp
-            FROM recall_bundles AS bundle
-            WHERE NOT EXISTS (
-                SELECT 1 FROM feedback WHERE feedback.bundle_id = bundle.bundle_id
-            )
-         )
-         WHERE (?1 IS NULL OR timestamp < ?1)
-         ORDER BY timestamp, kind_order, id
-         LIMIT ?2",
-    )?;
-    let rows = statement.query_map(rusqlite::params![before, limit], |row| {
+    match before {
+        Some(before) => query_retention_roots(
+            connection,
+            RETENTION_ROOTS_BEFORE_SQL,
+            rusqlite::params![before, limit],
+        ),
+        None => query_retention_roots(connection, RETENTION_ROOTS_ALL_SQL, [limit]),
+    }
+}
+
+fn query_retention_roots(
+    connection: &Connection,
+    sql: &str,
+    params: impl rusqlite::Params,
+) -> rusqlite::Result<Vec<RetentionRoot>> {
+    let mut statement = connection.prepare(sql)?;
+    let rows = statement.query_map(params, |row| {
         let kind = match row.get::<_, String>(0)?.as_str() {
             "event" => RetentionRootKind::Event,
             "feedback" => RetentionRootKind::Feedback,
@@ -3093,6 +3126,30 @@ mod tests {
             .expect("valid recall bundle should insert");
     }
 
+    fn insert_feedback_at(connection: &Connection, id: &str, timestamp: &str, bundle_id: &str) {
+        connection
+            .execute(
+                "INSERT INTO feedback (id, timestamp, bundle_id, outcome, reason)
+                 VALUES (?1, ?2, ?3, 'useful', NULL)",
+                rusqlite::params![id, timestamp, bundle_id],
+            )
+            .expect("valid feedback should insert");
+    }
+
+    fn retention_root_rows(roots: &[RetentionRoot]) -> Vec<(u8, &str, &str)> {
+        roots
+            .iter()
+            .map(|root| {
+                let kind_order = match &root.kind {
+                    RetentionRootKind::Event => 0,
+                    RetentionRootKind::Feedback => 1,
+                    RetentionRootKind::Bundle => 2,
+                };
+                (kind_order, root.id.as_str(), root.timestamp.as_str())
+            })
+            .collect()
+    }
+
     fn checkpoint(connection: &Connection) {
         let result: (i64, i64, i64) = connection
             .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
@@ -3647,6 +3704,118 @@ mod tests {
                     "forbidden payload field: {forbidden}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn retention_roots_before_preserves_cross_kind_order_and_strict_threshold() {
+        let workspace = TestWorkspace::new("retention-roots-before");
+        let writer = open_writer(&workspace.paths).expect("writer should initialize");
+        let timestamp = "2024-01-01T00:00:00Z";
+        let threshold = "2024-01-02T00:00:00Z";
+
+        insert_event_at(&writer.connection, "event-b", timestamp, "{}");
+        insert_event_at(&writer.connection, "event-a", timestamp, "{}");
+        insert_event_at(&writer.connection, "event-threshold", threshold, "{}");
+        insert_bundle_at(&writer.connection, "feedback-parent", timestamp);
+        insert_feedback_at(
+            &writer.connection,
+            "feedback-b",
+            timestamp,
+            "feedback-parent",
+        );
+        insert_feedback_at(
+            &writer.connection,
+            "feedback-a",
+            timestamp,
+            "feedback-parent",
+        );
+        insert_feedback_at(
+            &writer.connection,
+            "feedback-threshold",
+            threshold,
+            "feedback-parent",
+        );
+        insert_bundle_at(&writer.connection, "bundle-b", timestamp);
+        insert_bundle_at(&writer.connection, "bundle-a", timestamp);
+        insert_bundle_at(&writer.connection, "bundle-threshold", threshold);
+
+        let roots = load_oldest_retention_roots(&writer.connection, Some(threshold), 64)
+            .expect("retention roots should load");
+
+        assert_eq!(
+            retention_root_rows(&roots),
+            vec![
+                (0, "event-a", timestamp),
+                (0, "event-b", timestamp),
+                (1, "feedback-a", timestamp),
+                (1, "feedback-b", timestamp),
+                (2, "bundle-a", timestamp),
+                (2, "bundle-b", timestamp),
+            ]
+        );
+    }
+
+    #[test]
+    fn retention_roots_none_preserves_cross_kind_order() {
+        let workspace = TestWorkspace::new("retention-roots-none");
+        let writer = open_writer(&workspace.paths).expect("writer should initialize");
+        let first_timestamp = "2024-01-01T00:00:00Z";
+        let second_timestamp = "2024-01-02T00:00:00Z";
+
+        insert_event_at(&writer.connection, "event-later", second_timestamp, "{}");
+        insert_event_at(&writer.connection, "event-shared", first_timestamp, "{}");
+        insert_bundle_at(&writer.connection, "feedback-parent", first_timestamp);
+        insert_feedback_at(
+            &writer.connection,
+            "feedback-shared",
+            first_timestamp,
+            "feedback-parent",
+        );
+        insert_bundle_at(&writer.connection, "bundle-shared", first_timestamp);
+
+        let roots = load_oldest_retention_roots(&writer.connection, None, 64)
+            .expect("retention roots should load");
+
+        assert_eq!(
+            retention_root_rows(&roots),
+            vec![
+                (0, "event-shared", first_timestamp),
+                (1, "feedback-shared", first_timestamp),
+                (2, "bundle-shared", first_timestamp),
+                (0, "event-later", second_timestamp),
+            ]
+        );
+    }
+
+    #[test]
+    fn retention_roots_before_uses_existing_timestamp_indexes() {
+        let workspace = TestWorkspace::new("retention-roots-plan");
+        let writer = open_writer(&workspace.paths).expect("writer should initialize");
+        let explain_sql = format!("EXPLAIN QUERY PLAN {RETENTION_ROOTS_BEFORE_SQL}");
+        let mut statement = writer
+            .connection
+            .prepare(&explain_sql)
+            .expect("retention query plan should prepare");
+        let details = statement
+            .query_map(rusqlite::params!["2024-01-02T00:00:00Z", 64_i64], |row| {
+                row.get::<_, String>(3)
+            })
+            .expect("retention query plan should run")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("retention query plan should read")
+            .join("\n");
+
+        for index in [
+            "idx_observability_events_timestamp",
+            "idx_feedback_timestamp",
+            "idx_recall_bundles_timestamp",
+            "idx_feedback_bundle_id",
+        ] {
+            assert!(
+                details.contains(index),
+                "retention query plan did not use {index}: {details}"
+            );
         }
     }
 

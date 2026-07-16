@@ -28,9 +28,9 @@ use crate::storage::{self, AopmemPaths, WorkspacePaths};
 use crate::verify;
 
 const SOURCE_VERSION: &str = "0.1.0-rc3";
-const TARGET_VERSION: &str = "0.2.0-rc1";
+const TARGET_VERSION: &str = "0.2.0-rc2";
 const BACKUPS_DIRECTORY: &str = "backups";
-const BACKUP_RUN_PREFIX: &str = "upgrade-0.2.0-rc1-";
+const BACKUP_RUN_PREFIX: &str = "upgrade-0.2.0-rc2-";
 const BACKUP_PAGE_BATCH: i32 = 256;
 const BACKUP_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 const BACKUP_BUSY_PAUSE: Duration = Duration::from_millis(10);

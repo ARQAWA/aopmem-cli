@@ -9,7 +9,7 @@ use super::{
 use crate::storage;
 use rusqlite::{Connection, Transaction};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io;
 use thiserror::Error;
@@ -509,23 +509,54 @@ fn has_valid_timestamp_components(value: &str) -> bool {
     (1..=days).contains(&day) && hour <= 23 && minute <= 59 && second <= 59
 }
 
+const STATUS_FACTS_SQL: &str = r#"
+WITH stats(source, row_count, first_recorded_at, last_recorded_at) AS (
+    SELECT 'observability_events', COUNT(*), MIN(timestamp), MAX(timestamp)
+    FROM observability_events
+    UNION ALL
+    SELECT 'recall_bundles', COUNT(*), MIN(timestamp), MAX(timestamp)
+    FROM recall_bundles
+    UNION ALL
+    SELECT 'bundle_nodes', COUNT(*), MIN(first_seen_at), MAX(first_seen_at)
+    FROM bundle_nodes
+    UNION ALL
+    SELECT 'feedback', COUNT(*), MIN(timestamp), MAX(timestamp)
+    FROM feedback
+)
+SELECT
+    MAX(CASE WHEN source = 'observability_events' THEN row_count END),
+    MAX(CASE WHEN source = 'recall_bundles' THEN row_count END),
+    MAX(CASE WHEN source = 'bundle_nodes' THEN row_count END),
+    MAX(CASE WHEN source = 'feedback' THEN row_count END),
+    MIN(first_recorded_at),
+    MAX(last_recorded_at)
+FROM stats
+"#;
+
 fn load_status_facts(transaction: &Transaction<'_>) -> Result<ObserveStoreFacts, ObserveReadError> {
-    let observability_events = count_table(transaction, "observability_events")?;
-    let recall_bundles = count_table(transaction, "recall_bundles")?;
-    let bundle_nodes = count_table(transaction, "bundle_nodes")?;
-    let feedback = count_table(transaction, "feedback")?;
-    let (first_recorded_at, last_recorded_at): (Option<String>, Option<String>) = transaction
-        .query_row(
-            "SELECT MIN(timestamp), MAX(timestamp) FROM (
-                SELECT timestamp FROM observability_events
-                UNION ALL SELECT timestamp FROM recall_bundles
-                UNION ALL SELECT first_seen_at AS timestamp FROM bundle_nodes
-                UNION ALL SELECT timestamp FROM feedback
-             )",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
+    let (
+        observability_events,
+        recall_bundles,
+        bundle_nodes,
+        feedback,
+        first_recorded_at,
+        last_recorded_at,
+    ): (i64, i64, i64, i64, Option<String>, Option<String>) = transaction
+        .query_row(STATUS_FACTS_SQL, [], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        })
         .map_err(|_| ObserveReadError::ReadFailed)?;
+    let observability_events = nonnegative(observability_events)?;
+    let recall_bundles = nonnegative(recall_bundles)?;
+    let bundle_nodes = nonnegative(bundle_nodes)?;
+    let feedback = nonnegative(feedback)?;
     let (last_retention_at, retention_floor_at): (Option<String>, Option<String>) = transaction
         .query_row(
             "SELECT last_retention_at, retention_floor_at
@@ -557,20 +588,6 @@ fn load_status_facts(transaction: &Transaction<'_>) -> Result<ObserveStoreFacts,
     })
 }
 
-fn count_table(transaction: &Transaction<'_>, table: &str) -> Result<u64, ObserveReadError> {
-    let sql = match table {
-        "observability_events" => "SELECT COUNT(*) FROM observability_events",
-        "recall_bundles" => "SELECT COUNT(*) FROM recall_bundles",
-        "bundle_nodes" => "SELECT COUNT(*) FROM bundle_nodes",
-        "feedback" => "SELECT COUNT(*) FROM feedback",
-        _ => return Err(ObserveReadError::InvalidStore),
-    };
-    let value: i64 = transaction
-        .query_row(sql, [], |row| row.get(0))
-        .map_err(|_| ObserveReadError::ReadFailed)?;
-    nonnegative(value)
-}
-
 fn load_effectiveness_facts(
     transaction: &Transaction<'_>,
     workspace_key: &str,
@@ -590,18 +607,42 @@ fn load_effectiveness_facts(
         failed: event_facts.recall_failed,
         empty: event_facts.recall_empty,
         mandatory_overflow: event_facts.recall_mandatory_overflow,
-        more_results_bundles: usize_u64(event_facts.more_results_bundles.len())?,
-        terminal_more_results_bundles: usize_u64(
+        more_results_bundles: usize_u64(
             event_facts
-                .terminal_more_results
+                .recall_bundles
                 .values()
-                .filter(|more_results| **more_results)
+                .filter(|bundle| bundle.ever_more_results)
                 .count(),
         )?,
-        continuation_bundles: usize_u64(event_facts.continuation_bundles.len())?,
+        terminal_more_results_bundles: usize_u64(
+            event_facts
+                .recall_bundles
+                .values()
+                .filter(|bundle| bundle.terminal_more_results == Some(true))
+                .count(),
+        )?,
+        continuation_bundles: usize_u64(
+            event_facts
+                .recall_bundles
+                .values()
+                .filter(|bundle| bundle.continuation)
+                .count(),
+        )?,
         continuation_invocations: event_facts.continuation_invocations,
-        fts_fallback_bundles: usize_u64(event_facts.fts_bundles.len())?,
-        graph_traversal_bundles: usize_u64(event_facts.graph_bundles.len())?,
+        fts_fallback_bundles: usize_u64(
+            event_facts
+                .recall_bundles
+                .values()
+                .filter(|bundle| bundle.fts_fallback)
+                .count(),
+        )?,
+        graph_traversal_bundles: usize_u64(
+            event_facts
+                .recall_bundles
+                .values()
+                .filter(|bundle| bundle.graph_traversal)
+                .count(),
+        )?,
     };
     let selections = load_bundle_nodes(transaction, workspace_key, start_at, end_at)?;
     let feedback = load_feedback(transaction, workspace_key, start_at, end_at)?;
@@ -646,23 +687,28 @@ struct EventFacts {
     recall_failed: u64,
     recall_empty: u64,
     recall_mandatory_overflow: u64,
-    more_results_bundles: BTreeSet<String>,
-    terminal_more_results: BTreeMap<String, bool>,
-    continuation_bundles: BTreeSet<String>,
+    recall_bundles: HashMap<String, RecallBundleFacts>,
     continuation_invocations: u64,
-    fts_bundles: BTreeSet<String>,
-    graph_bundles: BTreeSet<String>,
     tool_success: u64,
     tool_failure: u64,
     tool_timeout: u64,
-    tool_terminals: BTreeSet<String>,
-    tool_errors: BTreeMap<(String, String), ToolErrorAggregate>,
+    tool_terminals: HashSet<String>,
+    tool_errors: HashMap<(String, String), ToolErrorAggregate>,
     reflection: ReflectionFacts,
     adapter_drift: AdapterDriftFacts,
     pending_audit_events: u64,
     health_failures: HealthFailureFacts,
     artifact_cleanup: ArtifactCleanupFacts,
     mcp: McpFacts,
+}
+
+#[derive(Debug, Default)]
+struct RecallBundleFacts {
+    ever_more_results: bool,
+    terminal_more_results: Option<bool>,
+    continuation: bool,
+    fts_fallback: bool,
+    graph_traversal: bool,
 }
 
 #[derive(Debug)]
@@ -960,23 +1006,20 @@ fn accumulate_event(event: StoredEvent, facts: &mut EventFacts) -> Result<(), Ob
         }
         (EventType::RecallContinuation, EventOutcome::Recorded, StoredPayload::Empty) => {
             let bundle_id = bundle_id.ok_or(ObserveReadError::InvalidStore)?;
-            facts.continuation_bundles.insert(bundle_id);
+            facts
+                .recall_bundles
+                .entry(bundle_id)
+                .or_default()
+                .continuation = true;
             facts.continuation_invocations = checked_increment(facts.continuation_invocations)?;
         }
         (EventType::RecallCompleted, EventOutcome::Success, StoredPayload::Recall(payload)) => {
             let bundle_id = bundle_id.ok_or(ObserveReadError::InvalidStore)?;
-            if payload.more_results {
-                facts.more_results_bundles.insert(bundle_id.clone());
-            }
-            if payload.fts_fallback_used {
-                facts.fts_bundles.insert(bundle_id.clone());
-            }
-            if payload.graph_traversal_used {
-                facts.graph_bundles.insert(bundle_id.clone());
-            }
-            facts
-                .terminal_more_results
-                .insert(bundle_id, payload.more_results);
+            let bundle = facts.recall_bundles.entry(bundle_id).or_default();
+            bundle.ever_more_results |= payload.more_results;
+            bundle.terminal_more_results = Some(payload.more_results);
+            bundle.fts_fallback |= payload.fts_fallback_used;
+            bundle.graph_traversal |= payload.graph_traversal_used;
         }
         (EventType::RecallEmpty, EventOutcome::Empty, StoredPayload::Empty) => {
             facts.recall_empty = checked_increment(facts.recall_empty)?;
@@ -1062,7 +1105,7 @@ fn accumulate_event(event: StoredEvent, facts: &mut EventFacts) -> Result<(), Ob
 
 fn record_tool_terminal(
     correlation_id: &str,
-    terminals: &mut BTreeSet<String>,
+    terminals: &mut HashSet<String>,
 ) -> Result<(), ObserveReadError> {
     if terminals.insert(correlation_id.to_string()) {
         Ok(())
@@ -1091,9 +1134,9 @@ fn record_tool_error(
 }
 
 fn repeated_tool_errors(
-    aggregates: BTreeMap<(String, String), ToolErrorAggregate>,
+    aggregates: HashMap<(String, String), ToolErrorAggregate>,
 ) -> TopList<RepeatedToolError> {
-    let mut items = aggregates
+    let items = aggregates
         .into_iter()
         .filter(|(_, aggregate)| aggregate.invocations >= 2)
         .map(|((tool_id, error_code), aggregate)| RepeatedToolError {
@@ -1103,14 +1146,13 @@ fn repeated_tool_errors(
             last_seen_at: aggregate.last_seen_at,
         })
         .collect::<Vec<_>>();
-    items.sort_by(|left, right| {
+    bounded_top_by(items, |left, right| {
         right
             .invocations
             .cmp(&left.invocations)
             .then_with(|| left.tool_id.cmp(&right.tool_id))
             .then_with(|| left.error_code.cmp(&right.error_code))
-    });
-    bounded_top(items)
+    })
 }
 
 fn record_event_items(
@@ -1163,8 +1205,8 @@ struct SelectedNodeAggregate {
 #[derive(Debug, Default)]
 struct RepeatedTitleAggregate {
     selections: u64,
-    nodes: BTreeSet<i64>,
-    bundles: BTreeSet<String>,
+    nodes: HashSet<i64>,
+    bundles: HashSet<String>,
 }
 
 fn load_bundle_nodes(
@@ -1189,8 +1231,8 @@ fn load_bundle_nodes(
         .query([start_at, end_at])
         .map_err(|_| ObserveReadError::ReadFailed)?;
     let mut by_type = BTreeMap::<String, u64>::new();
-    let mut selected = BTreeMap::<(String, i64), SelectedNodeAggregate>::new();
-    let mut repeated = BTreeMap::<(String, String), RepeatedTitleAggregate>::new();
+    let mut selected = HashMap::<(String, i64), SelectedNodeAggregate>::new();
+    let mut repeated = HashMap::<(String, String), RepeatedTitleAggregate>::new();
     while let Some(row) = rows.next().map_err(|_| ObserveReadError::ReadFailed)? {
         let bundle_id: String = row.get(0).map_err(|_| ObserveReadError::InvalidStore)?;
         let node_id: i64 = row.get(1).map_err(|_| ObserveReadError::InvalidStore)?;
@@ -1267,12 +1309,8 @@ fn load_bundle_nodes(
         .into_iter()
         .map(|(name, count)| NamedCount { name, count })
         .collect();
-    let most_selected = MostSelectedFacts {
-        workflows: selected_nodes_for_type(&selected, "workflow"),
-        tools: selected_nodes_for_type(&selected, "tool_contract"),
-        failure_modes: selected_nodes_for_type(&selected, "failure_mode"),
-    };
-    let mut repeated_titles = repeated
+    let most_selected = selected_nodes_by_type(selected);
+    let repeated_titles = repeated
         .into_iter()
         .filter(|(_, aggregate)| aggregate.selections >= 2)
         .map(|((node_type, title), aggregate)| {
@@ -1285,47 +1323,65 @@ fn load_bundle_nodes(
             })
         })
         .collect::<Result<Vec<_>, ObserveReadError>>()?;
-    repeated_titles.sort_by(|left, right| {
-        right
-            .selections
-            .cmp(&left.selections)
-            .then_with(|| left.node_type.cmp(&right.node_type))
-            .then_with(|| left.title.cmp(&right.title))
-    });
     Ok(SelectionFacts {
         by_type,
         most_selected,
-        repeated_titles: bounded_top(repeated_titles),
+        repeated_titles: bounded_top_by(repeated_titles, |left, right| {
+            right
+                .selections
+                .cmp(&left.selections)
+                .then_with(|| left.node_type.cmp(&right.node_type))
+                .then_with(|| left.title.cmp(&right.title))
+        }),
     })
 }
 
-fn selected_nodes_for_type(
-    selected: &BTreeMap<(String, i64), SelectedNodeAggregate>,
-    node_type: &str,
-) -> TopList<SelectedNodeCount> {
-    let mut items = selected
-        .iter()
-        .filter(|((stored_type, _), _)| stored_type == node_type)
-        .map(|((_, node_id), aggregate)| SelectedNodeCount {
-            node_id: *node_id,
-            title: aggregate.title.clone(),
+fn selected_nodes_by_type(
+    selected: HashMap<(String, i64), SelectedNodeAggregate>,
+) -> MostSelectedFacts {
+    let mut workflows = Vec::new();
+    let mut tools = Vec::new();
+    let mut failure_modes = Vec::new();
+    for ((node_type, node_id), aggregate) in selected {
+        let item = SelectedNodeCount {
+            node_id,
+            title: aggregate.title,
             bundles: aggregate.bundles,
-        })
-        .collect::<Vec<_>>();
-    items.sort_by(|left, right| {
+        };
+        match node_type.as_str() {
+            "workflow" => workflows.push(item),
+            "tool_contract" => tools.push(item),
+            "failure_mode" => failure_modes.push(item),
+            _ => {}
+        }
+    }
+    let order = |left: &SelectedNodeCount, right: &SelectedNodeCount| {
         right
             .bundles
             .cmp(&left.bundles)
             .then_with(|| left.title.cmp(&right.title))
             .then_with(|| left.node_id.cmp(&right.node_id))
-    });
-    bounded_top(items)
+    };
+    MostSelectedFacts {
+        workflows: bounded_top_by(workflows, order),
+        tools: bounded_top_by(tools, order),
+        failure_modes: bounded_top_by(failure_modes, order),
+    }
 }
 
-fn bounded_top<T>(mut items: Vec<T>) -> TopList<T> {
+fn bounded_top_by<T>(
+    mut items: Vec<T>,
+    compare: impl Fn(&T, &T) -> std::cmp::Ordering,
+) -> TopList<T> {
     let more_results = items.len() > TOP_LIMIT;
-    if items.len() > TOP_LIMIT {
+    if more_results {
+        {
+            let (top, _, _) = items.select_nth_unstable_by(TOP_LIMIT, &compare);
+            top.sort_by(&compare);
+        }
         items.truncate(TOP_LIMIT);
+    } else {
+        items.sort_by(&compare);
     }
     TopList {
         limit: TOP_LIMIT,
@@ -1962,6 +2018,38 @@ mod tests {
         (bytes, modified)
     }
 
+    fn legacy_status_facts(
+        connection: &Connection,
+    ) -> (u64, u64, u64, u64, Option<String>, Option<String>) {
+        let count = |table| {
+            let sql = format!("SELECT COUNT(*) FROM {table}");
+            let value: i64 = connection
+                .query_row(&sql, [], |row| row.get(0))
+                .expect("legacy status count should read");
+            u64::try_from(value).expect("legacy status count should be nonnegative")
+        };
+        let (first_recorded_at, last_recorded_at) = connection
+            .query_row(
+                "SELECT MIN(timestamp), MAX(timestamp) FROM (
+                    SELECT timestamp FROM observability_events
+                    UNION ALL SELECT timestamp FROM recall_bundles
+                    UNION ALL SELECT first_seen_at AS timestamp FROM bundle_nodes
+                    UNION ALL SELECT timestamp FROM feedback
+                 )",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("legacy status timestamp range should read");
+        (
+            count("observability_events"),
+            count("recall_bundles"),
+            count("bundle_nodes"),
+            count("feedback"),
+            first_recorded_at,
+            last_recorded_at,
+        )
+    }
+
     #[test]
     fn missing_store_reports_not_collected_without_creating_paths() {
         let _workspace = TestWorkspace::new("missing");
@@ -2028,6 +2116,135 @@ mod tests {
         assert_eq!(after.0, before.0, "read changed observability DB bytes");
         assert_eq!(after.1, before.1, "read changed observability DB mtime");
         assert!(!workspace.paths.db().exists());
+    }
+
+    #[test]
+    fn status_facts_cte_matches_legacy_counts_and_range() {
+        let workspace = TestWorkspace::new("status-facts-parity");
+        workspace.initialize();
+        workspace.mutate_fixture(|connection| {
+            let bundle_id = insert_bundle(
+                connection,
+                50,
+                "2026-01-02T00:00:00.000Z",
+                WORKSPACE_KEY,
+                "success",
+                None,
+                false,
+                0,
+            );
+            insert_event(
+                connection,
+                51,
+                "2026-01-01T00:00:00.000Z",
+                EventType::Doctor,
+                EventOutcome::Success,
+                empty_json(),
+                None,
+                None,
+            );
+            insert_event(
+                connection,
+                52,
+                "2026-01-05T00:00:00.000Z",
+                EventType::Doctor,
+                EventOutcome::Success,
+                empty_json(),
+                None,
+                None,
+            );
+            insert_bundle_node(
+                connection,
+                &bundle_id,
+                1,
+                "2026-01-01T00:00:00.000Z",
+                "workflow",
+                "Status fixture",
+            );
+            insert_feedback(
+                connection,
+                53,
+                "2026-01-06T00:00:00.000Z",
+                &bundle_id,
+                "useful",
+            );
+
+            let legacy = legacy_status_facts(connection);
+            let transaction = connection
+                .unchecked_transaction()
+                .expect("status facts transaction should start");
+            let facts = load_status_facts(&transaction).expect("status facts CTE should read");
+            transaction
+                .commit()
+                .expect("status facts transaction should commit");
+
+            assert_eq!(
+                (
+                    facts.observability_events,
+                    facts.recall_bundles,
+                    facts.bundle_nodes,
+                    facts.feedback,
+                    facts.first_recorded_at,
+                    facts.last_recorded_at,
+                ),
+                legacy
+            );
+        });
+    }
+
+    #[test]
+    fn status_facts_cte_rejects_invalid_timestamp() {
+        let workspace = TestWorkspace::new("status-facts-invalid-timestamp");
+        workspace.initialize();
+        workspace.mutate_fixture(|connection| {
+            insert_event(
+                connection,
+                60,
+                "invalid",
+                EventType::Doctor,
+                EventOutcome::Success,
+                empty_json(),
+                None,
+                None,
+            );
+            let transaction = connection
+                .unchecked_transaction()
+                .expect("invalid status facts transaction should start");
+            assert!(matches!(
+                load_status_facts(&transaction),
+                Err(ObserveReadError::InvalidStore)
+            ));
+        });
+    }
+
+    #[test]
+    fn status_facts_cte_uses_each_timestamp_index_once() {
+        let workspace = TestWorkspace::new("status-facts-plan");
+        workspace.initialize();
+        workspace.mutate_fixture(|connection| {
+            let explain = format!("EXPLAIN QUERY PLAN {STATUS_FACTS_SQL}");
+            let mut statement = connection
+                .prepare(&explain)
+                .expect("status facts query plan should prepare");
+            let plan = statement
+                .query_map([], |row| row.get::<_, String>(3))
+                .expect("status facts query plan should run")
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .expect("status facts query plan should collect")
+                .join("\n");
+
+            for expected_index in [
+                "idx_observability_events_timestamp",
+                "idx_recall_bundles_timestamp",
+                "idx_bundle_nodes_first_seen_at",
+                "idx_feedback_timestamp",
+            ] {
+                assert!(
+                    plan.matches(expected_index).count() == 1,
+                    "status facts must use {expected_index} once, got: {plan}"
+                );
+            }
+        });
     }
 
     #[test]
@@ -2938,11 +3155,50 @@ mod tests {
     }
 
     #[test]
-    fn bounded_top_is_explicit_and_stable() {
-        let list = bounded_top((0..TOP_QUERY_LIMIT).collect::<Vec<_>>());
-        assert_eq!(list.items.len(), TOP_LIMIT);
-        assert!(list.more_results);
-        assert_eq!(list.limit, TOP_LIMIT);
+    fn bounded_top_by_matches_full_sort_at_boundaries_and_ties() {
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        struct RankedFixture {
+            score: usize,
+            name: String,
+        }
+
+        fn order(left: &RankedFixture, right: &RankedFixture) -> std::cmp::Ordering {
+            right
+                .score
+                .cmp(&left.score)
+                .then_with(|| left.name.cmp(&right.name))
+        }
+
+        fn legacy(mut items: Vec<RankedFixture>) -> TopList<RankedFixture> {
+            items.sort_by(order);
+            let more_results = items.len() > TOP_LIMIT;
+            items.truncate(TOP_LIMIT);
+            TopList {
+                limit: TOP_LIMIT,
+                more_results,
+                items,
+            }
+        }
+
+        for size in [0, TOP_LIMIT, TOP_QUERY_LIMIT] {
+            let items = (0..size)
+                .rev()
+                .map(|index| RankedFixture {
+                    score: index % 4,
+                    name: format!("item-{index:03}"),
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(bounded_top_by(items.clone(), order), legacy(items));
+        }
+
+        let ties = (0..(TOP_LIMIT + 7))
+            .rev()
+            .map(|index| RankedFixture {
+                score: 1,
+                name: format!("tie-{index:03}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(bounded_top_by(ties.clone(), order), legacy(ties));
     }
 
     #[test]

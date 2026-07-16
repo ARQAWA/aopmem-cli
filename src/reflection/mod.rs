@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -198,6 +198,13 @@ struct ReflectionProposalRecord {
     items: Vec<ReflectionProposalItem>,
 }
 
+#[derive(Serialize)]
+struct ReflectionProposalRecordRef<'a> {
+    session_id: &'a str,
+    items: &'a [ReflectionProposalItem],
+}
+
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ReflectionApplyRecord {
     session_id: String,
@@ -209,6 +216,19 @@ struct ReflectionApplyRecord {
     created_tag_ids: Vec<i64>,
     created_source_ids: Vec<i64>,
     created_link_ids: Vec<i64>,
+}
+
+#[derive(Serialize)]
+struct ReflectionApplyRecordRef<'a> {
+    session_id: &'a str,
+    proposal_id: i64,
+    applied_item_indexes: &'a [usize],
+    draft_items: &'a [ReflectionDraftItem],
+    created_node_ids: &'a [i64],
+    created_alias_ids: &'a [i64],
+    created_tag_ids: &'a [i64],
+    created_source_ids: &'a [i64],
+    created_link_ids: &'a [i64],
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -485,9 +505,9 @@ fn reflection_proposal_node_input(
         return Err(ReflectionError::EmptySessionId);
     }
     validate_reflection_proposal(proposal)?;
-    let record = ReflectionProposalRecord {
-        session_id: session_id.to_string(),
-        items: proposal.items.clone(),
+    let record = ReflectionProposalRecordRef {
+        session_id,
+        items: &proposal.items,
     };
     Ok(storage::NewNode {
         node_type: "raw_note".to_string(),
@@ -564,9 +584,7 @@ fn apply_proposal_in_transaction(
     proposal_id: i64,
 ) -> Result<ReflectionApplyReport, ReflectionError> {
     let proposal = load_proposal(connection, proposal_id)?;
-    validate_reflection_proposal(&ReflectionProposalInput {
-        items: proposal.items.clone(),
-    })?;
+    validate_reflection_items(&proposal.items)?;
 
     connection.execute_batch(&format!("SAVEPOINT {REFLECTION_APPLY_SAVEPOINT};"))?;
     match apply_loaded_proposal_in_transaction(connection, proposal) {
@@ -597,9 +615,7 @@ pub(crate) fn attempt_apply_proposal(
     }
 
     let proposal = load_proposal(connection, proposal_id)?;
-    validate_reflection_proposal(&ReflectionProposalInput {
-        items: proposal.items.clone(),
-    })?;
+    validate_reflection_items(&proposal.items)?;
 
     connection.execute_batch(&format!("SAVEPOINT {REFLECTION_APPLY_SAVEPOINT};"))?;
     match apply_loaded_proposal_in_transaction(connection, proposal) {
@@ -629,12 +645,10 @@ fn apply_loaded_proposal_in_transaction(
     connection: &Connection,
     proposal: ReflectionProposal,
 ) -> Result<ReflectionApplyReport, ReflectionError> {
-    validate_reflection_proposal(&ReflectionProposalInput {
-        items: proposal.items.clone(),
-    })?;
+    validate_reflection_items(&proposal.items)?;
     let proposal_id = proposal.proposal_id;
 
-    let mut resolved_node_refs = BTreeMap::<String, i64>::new();
+    let mut resolved_node_refs = HashMap::<String, i64>::with_capacity(proposal.items.len());
     let mut applied_item_indexes = Vec::new();
     let mut draft_items = Vec::new();
     let mut created_node_ids = Vec::new();
@@ -684,16 +698,16 @@ fn apply_loaded_proposal_in_transaction(
         }
     }
 
-    let record = ReflectionApplyRecord {
-        session_id: proposal.session_id.clone(),
+    let record = ReflectionApplyRecordRef {
+        session_id: &proposal.session_id,
         proposal_id,
-        applied_item_indexes: applied_item_indexes.clone(),
-        draft_items: draft_items.clone(),
-        created_node_ids: created_node_ids.clone(),
-        created_alias_ids: created_alias_ids.clone(),
-        created_tag_ids: created_tag_ids.clone(),
-        created_source_ids: created_source_ids.clone(),
-        created_link_ids: created_link_ids.clone(),
+        applied_item_indexes: &applied_item_indexes,
+        draft_items: &draft_items,
+        created_node_ids: &created_node_ids,
+        created_alias_ids: &created_alias_ids,
+        created_tag_ids: &created_tag_ids,
+        created_source_ids: &created_source_ids,
+        created_link_ids: &created_link_ids,
     };
     let apply_node = storage::create_node(
         connection,
@@ -822,17 +836,23 @@ fn load_proposal(
 fn validate_reflection_proposal(
     proposal: &ReflectionProposalInput,
 ) -> Result<(), ReflectionValidationError> {
-    if proposal.items.is_empty() {
+    validate_reflection_items(&proposal.items)
+}
+
+fn validate_reflection_items(
+    items: &[ReflectionProposalItem],
+) -> Result<(), ReflectionValidationError> {
+    if items.is_empty() {
         return Err(ReflectionValidationError::EmptyProposal);
     }
-    if proposal.items.len() > storage::MAX_PROPOSAL_ITEMS {
+    if items.len() > storage::MAX_PROPOSAL_ITEMS {
         return Err(ReflectionValidationError::TooManyProposalItems {
             max_items: storage::MAX_PROPOSAL_ITEMS,
-            actual: proposal.items.len(),
+            actual: items.len(),
         });
     }
 
-    for (index, item) in proposal.items.iter().enumerate() {
+    for (index, item) in items.iter().enumerate() {
         validate_reflection_item(index, item)?;
     }
 
@@ -983,7 +1003,7 @@ enum ReflectionApplyOutcome {
 fn apply_low_risk_item(
     connection: &Connection,
     item: &ReflectionProposalItem,
-    resolved_node_refs: &mut BTreeMap<String, i64>,
+    resolved_node_refs: &mut HashMap<String, i64>,
     alias_node_ids: &mut BTreeSet<i64>,
 ) -> Result<ReflectionApplyOutcome, ReflectionError> {
     match item {
@@ -999,17 +1019,17 @@ fn apply_low_risk_item(
             trust_level,
             ..
         } => {
-            let created = storage::create_node(
+            let created = storage::create_node_borrowed(
                 connection,
-                &storage::NewNode {
-                    node_type: node_type.clone(),
-                    status: status.clone(),
-                    title: title.clone(),
-                    summary: summary.clone(),
-                    body: body.clone(),
-                    source_ref: source_ref.clone(),
+                storage::BorrowedNodeInput {
+                    node_type,
+                    status,
+                    title,
+                    summary: summary.as_deref(),
+                    body: body.as_deref(),
+                    source_ref: source_ref.as_deref(),
                     confidence: *confidence,
-                    trust_level: trust_level.clone(),
+                    trust_level: trust_level.as_deref(),
                 },
             )?;
             if let Some(node_ref) = node_ref {
@@ -1155,7 +1175,7 @@ fn apply_low_risk_item(
 fn resolve_reflection_target(
     node_id: Option<i64>,
     node_ref: Option<&str>,
-    resolved_node_refs: &BTreeMap<String, i64>,
+    resolved_node_refs: &HashMap<String, i64>,
 ) -> Option<i64> {
     match (node_id, node_ref) {
         (Some(node_id), None) => Some(node_id),
@@ -1265,6 +1285,60 @@ mod tests {
                 },
             ],
         }
+    }
+
+    #[test]
+    fn borrowed_reflection_records_preserve_exact_json() {
+        let proposal_items = duplicate_alias_failure_proposal().items;
+        let owned_proposal = ReflectionProposalRecord {
+            session_id: "session-1".to_string(),
+            items: proposal_items.clone(),
+        };
+        let borrowed_proposal = ReflectionProposalRecordRef {
+            session_id: "session-1",
+            items: &proposal_items,
+        };
+        assert_eq!(
+            serde_json::to_vec(&borrowed_proposal).expect("borrowed proposal should serialize"),
+            serde_json::to_vec(&owned_proposal).expect("owned proposal should serialize")
+        );
+
+        let applied_item_indexes = vec![0, 2];
+        let draft_items = vec![ReflectionDraftItem {
+            index: 1,
+            reason: "high_risk_item".to_string(),
+        }];
+        let created_node_ids = vec![10, 11];
+        let created_alias_ids = vec![20];
+        let created_tag_ids = vec![30];
+        let created_source_ids = vec![40];
+        let created_link_ids = vec![50];
+        let owned_apply = ReflectionApplyRecord {
+            session_id: "session-1".to_string(),
+            proposal_id: 7,
+            applied_item_indexes: applied_item_indexes.clone(),
+            draft_items: draft_items.clone(),
+            created_node_ids: created_node_ids.clone(),
+            created_alias_ids: created_alias_ids.clone(),
+            created_tag_ids: created_tag_ids.clone(),
+            created_source_ids: created_source_ids.clone(),
+            created_link_ids: created_link_ids.clone(),
+        };
+        let borrowed_apply = ReflectionApplyRecordRef {
+            session_id: "session-1",
+            proposal_id: 7,
+            applied_item_indexes: &applied_item_indexes,
+            draft_items: &draft_items,
+            created_node_ids: &created_node_ids,
+            created_alias_ids: &created_alias_ids,
+            created_tag_ids: &created_tag_ids,
+            created_source_ids: &created_source_ids,
+            created_link_ids: &created_link_ids,
+        };
+        assert_eq!(
+            serde_json::to_vec(&borrowed_apply).expect("borrowed apply should serialize"),
+            serde_json::to_vec(&owned_apply).expect("owned apply should serialize")
+        );
     }
 
     #[test]
@@ -1607,6 +1681,53 @@ mod tests {
                 actual: "low",
             })
         ));
+    }
+
+    #[test]
+    fn reflection_item_slice_validation_matches_wrapper_and_exact_error() {
+        let valid = ReflectionProposalInput {
+            items: vec![ReflectionProposalItem::CreateNode {
+                risk: ReflectionRisk::Low,
+                node_ref: Some("lesson".to_string()),
+                node_type: "lesson".to_string(),
+                status: "draft".to_string(),
+                title: "Validated lesson".to_string(),
+                summary: None,
+                body: None,
+                source_ref: None,
+                confidence: None,
+                trust_level: None,
+            }],
+        };
+        assert_eq!(
+            validate_reflection_items(&valid.items),
+            validate_reflection_proposal(&valid)
+        );
+
+        let invalid = ReflectionProposalInput {
+            items: vec![ReflectionProposalItem::CreateNode {
+                risk: ReflectionRisk::Low,
+                node_ref: Some(" ".to_string()),
+                node_type: "lesson".to_string(),
+                status: "draft".to_string(),
+                title: "Invalid lesson".to_string(),
+                summary: None,
+                body: None,
+                source_ref: None,
+                confidence: None,
+                trust_level: None,
+            }],
+        };
+        let slice_error = validate_reflection_items(&invalid.items)
+            .expect_err("slice validation should reject an empty node_ref");
+        let wrapper_error = validate_reflection_proposal(&invalid)
+            .expect_err("wrapper validation should reject an empty node_ref");
+
+        assert_eq!(slice_error, wrapper_error);
+        assert_eq!(
+            slice_error.to_string(),
+            "reflection proposal item 0 has an empty node_ref"
+        );
     }
 
     #[test]

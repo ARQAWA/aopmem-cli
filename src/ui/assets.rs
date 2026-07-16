@@ -179,6 +179,75 @@ mod tests {
     }
 
     #[test]
+    fn javascript_reuses_static_lookups_and_preserves_graph_ordering_sorts() {
+        for (value, class_name) in [
+            ("active", "badge-success"),
+            ("success", "badge-success"),
+            ("installed", "badge-success"),
+            ("configured", "badge-success"),
+            ("useful", "badge-success"),
+            ("applied", "badge-success"),
+            ("recorded", "badge-success"),
+            ("ready", "badge-success"),
+            ("completed", "badge-success"),
+            ("draft", "badge-warning"),
+            ("warning", "badge-warning"),
+            ("pending", "badge-warning"),
+            ("partial", "badge-warning"),
+            ("configured_unverified", "badge-warning"),
+            ("proposed", "badge-warning"),
+            ("drafted", "badge-warning"),
+            ("started", "badge-warning"),
+            ("truncated", "badge-warning"),
+            ("broken", "badge-danger"),
+            ("failure", "badge-danger"),
+            ("failed", "badge-danger"),
+            ("missing", "badge-danger"),
+            ("wrong", "badge-danger"),
+            ("timeout", "badge-danger"),
+            ("overflow", "badge-danger"),
+            ("blocked", "badge-danger"),
+            ("deprecated", "badge-accent"),
+            ("superseded", "badge-accent"),
+        ] {
+            assert!(
+                APP_JS.contains(&format!("[\"{value}\", \"{class_name}\"]")),
+                "badge class lookup lost {value} -> {class_name}"
+            );
+        }
+        assert!(APP_JS.contains("const BADGE_CLASS_BY_VALUE = new Map(["));
+        assert!(APP_JS.contains("BADGE_CLASS_BY_VALUE.get(normalized)"));
+        assert!(
+            APP_JS.contains("const className = badgeClass ? `badge ${badgeClass}` : \"badge\";")
+        );
+
+        assert_eq!(APP_JS.matches(".sort(compareNodes)").count(), 1);
+        for forbidden in [
+            "const nodeIds = new Set(nodes.map",
+            "const sortedNodes = [...nodes].sort(compareNodes)",
+            "for (const node of [...nodes].sort(compareNodes))",
+        ] {
+            assert!(
+                !APP_JS.contains(forbidden),
+                "UI restored redundant graph work: {forbidden}"
+            );
+        }
+        for required in [
+            "deduplicated.has(Number(edge.source_node_id))",
+            "deduplicated.has(Number(edge.target_node_id))",
+            "const sortedNodes = nodes;",
+            "const neighbors = Array.from(",
+            "const orderedLayers = Array.from(layers.entries()).sort(",
+            "layer[1].sort(",
+        ] {
+            assert!(
+                APP_JS.contains(required),
+                "UI lost required deterministic graph work: {required}"
+            );
+        }
+    }
+
+    #[test]
     fn styles_are_desktop_dense_accessible_and_system_themed() {
         for required in [
             "min-width: 1100px",

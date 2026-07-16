@@ -10,7 +10,7 @@ The only supported source and target are:
 | Item | Value |
 |---|---|
 | Source | `0.1.0-rc3` |
-| Target | `0.2.0-rc1` |
+| Target | `0.2.0-rc2` |
 | Scope | all existing AOPMem workspaces |
 | macOS | Apple Silicon |
 | Windows | Windows 11 x64, PowerShell 5.1 |
@@ -83,7 +83,7 @@ There are two backup layers:
 - Installer binary backup:
   `~/.aopmem/bin/aopmem.backup-v0.1.0-rc3-*`
 - Upgrade run backup:
-  `~/.aopmem/backups/upgrade-0.2.0-rc1-*`
+  `~/.aopmem/backups/upgrade-0.2.0-rc2-*`
 
 Windows uses the same directories under `%USERPROFILE%\.aopmem` and adds
 `.exe` to the binary filename.
@@ -173,7 +173,7 @@ Set the final flat binary path:
 ```sh
 V020_BINARY="/absolute/path/to/aopmem-darwin-arm64"
 test -x "$V020_BINARY"
-test "$("$V020_BINARY" --version)" = "aopmem 0.2.0-rc1"
+test "$("$V020_BINARY" --version)" = "aopmem 0.2.0-rc2"
 ```
 
 Create local release assets:
@@ -254,7 +254,7 @@ Then run:
 
 ```sh
 test "$("$PROOF_ROOT/update-home/bin/aopmem" --version)" = \
-  "aopmem 0.2.0-rc1"
+  "aopmem 0.2.0-rc2"
 ! grep -Eq '^init$' "$PROOF_ROOT/update-installer.trace"
 (
   cd "$PROOF_ROOT/update-repo"

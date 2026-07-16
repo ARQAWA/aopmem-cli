@@ -1,6 +1,7 @@
 //! Loopback-only HTTP transport for the embedded desktop UI.
 
 use super::{assets, data};
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{self, Cursor};
@@ -171,7 +172,7 @@ impl HttpServer {
 #[derive(Debug, Clone)]
 struct ResponseSpec {
     status: StatusCode,
-    body: Vec<u8>,
+    body: Cow<'static, [u8]>,
     content_type: &'static str,
     allow_get: bool,
 }
@@ -222,14 +223,14 @@ fn route(
     if method != &Method::Get {
         return Ok(ResponseSpec {
             status: StatusCode(405),
-            body: METHOD_NOT_ALLOWED_BODY.to_vec(),
+            body: Cow::Borrowed(METHOD_NOT_ALLOWED_BODY),
             content_type: "text/plain; charset=utf-8",
             allow_get: true,
         });
     }
     Ok(ResponseSpec {
         status: StatusCode(200),
-        body: asset.body.to_vec(),
+        body: Cow::Borrowed(asset.body),
         content_type: asset.content_type,
         allow_get: false,
     })
@@ -543,7 +544,7 @@ fn constant_time_token_match(candidate: &[u8], expected: &[u8]) -> bool {
 fn not_found() -> ResponseSpec {
     ResponseSpec {
         status: StatusCode(404),
-        body: NOT_FOUND_BODY.to_vec(),
+        body: Cow::Borrowed(NOT_FOUND_BODY),
         content_type: "text/plain; charset=utf-8",
         allow_get: false,
     }
@@ -559,13 +560,13 @@ fn json_response<T: serde::Serialize>(
 ) -> Result<ResponseSpec, HttpError> {
     Ok(ResponseSpec {
         status,
-        body: serde_json::to_vec(body)?,
+        body: Cow::Owned(serde_json::to_vec(body)?),
         content_type: "application/json; charset=utf-8",
         allow_get: status.0 == 405,
     })
 }
 
-fn build_response(spec: ResponseSpec) -> Result<Response<Cursor<Vec<u8>>>, HttpError> {
+fn build_response(spec: ResponseSpec) -> Result<Response<Cursor<Cow<'static, [u8]>>>, HttpError> {
     let body_len = spec.body.len();
     let mut headers = Vec::with_capacity(if spec.allow_get { 6 } else { 5 });
     headers.push(static_header("Content-Type", spec.content_type)?);
@@ -1089,6 +1090,42 @@ mod tests {
             .expect("HTTP response should have a body separator")
     }
 
+    fn decoded_body(response: &str) -> Vec<u8> {
+        let (headers, encoded_body) = response
+            .split_once("\r\n\r\n")
+            .expect("HTTP response should have a body separator");
+        if !headers
+            .lines()
+            .any(|line| line.eq_ignore_ascii_case("Transfer-Encoding: chunked"))
+        {
+            return encoded_body.as_bytes().to_vec();
+        }
+
+        let mut encoded = encoded_body.as_bytes();
+        let mut decoded = Vec::new();
+        loop {
+            let line_end = encoded
+                .windows(2)
+                .position(|window| window == b"\r\n")
+                .expect("chunk size should end with CRLF");
+            let length = std::str::from_utf8(&encoded[..line_end])
+                .ok()
+                .and_then(|value| value.split(';').next())
+                .and_then(|value| usize::from_str_radix(value, 16).ok())
+                .expect("chunk size should be hexadecimal");
+            encoded = &encoded[line_end + 2..];
+            if length == 0 {
+                assert!(encoded.starts_with(b"\r\n"));
+                break;
+            }
+            assert!(encoded.len() >= length + 2);
+            decoded.extend_from_slice(&encoded[..length]);
+            assert_eq!(&encoded[length..length + 2], b"\r\n");
+            encoded = &encoded[length + 2..];
+        }
+        decoded
+    }
+
     fn json_spec(spec: &ResponseSpec) -> serde_json::Value {
         serde_json::from_slice(&spec.body).expect("UI response should contain JSON")
     }
@@ -1260,6 +1297,48 @@ mod tests {
     }
 
     #[test]
+    fn static_response_bodies_are_borrowed_and_json_bodies_are_owned() {
+        let token = fixture_token();
+        for path in ["", "app.css", "app.js"] {
+            let url = format!("/{}/{path}", token.as_str());
+            let response = test_route(&Method::Get, &url, &token);
+            let asset = assets::for_path(path).expect("test asset should be allowlisted");
+            assert_eq!(response.status.0, 200);
+            assert_eq!(response.content_type, asset.content_type);
+            assert!(!response.allow_get);
+            match response.body {
+                Cow::Borrowed(body) => assert_eq!(body, asset.body),
+                Cow::Owned(_) => panic!("static asset body must stay borrowed"),
+            }
+        }
+
+        let not_found = test_route(&Method::Get, "/wrong/", &token);
+        match not_found.body {
+            Cow::Borrowed(body) => assert_eq!(body, NOT_FOUND_BODY),
+            Cow::Owned(_) => panic!("fixed 404 body must stay borrowed"),
+        }
+
+        let method_not_allowed = test_route(
+            &Method::Post,
+            &format!("/{}/app.js", token.as_str()),
+            &token,
+        );
+        assert!(method_not_allowed.allow_get);
+        match method_not_allowed.body {
+            Cow::Borrowed(body) => assert_eq!(body, METHOD_NOT_ALLOWED_BODY),
+            Cow::Owned(_) => panic!("fixed 405 body must stay borrowed"),
+        }
+
+        let json = json_response(StatusCode(200), &serde_json::json!({ "ok": true }))
+            .expect("JSON response should serialize");
+        assert_eq!(json.content_type, "application/json; charset=utf-8");
+        match json.body {
+            Cow::Owned(body) => assert_eq!(body.as_slice(), br#"{"ok":true}"#),
+            Cow::Borrowed(_) => panic!("serialized JSON body must stay owned"),
+        }
+    }
+
+    #[test]
     fn live_server_serves_all_assets_with_security_headers_and_stops_internally() {
         let token = fixture_token();
         let server = HttpServer::bind_with_token(
@@ -1282,6 +1361,7 @@ mod tests {
             ("app.css", "text/css; charset=utf-8"),
             ("app.js", "application/javascript; charset=utf-8"),
         ] {
+            let asset = assets::for_path(path).expect("live test asset should be allowlisted");
             let response = raw_request(
                 address,
                 &format!(
@@ -1297,7 +1377,16 @@ mod tests {
             assert!(response.contains("X-Content-Type-Options: nosniff\r\n"));
             assert!(response.contains("Referrer-Policy: no-referrer\r\n"));
             assert!(response.contains("Cache-Control: no-store\r\n"));
+            if let Some(content_length) = response
+                .lines()
+                .find_map(|line| line.strip_prefix("Content-Length: "))
+            {
+                assert_eq!(content_length.parse::<usize>().ok(), Some(asset.body.len()));
+            } else {
+                assert!(response.contains("Transfer-Encoding: chunked\r\n"));
+            }
             assert!(!response.to_ascii_lowercase().contains("access-control-"));
+            assert_eq!(decoded_body(&response), asset.body);
             if path.is_empty() {
                 index_response = Some(response);
             }
@@ -1315,6 +1404,7 @@ mod tests {
         assert!(status(&invalid).contains(" 404 "));
         assert_eq!(body(&missing), body(&invalid));
         assert_eq!(body(&missing), "Not Found\n");
+        assert!(missing.contains(&format!("Content-Length: {}\r\n", NOT_FOUND_BODY.len())));
 
         let post = raw_request(
             address,
@@ -1326,6 +1416,10 @@ mod tests {
         assert!(status(&post).contains(" 405 "));
         assert!(post.contains("Allow: GET\r\n"));
         assert_eq!(body(&post), "Method Not Allowed\n");
+        assert!(post.contains(&format!(
+            "Content-Length: {}\r\n",
+            METHOD_NOT_ALLOWED_BODY.len()
+        )));
 
         let index_response = index_response.expect("index response should be captured");
         assert!(body(&index_response).contains("Local read-only browser UI."));
@@ -1525,6 +1619,30 @@ mod tests {
         let deprecated_json = json_spec(&deprecated);
         assert_eq!(deprecated_json["items"].as_array().map(Vec::len), Some(1));
         assert_eq!(deprecated_json["items"][0]["id"], fixture.node_ids[2]);
+        let combined_filters = route(
+            &Method::Get,
+            &format!("{prefix}/memory?type=failure_mode&status=deprecated&q=Alpha"),
+            &token,
+            &fixture.context,
+        )
+        .expect("combined memory filters should serialize");
+        assert_eq!(
+            json_spec(&combined_filters)["items"][0]["id"],
+            fixture.node_ids[2]
+        );
+        let mismatched_filters = route(
+            &Method::Get,
+            &format!("{prefix}/memory?type=workflow&status=deprecated&q=Alpha"),
+            &token,
+            &fixture.context,
+        )
+        .expect("mismatched memory filters should serialize");
+        assert_eq!(
+            json_spec(&mismatched_filters)["items"]
+                .as_array()
+                .map(Vec::len),
+            Some(0)
+        );
 
         let node = route(
             &Method::Get,
@@ -1679,6 +1797,97 @@ mod tests {
     }
 
     #[test]
+    fn centered_graph_preserves_missing_cursor_and_corrupt_data_error_order() {
+        let fixture = DataFixture::new();
+        let token = fixture_token();
+        let prefix = format!("/{}/api/v1/graph", token.as_str());
+        let invalid_cursor = "not-a-center-cursor";
+
+        let missing = route(
+            &Method::Get,
+            &format!("{prefix}?center=999999&cursor={invalid_cursor}"),
+            &token,
+            &fixture.context,
+        )
+        .expect("missing centered graph should serialize");
+        assert_eq!(missing.status.0, 404);
+        assert_eq!(
+            json_spec(&missing),
+            serde_json::json!({
+                "ok": false,
+                "error": {
+                    "code": "UI_NODE_NOT_FOUND",
+                    "message": "Memory node was not found"
+                }
+            })
+        );
+
+        let connection = crate::storage::open_workspace_db(fixture.context.workspace_paths())
+            .expect("UI error-order DB should open");
+        connection
+            .execute(
+                "UPDATE nodes SET node_type = 'invalid-ui-test-type' WHERE id = ?1",
+                [fixture.node_ids[0]],
+            )
+            .expect("UI center semantic-corruption fixture should update");
+        drop(connection);
+
+        let invalid = route(
+            &Method::Get,
+            &format!(
+                "{prefix}?center={}&cursor={invalid_cursor}",
+                fixture.node_ids[0]
+            ),
+            &token,
+            &fixture.context,
+        )
+        .expect("invalid centered graph cursor should serialize");
+        assert_eq!(invalid.status.0, 400);
+        assert_eq!(
+            json_spec(&invalid),
+            serde_json::json!({
+                "ok": false,
+                "error": {
+                    "code": "UI_INVALID_CURSOR",
+                    "message": "Pagination cursor is invalid"
+                }
+            })
+        );
+
+        let connection = crate::storage::open_workspace_db(fixture.context.workspace_paths())
+            .expect("UI unreadable-center DB should open");
+        connection
+            .execute(
+                "UPDATE nodes SET created_at = ?1 WHERE id = ?2",
+                rusqlite::params![vec![0xff_u8], fixture.node_ids[0]],
+            )
+            .expect("UI center read-corruption fixture should update");
+        drop(connection);
+
+        let unreadable = route(
+            &Method::Get,
+            &format!(
+                "{prefix}?center={}&cursor={invalid_cursor}",
+                fixture.node_ids[0]
+            ),
+            &token,
+            &fixture.context,
+        )
+        .expect("unreadable centered graph should serialize");
+        assert_eq!(unreadable.status.0, 500);
+        assert_eq!(
+            json_spec(&unreadable),
+            serde_json::json!({
+                "ok": false,
+                "error": {
+                    "code": "UI_DATA_UNAVAILABLE",
+                    "message": "Local UI data is unavailable"
+                }
+            })
+        );
+    }
+
+    #[test]
     fn missing_observability_is_not_collected_and_is_never_created() {
         let fixture = DataFixture::new();
         let token = fixture_token();
@@ -1788,6 +1997,30 @@ mod tests {
         assert!(redacted_body.contains("[REDACTED]"));
         assert!(!redacted_body.contains("ACTIVITY_SECRET"));
         assert!(!redacted_body.contains("payload_json"));
+        let combined_filters = route(
+            &Method::Get,
+            &format!("{prefix}/activity?event=tool.run.failed&outcome=failure&command=ui-test"),
+            &token,
+            &fixture.context,
+        )
+        .expect("combined activity filters should serialize");
+        assert_eq!(
+            json_spec(&combined_filters)["items"],
+            json_spec(&redacted_activity)["items"]
+        );
+        let mismatched_filters = route(
+            &Method::Get,
+            &format!("{prefix}/activity?event=tool.run.failed&outcome=success&command=ui-test"),
+            &token,
+            &fixture.context,
+        )
+        .expect("mismatched activity filters should serialize");
+        assert_eq!(
+            json_spec(&mismatched_filters)["items"]
+                .as_array()
+                .map(Vec::len),
+            Some(0)
+        );
         let cursor = first_json["next_cursor"]
             .as_str()
             .expect("activity first page should have a cursor");
@@ -2023,6 +2256,30 @@ mod tests {
             json_spec(&external_write)["items"][0]["tool_id"],
             "omega-tool"
         );
+        let combined_tool_filters = route(
+            &Method::Get,
+            &format!("{prefix}/tools?status=draft&side_effects=external_write"),
+            &token,
+            &fixture.context,
+        )
+        .expect("combined tool filters should serialize");
+        assert_eq!(
+            json_spec(&combined_tool_filters)["items"][0]["tool_id"],
+            "omega-tool"
+        );
+        let mismatched_tool_filters = route(
+            &Method::Get,
+            &format!("{prefix}/tools?status=active&side_effects=external_write"),
+            &token,
+            &fixture.context,
+        )
+        .expect("mismatched tool filters should serialize");
+        assert_eq!(
+            json_spec(&mismatched_tool_filters)["items"]
+                .as_array()
+                .map(Vec::len),
+            Some(0)
+        );
 
         let mcp = route(
             &Method::Get,
@@ -2075,6 +2332,30 @@ mod tests {
         )
         .expect("MCP status filter should serialize");
         assert_eq!(json_spec(&configured)["items"][0]["id"], "omega-mcp");
+        let combined_mcp_filters = route(
+            &Method::Get,
+            &format!("{prefix}/mcp?status=configured_unverified&kind=http"),
+            &token,
+            &fixture.context,
+        )
+        .expect("combined MCP filters should serialize");
+        assert_eq!(
+            json_spec(&combined_mcp_filters)["items"][0]["id"],
+            "omega-mcp"
+        );
+        let mismatched_mcp_filters = route(
+            &Method::Get,
+            &format!("{prefix}/mcp?status=installed&kind=http"),
+            &token,
+            &fixture.context,
+        )
+        .expect("mismatched MCP filters should serialize");
+        assert_eq!(
+            json_spec(&mismatched_mcp_filters)["items"]
+                .as_array()
+                .map(Vec::len),
+            Some(0)
+        );
 
         for endpoint in [
             "bootstrap".to_string(),

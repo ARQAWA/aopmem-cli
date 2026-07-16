@@ -8,7 +8,7 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = "Stop"
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
-$script:ProductVersion = "0.2.0-rc1"
+$script:ProductVersion = "0.2.0-rc2"
 $script:OldReleaseLabel = "0.1.0-rc3"
 $script:OldBinaryVersion = "0.1.0"
 $script:OldBinarySha256 = "01010aeffc20aead5f353353674621b367e6ad590769e4b5915b8d02d62f6d7a"
