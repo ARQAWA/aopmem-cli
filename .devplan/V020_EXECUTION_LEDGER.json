@@ -1,0 +1,132 @@
+{
+  "goal": "AOPMem v0.2.0-rc1",
+  "status": "completed",
+  "baseline": "v0.1.0-rc3",
+  "authoritative_tree": "7c6bf85e90833fba169c58f0b60a697054310909",
+  "auto_patch_window": {
+    "max_files": 3,
+    "scope": "minimal cross-layer wiring only",
+    "requires_proof": true
+  },
+  "stages": [
+    {"id":1,"name":"recovery and classification","status":"completed","agent":"stage_01_recovery","proof":"434 hunks classified; recovery refs protected; jq and git diff --check passed"},
+    {"id":2,"name":"materialize classified checkpoint","status":"completed","agent":"stage_02_materialize","proof":"16/16 checkpoint blobs exact; V020 files preserved; fmt and 225 tests passed"},
+    {"id":3,"name":"Windows legacy workspace compatibility","status":"completed","agent":"stage_03_impl","proof":"collision-safe current/legacy resolver; 229 tests passed"},
+    {"id":4,"name":"draft approval correction","status":"completed","agent":"stage_04_prep","proof":"draft-only gate and draft_review removed; five policy tests plus CLI E2E passed; 228 tests passed"},
+    {"id":5,"name":"safe storage optimizations","status":"completed","agent":"stage_05_prep","proof":"implementation plus Stage06 AUTO_PATCH independently re-audited; P1=0 P2=0"},
+    {"id":6,"name":"transactional mutation coordinator","status":"completed","agent":"stage_06_impl","proof":"17 production writers coordinated; repo-side init rollback; 253 tests; build/fmt/clippy/diff PASS; independent re-audit PASS"},
+    {"id":7,"name":"streaming audit snapshot","status":"completed","agent":"stage_07_impl","proof":"streaming 8KiB writes, lossless TEXT/BLOB, sqlite_sequence, canonical FTS rebuild, deterministic restore; 261 tests and all checks PASS"},
+    {"id":8,"name":"cross-platform audit publish and local Git","status":"completed","agent":"stage_08_impl","proof":"atomic Unix/Windows publish; real gix commit; permanent lock; fail-closed workspace/DB/sidecar/audit Git containment; 292 tests and stable cargo-xwin check PASS"},
+    {"id":9,"name":"node pagination","status":"completed","agent":"stage_20_prep","proof":"versioned cursor, pre-DB validation, 100/500 keyset, explicit completeness, --all read snapshot, body contract; 274 tests and all checks PASS"},
+    {"id":10,"name":"all list pagination and Memory Keeper traversal","status":"completed","agent":"stage_20_prep","proof":"six remaining lists use bound cursors/--all/explicit completeness; Memory Keeper loops pages; 282 tests and all checks PASS"},
+    {"id":11,"name":"recall contract model","status":"completed","agent":"stage_11_impl","proof":"typed stable JSON model, canonical byte budgets, UUIDv4 bundle id, strict v0.2 CLI preflight; 300 tests and all checks PASS"},
+    {"id":12,"name":"mandatory recall and overflow","status":"completed","agent":"stage_12_impl","proof":"complete active mandatory load, exact O(n) JSON budget, fail-closed overflow ids and no partial success; 308 tests PASS"},
+    {"id":13,"name":"query roots FTS direct links","status":"completed","agent":"stage_13_impl","proof":"typed exact roots, full-body BM25, batched one-hop links, 256KiB whole-node packing; migration 003 AUTO_PATCH; 319 tests PASS"},
+    {"id":14,"name":"graph expansion ordering deduplication","status":"completed","agent":"stage_14_impl","proof":"bounded depth-2 recursive CTE, cycle guard, expansion reasons, tier/source/trust/confidence order and global dedup; 327 tests PASS"},
+    {"id":15,"name":"continuation reasons bundle full recall","status":"completed","agent":"stage_15_impl","proof":"query-bound continuation/full recall plus BM25 starvation and concurrent snapshot remediation; 343 tests; independent re-audit P1=0 P2=0"},
+    {"id":16,"name":"tool resource JSON contract","status":"completed","agent":"stage_16_impl","proof":"legacy-safe persisted defaults and overrides, exact 15min/10MiB ceilings, create-draft preflight and parity; 349 tests and all checks PASS"},
+    {"id":17,"name":"tool timeout inline runner","status":"completed","agent":"stage_17_impl","proof":"persisted inline limits, concurrent bounded drains, Unix process groups, race-free Windows suspended Job Object assignment, structured timeout/overflow; 361 tests and local gates PASS; final post-fix xwin compile deferred to Stage35 after bounded external CRT download stall"},
+    {"id":18,"name":"tool artifact output","status":"completed","agent":"stage_17_impl","proof":"conditional artifact fallback streams byte-exact stdout/stderr with bounded previews, secure atomic publish, 10MiB hard ceiling and cleanup; 373 tests, dev_verify and local gates PASS; final xwin build remains Stage35"},
+    {"id":19,"name":"reflection inventory and events","status":"completed","agent":"audit_01_05","proof":"one current inventory projection, exact append-only events, separate proposal/receipt nodes, nested savepoint rollback and durable failed attempts; privacy boundary AUTO_PATCH independently re-audited P1=0 P2=0; 382 tests and all local gates PASS"},
+    {"id":20,"name":"artifact retention and report","status":"completed","agent":"stage_24_prep + stage21_prep_final","proof":"exact 7-day/decimal-1GB retention and complete cleanup reports; cumulative remediation anchored artifact/audit/Git/mutation paths, fixed nested teach savepoint and macOS process-tree/executable races; 413 tests, dev_verify and all local gates PASS; independent final P1=0 P2=0"},
+    {"id":21,"name":"version and observability schema","status":"completed","agent":"stage21_prep_final","proof":"v0.2.0-rc1 package version and isolated observability.sqlite schema v1; exact 5-table/15-index plus 4-autoindex manifest, strict pre-write validation, true RO reader and private wrappers; 15 focused and 428 full tests, clippy/dev_verify/diff gates PASS"},
+    {"id":22,"name":"collector privacy and failure isolation","status":"completed","agent":"stage21_prep_final","proof":"exact 42-event typed privacy-bounded collector, lazy one-warning failure isolation, and 30-day/decimal-100MB physical retention; privacy and workspace-key audit findings remediated; 29 focused tests plus fmt/check/clippy/diff PASS; independent final re-audit P1=0 P2=0 with P3 retained for boundary/concurrency/Windows proof"},
+    {"id":23,"name":"core lifecycle instrumentation","status":"completed","agent":"stage21_prep_final","proof":"invocation-scoped collector and typed install/adapter/recall/node/link/remember/teach/reflection lifecycle facts; core locks dropped before writes; fallible UUID RNG; bounded install and pure mutation preflight; audit-before-OBS warnings; privacy/order/duration/failure tests; independent P1=0 P2=0; 459 tests plus fmt/check/clippy/build/dev_verify/diff PASS"},
+    {"id":24,"name":"tool health audit instrumentation","status":"completed","agent":"stage24_instrumentation_impl","proof":"typed post-core audit snapshot, tool, artifact, doctor, verify, cleanup, and MCP observability facts; invocation-local tool spawn trace; frozen terminal duration; strict privacy and collector failure isolation; 7 focused regressions plus 466 full tests, fmt/check/clippy/build/diff PASS; independent audit P1=0 P2=0; native Windows runtime proof remains Stage35"},
+    {"id":25,"name":"bundle tables global id feedback","status":"completed","agent":"stage25_refresh_prep","proof":"atomic recall parent/nodes/events with first-seen continuation semantics; canonical global UUIDv4 propagation; observability-only atomic feedback with redaction and no-create parent binding; managed Memory Keeper handoff; cumulative remediation closed URI/userinfo/vendor/no-host/truncated privacy, early unreadable-DB bundle linkage, workspace-bound cursor, and stale-before-retrieval ordering findings; 484 tests plus fmt/check/clippy/build/dev_verify/diff gates PASS; two independent clean audits final P1=0 P2=0 P3=0"},
+    {"id":26,"name":"observe status and report","status":"completed_after_remediation","agent":"stage26_report_refresh","proof":"strict read-only status and inclusive 30-day fact report from one SQLite snapshot; exact recall facts derive from in-window lifecycle events, terminal more_results from the last completion, and node selection from in-window first_seen_at independent of parent timestamp; AdapterDrift Failure has an explicit failed fact; initial independent audit P1=0 P2=2, both remediated; 23 report plus 2 CLI focused tests and 509 full tests; fmt/check/clippy/build/dev_verify/diff/jq PASS; independent clean re-audit P1=0 P2=0 P3=0"},
+    {"id":27,"name":"debug capsule and export","status":"completed","agent":"stage26_report_refresh","proof":"exact deterministic 12-entry read-only ZIP64 capsule; strict operational/observability snapshots, schema/integrity/workspace binding, privacy redaction, same-handle anchored no-clobber publish, and typed post-publish warning; 15 export plus 1 CLI focused proofs, 524 full tests through both suite commands, clippy/dev_verify/diff PASS; independent audit P1=0 P2=0 P3=1 accepted under D-017"},
+    {"id":28,"name":"UI server and security","status":"completed","agent":"stage28_ui_prep","proof":"invocation-scoped embedded tiny_http UI with exact IPv4 127.0.0.1 bind, random 32-byte URL token, strict GET asset allowlist, security headers, read-only/no-observability CLI dispatch, deterministic test shutdown, and shell-free macOS/Windows browser launch; 11 UI plus 3 CLI focused tests, 538 full tests through both suite commands, fmt/clippy/build/dev_verify/diff PASS; locked cargo-xwin check exit 0 after approved compile-only Windows identity wiring; independent AUTO_PATCH audit P1=0 P2=0 P3=0; independent frozen UI audit P1=0 P2=0 P3=1 accepted under D-021"},
+    {"id":29,"name":"UI read APIs","status":"completed","agent":"stage26_independent_audit","proof":"exact authenticated GET-only 11-route API; strict read-only operational and observability snapshots; scoped stable keyset pagination; body-free memory list and full node; graph 200-node/500-edge ceilings with fixed center context; private activity/bundle/effectiveness/tools/MCP DTOs; all GETs preserve DB bytes, size, mtime, schema, and counts; 13 focused and 546 full tests through both suite commands; fmt/clippy/build/dev_verify/diff PASS; independent audit P1=0 P2=0 P3=2 semantics-only accepted under D-022"},
+    {"id":30,"name":"UI frontend screenshots docs","status":"completed_after_remediation","agent":"stage28_ui_prep","proof":"six embedded desktop views consume only frozen read-only APIs; safe text-only DOM and strict same-origin token-relative GETs; bounded pagination and deterministic 200-node/500-edge graph with center dedup; real temporary-workspace browser proof at 1440x900 produced three true RGB PNGs and preserved operational/observability main DB bytes, schemas, rows, sizes, and mtimes; 7 final asset tests, 24 scoped UI tests before the final CSS-only fix, and 561 full tests at the cumulative checkpoint; cumulative Stage26-30 audit initial P1=0 P2=9 groups, all remediated, final P1=0 P2=0"},
+    {"id":31,"name":"upgrade plan","status":"completed","agent":"stage26_independent_audit","proof":"strict no-write and no-self-observation all-workspaces plan; stable ordered JSON with binary/schema/migration/disk facts; only v0.1 AOPMem workspaces, immutable read-only inspection, path and sidecar rejection, corrupt/newer schema and insufficient-space blockers; missing home remains absent; 9 module plus 1 CLI focused tests, 561 full tests, fmt/clippy/build/diff PASS; P1=0 P2=0"},
+    {"id":32,"name":"upgrade apply backups rollback","status":"completed_after_remediation","agent":"stage26_independent_audit","proof":"upgrade apply uses durable per-run backups, SQLite Online Backup under BEGIN IMMEDIATE guard, one-transaction pending migrations, exact adapter/owned-asset preflight, current-repo adapter sync plus doctor/verify, best-effort update observability, and success-with-warning pending snapshot semantics; unsafe recovery fails closed, prior committed workspaces are never cross-restored, and backups remain resumable; 14 focused apply plus 1 CLI tests, 575 full tests, fmt/clippy/check/build/diff PASS; final P1=0 P2=0"},
+    {"id":33,"name":"install prompt and platform install proofs","status":"completed","agent":"stage28_ui_prep","proof":"fresh and update installers for Apple Silicon macOS and native Windows x64 PowerShell 5.1 use prebuilt SHA-bound assets, private temp roots, safe staging/apply/atomic publish, v0.2 recovery retention, no onboarding on update, no admin/WSL/source build/Codex launch; exact v0.1 tag binary semver and both platform hashes bound; isolated 10-group audit, sh -n and diff check PASS; real final-binary macOS fresh/update deferred to Stage35"},
+    {"id":34,"name":"corpora and benchmarks","status":"completed","agent":"stage34_benchmarks","proof":"reproducible peeled-tag versus frozen-RC harness generated logical-hash-identical 100/2000/10000-node and 300/6000/30000-link corpora; 3 warmups and 20 samples per supported series, 1060 measured supported invocations, exact pagination/query/tool/verify/observability/UI/export assertions, raw JSON/CSV and medians/p95; unsupported tag operations are explicit and no percentage claim is made; P1=0 P2=0"},
+    {"id":35,"name":"assets full gates global audit RC report","status":"completed_after_remediation","agent":"stage35_release_integration","proof":"flat Mach-O arm64/minOS11 and cargo-xwin PE x64/static-CRT assets with verified SHA256SUMS; fresh installer P2 remediated with adapter seed and strict healthy/clean JSON; isolated 11-group installer audit plus real final-binary macOS fresh and peeled-v0.1 update preserve exact logical/tool/artifact data; real observability capsule and live UI proofs; source digest and benchmark candidate reproduced; fmt/clippy/build/575 tests/575 test-only/dev_verify/migration/export/UI/forbidden/diff gates PASS; independent cache-drift P3 removed; final independent OPEN P1=0 P2=0 P3=0; READY for macOS and Windows dogfood"}
+  ],
+  "cumulative_audits_after": [5,10,15,20,25,30,35],
+  "cumulative_audits": [
+    {
+      "after_stage": 5,
+      "status": "passed_after_remediation",
+      "agent": "audit_01_05",
+      "findings": {
+        "p1": 1,
+        "p2": 2
+      },
+      "proof": "initial P1/P2 repros fixed; independent runtime re-audit killed three approval mutants, checked seven invalid commands, tools-root escape, marker ownership, draft/init rollback; final P1=0 P2=0"
+    },
+    {
+      "after_stage": 10,
+      "status": "passed_after_remediation",
+      "agent": "audit_06_10_final",
+      "findings": {
+        "p1": 1,
+        "p2": 0
+      },
+      "proof": "initial systemic persistent-path escape reproduced for workspace/DB/audit paths; remediation added fail-closed link/reparse and SQLite sidecar guards; independent rebuilt-binary audit, 292 tests, seven list E2E, LocalGitAudit proofs and Windows xwin check passed; final P1=0 P2=0"
+    },
+    {
+      "after_stage": 15,
+      "status": "passed_after_remediation",
+      "agent": "audit_11_15",
+      "findings": {
+        "p1": 0,
+        "p2": 1
+      },
+      "proof": "initial BM25 continuation-order P2 fixed in Rust and SQL with starvation and WAL snapshot regressions; 343 tests and independent focused re-audit passed; final P1=0 P2=0"
+    },
+    {
+      "after_stage": 20,
+      "status": "passed_after_remediation",
+      "agent": "audit_16_20",
+      "findings": {
+        "p1": 3,
+        "p2": 3
+      },
+      "proof": "initial tool descendant/executable, artifact cleanup, audit snapshot/Git, nested teach, and cleanup-report findings remediated; component-wise and handle-relative containment, workspace identity handoff, composite mutation/snapshot locks, strict Git preflight, bounded macOS EPERM handling and negative swaps proved; 413 tests plus dev_verify passed; final P1=0 P2=0"
+    },
+    {
+      "after_stage": 25,
+      "status": "passed_after_remediation",
+      "agent": "stage25_refresh_prep + two independent re-audits",
+      "findings": {
+        "p1": 1,
+        "p2": 3
+      },
+      "proof": "initial P1 privacy finding covered URI userinfo and bounded vendor tokens; initial P2 findings covered early operational-DB failure linkage, copied-DB cross-workspace cursor binding, and the additional stale-cursor versus mandatory-overflow ordering mutant; remediation added deterministic URI/vendor/no-host/truncated canaries, atomic correlated read-open failures, domain-bound revision hashes, and stale-first retrieval ordering; 484 tests plus all local gates passed; two independent clean audits final P1=0 P2=0 P3=0"
+    },
+    {
+      "after_stage": 26,
+      "status": "passed_after_remediation",
+      "agent": "stage26_report_refresh + stage26_independent_audit",
+      "findings": {
+        "p1": 0,
+        "p2": 2
+      },
+      "proof": "initial P2 findings were parent-row/lifetime recall period semantics and omitted AdapterDrift Failure facts; remediation counts lifecycle events by their own timestamps, derives terminal more_results from stable completion order, admits current first-seen nodes for older parents, and exposes adapter failed; 23 report tests, 2 CLI tests, 509 full tests and all local gates pass; independent clean re-audit final P1=0 P2=0 P3=0"
+    },
+    {
+      "after_stage": 30,
+      "status": "passed_after_remediation",
+      "agent": "stage29_live_review",
+      "findings": {
+        "p1": 0,
+        "p2": 9
+      },
+      "proof": "two Stage26 report groups and seven Stage30 frontend/proof groups were remediated; final UI reports complete effectiveness/continuation facts and correct partial/error state, uses concise accessibility status, and provides visually checked true 1440x900 PNGs from real temporary APIs; main operational and observability DB bytes, schemas, rows, sizes, and mtimes remained unchanged; 561 full tests at the stable checkpoint plus final 7 asset tests; independent final audit P1=0 P2=0 with four accepted P3 items under D-017, D-021, and D-022"
+    },
+    {
+      "after_stage": 35,
+      "status": "passed_after_remediation",
+      "agent": "stage35_global_audit",
+      "findings": {
+        "p1": 0,
+        "p2": 0,
+        "p3": 1
+      },
+      "proof": "independent audit rechecked exact source digest, fmt, clippy, 575 tests, 11 installer groups, asset manifest/types/imports, dependency justification, forbidden drift, jq, diff, and every required path; one generated Python cache P3 was deleted and repeat scan passed; final OPEN P1=0 P2=0 P3=0 and READY for macOS/Windows dogfood"
+    }
+  ]
+}

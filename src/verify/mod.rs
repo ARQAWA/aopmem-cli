@@ -2,11 +2,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::Connection;
 use serde::Serialize;
 use thiserror::Error;
 
 use crate::adapter;
+use crate::audit;
 use crate::storage;
 
 const REQUIRED_SCHEMA_TABLES: &[&str] = &[
@@ -20,8 +21,8 @@ const REQUIRED_SCHEMA_TABLES: &[&str] = &[
     "tool_contracts",
     "mcp_profiles",
 ];
-const REQUIRED_SCHEMA_MIGRATION_VERSION: &str = "001";
-const REQUIRED_SCHEMA_MIGRATION_NAME: &str = "001_init";
+const REQUIRED_SCHEMA_MIGRATION_VERSION: &str = "003";
+const REQUIRED_SCHEMA_MIGRATION_NAME: &str = "003_task_recall_exact_indexes";
 const REQUIRED_FTS_TABLE: &str = "fts_nodes";
 const REQUIRED_FTS_COLUMNS: &[&str] = &["title", "summary", "body", "aliases"];
 const MIN_REQUIRED_ACTIVE_GATES: usize = 1;
@@ -80,6 +81,7 @@ pub struct DoctorChecks {
     pub fts: FtsHealth,
     pub adapter_block: AdapterBlockHealth,
     pub artifacts_dirs: ArtifactsDirsHealth,
+    pub audit_snapshot: AuditSnapshotHealth,
     pub tools_dirs: PathHealth,
 }
 
@@ -151,6 +153,14 @@ pub struct ArtifactsDirsHealth {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AuditSnapshotHealth {
+    pub status: DoctorStatus,
+    pub pending: bool,
+    pub marker_path: String,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LintReport {
     pub clean: bool,
     pub repo_root: String,
@@ -171,6 +181,7 @@ pub struct LintSummary {
     pub adapter_block_drift: usize,
     pub schema_drift: usize,
     pub forbidden_feature_terms: usize,
+    pub pending_audit_snapshot: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -192,6 +203,16 @@ pub enum LintIssueKind {
     AdapterBlockDrift,
     SchemaDrift,
     ForbiddenFeatureTerm,
+    PendingAuditSnapshot,
+}
+
+#[derive(Debug)]
+struct LintNode {
+    id: i64,
+    node_type: String,
+    status: String,
+    summary: Option<String>,
+    source_ref: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -199,7 +220,7 @@ pub enum DoctorError {
     #[error(transparent)]
     Path(#[from] storage::PathResolveError),
     #[error(transparent)]
-    WorkspaceKey(#[from] storage::WorkspaceKeyError),
+    WorkspaceResolve(#[from] storage::WorkspaceResolveError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -209,7 +230,7 @@ pub enum LintError {
     #[error(transparent)]
     Path(#[from] storage::PathResolveError),
     #[error(transparent)]
-    WorkspaceKey(#[from] storage::WorkspaceKeyError),
+    WorkspaceResolve(#[from] storage::WorkspaceResolveError),
     #[error("workspace database not found: {0}")]
     WorkspaceDbMissing(String),
     #[error(transparent)]
@@ -218,13 +239,12 @@ pub enum LintError {
     Io(#[from] std::io::Error),
 }
 
-#[must_use]
 pub fn run_doctor(repo_root: &Path) -> Result<DoctorReport, DoctorError> {
     let repo_root = repo_root.canonicalize()?;
     let paths = storage::resolve_paths()?;
-    let workspace_key = storage::workspace_key(&repo_root)?;
+    let workspace_key = storage::resolve_workspace_key(&paths, &repo_root)?;
+    let workspace_paths = storage::workspace_paths_for_key(&paths, &workspace_key);
     let workspace_root = paths.workspaces().join(&workspace_key);
-    let db_path = workspace_root.join("aopmem.sqlite");
     let tools_path = workspace_root.join("tools");
     let artifacts_path = workspace_root.join("artifacts");
     let audit_git_path = workspace_root.join("audit-git");
@@ -237,9 +257,8 @@ pub fn run_doctor(repo_root: &Path) -> Result<DoctorReport, DoctorError> {
     let tools_dirs = inspect_path(&tools_path);
     let artifacts_dirs =
         inspect_artifacts_dirs(&artifacts_path, &audit_git_path, &runtimes_path, &logs_path);
-    let db = inspect_db(&db_path);
-    let schema = inspect_schema(db.open_read_only.then_some(&db_path), db.error.as_deref());
-    let fts = inspect_fts(db.open_read_only.then_some(&db_path), db.error.as_deref());
+    let audit_snapshot = inspect_audit_snapshot(&audit_git_path);
+    let (db, schema, fts) = inspect_database(&workspace_paths);
     let adapter_block = inspect_adapter_block(&instruction_file);
 
     let healthy = [
@@ -250,6 +269,7 @@ pub fn run_doctor(repo_root: &Path) -> Result<DoctorReport, DoctorError> {
         fts.status,
         adapter_block.status,
         artifacts_dirs.status,
+        audit_snapshot.status,
         tools_dirs.status,
     ]
     .into_iter()
@@ -267,30 +287,33 @@ pub fn run_doctor(repo_root: &Path) -> Result<DoctorReport, DoctorError> {
             fts,
             adapter_block,
             artifacts_dirs,
+            audit_snapshot,
             tools_dirs,
         },
     })
 }
 
-#[must_use]
 pub fn run_lint(repo_root: &Path) -> Result<LintReport, LintError> {
     let repo_root = repo_root.canonicalize()?;
     let paths = storage::resolve_paths()?;
-    let workspace_key = storage::workspace_key(&repo_root)?;
-    let db_path = paths
-        .workspaces()
-        .join(&workspace_key)
-        .join("aopmem.sqlite");
-    if !db_path.is_file() {
-        return Err(LintError::WorkspaceDbMissing(path_string(&db_path)));
-    }
-
-    let connection = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    let nodes = storage::list_nodes(&connection)?;
+    let workspace_key = storage::resolve_workspace_key(&paths, &repo_root)?;
+    let workspace_paths = storage::workspace_paths_for_key(&paths, &workspace_key);
+    let workspace_root = workspace_paths.root();
+    let audit_git_path = workspace_root.join("audit-git");
+    let connection = match storage::open_workspace_db_read_only(&workspace_paths) {
+        Ok(connection) => connection,
+        Err(storage::OpenWorkspaceReadOnlyError::Missing(path)) => {
+            return Err(LintError::WorkspaceDbMissing(path_string(&path)));
+        }
+        Err(storage::OpenWorkspaceReadOnlyError::UnsafePath(error)) => {
+            return Err(LintError::Io(error));
+        }
+        Err(storage::OpenWorkspaceReadOnlyError::Db(error)) => return Err(LintError::Db(error)),
+    };
+    let nodes = list_lint_nodes(&connection)?;
     let links = storage::list_links(&connection)?;
     let node_map = nodes
         .iter()
-        .cloned()
         .map(|node| (node.id, node))
         .collect::<BTreeMap<_, _>>();
     let mut issues = Vec::new();
@@ -320,6 +343,7 @@ pub fn run_lint(repo_root: &Path) -> Result<LintReport, LintError> {
     issues.extend(find_missing_gate_issues(&nodes));
     issues.extend(find_adapter_block_drift_issues(&repo_root));
     issues.extend(find_schema_drift_issues(&connection));
+    issues.extend(find_pending_audit_snapshot_issues(&audit_git_path)?);
     issues.extend(find_forbidden_feature_term_issues(&repo_root)?);
 
     let summary = summarize_lint_issues(&issues);
@@ -331,6 +355,29 @@ pub fn run_lint(repo_root: &Path) -> Result<LintReport, LintError> {
         summary,
         issues,
     })
+}
+
+fn list_lint_nodes(connection: &Connection) -> rusqlite::Result<Vec<LintNode>> {
+    let mut statement = connection.prepare(
+        "
+        SELECT id, node_type, status, summary, source_ref
+        FROM nodes
+        ORDER BY id ASC;
+        ",
+    )?;
+    let nodes = statement
+        .query_map([], |row| {
+            Ok(LintNode {
+                id: row.get(0)?,
+                node_type: row.get(1)?,
+                status: row.get(2)?,
+                summary: row.get(3)?,
+                source_ref: row.get(4)?,
+            })
+        })?
+        .collect();
+
+    nodes
 }
 
 fn inspect_global_dirs(paths: &storage::AopmemPaths) -> GlobalDirsHealth {
@@ -390,7 +437,7 @@ fn find_duplicate_id_issues(
 
 fn find_broken_link_issues(
     links: &[storage::Link],
-    node_map: &BTreeMap<i64, storage::Node>,
+    node_map: &BTreeMap<i64, &LintNode>,
 ) -> Vec<LintIssue> {
     links
         .iter()
@@ -422,7 +469,7 @@ fn find_broken_link_issues(
 
 fn find_deprecated_active_link_issues(
     links: &[storage::Link],
-    node_map: &BTreeMap<i64, storage::Node>,
+    node_map: &BTreeMap<i64, &LintNode>,
 ) -> Vec<LintIssue> {
     let mut seen = BTreeSet::new();
     let mut issues = Vec::new();
@@ -457,7 +504,7 @@ fn find_deprecated_active_link_issues(
     issues
 }
 
-fn find_missing_source_issues(nodes: &[storage::Node]) -> Vec<LintIssue> {
+fn find_missing_source_issues(nodes: &[LintNode]) -> Vec<LintIssue> {
     nodes
         .iter()
         .filter(|node| node.status == "active" && is_blank(node.source_ref.as_deref()))
@@ -469,7 +516,7 @@ fn find_missing_source_issues(nodes: &[storage::Node]) -> Vec<LintIssue> {
         .collect()
 }
 
-fn find_missing_summary_issues(nodes: &[storage::Node]) -> Vec<LintIssue> {
+fn find_missing_summary_issues(nodes: &[LintNode]) -> Vec<LintIssue> {
     nodes
         .iter()
         .filter(|node| node.status == "active" && is_blank(node.summary.as_deref()))
@@ -481,7 +528,7 @@ fn find_missing_summary_issues(nodes: &[storage::Node]) -> Vec<LintIssue> {
         .collect()
 }
 
-fn find_missing_gate_issues(nodes: &[storage::Node]) -> Vec<LintIssue> {
+fn find_missing_gate_issues(nodes: &[LintNode]) -> Vec<LintIssue> {
     let active_gate_count = nodes
         .iter()
         .filter(|node| node.node_type == "gate" && node.status == "active")
@@ -501,8 +548,10 @@ fn find_missing_gate_issues(nodes: &[storage::Node]) -> Vec<LintIssue> {
 }
 
 fn summarize_lint_issues(issues: &[LintIssue]) -> LintSummary {
-    let mut summary = LintSummary::default();
-    summary.total = issues.len();
+    let mut summary = LintSummary {
+        total: issues.len(),
+        ..LintSummary::default()
+    };
 
     for issue in issues {
         match issue.kind {
@@ -515,10 +564,29 @@ fn summarize_lint_issues(issues: &[LintIssue]) -> LintSummary {
             LintIssueKind::AdapterBlockDrift => summary.adapter_block_drift += 1,
             LintIssueKind::SchemaDrift => summary.schema_drift += 1,
             LintIssueKind::ForbiddenFeatureTerm => summary.forbidden_feature_terms += 1,
+            LintIssueKind::PendingAuditSnapshot => summary.pending_audit_snapshot += 1,
         }
     }
 
     summary
+}
+
+fn find_pending_audit_snapshot_issues(
+    audit_git_dir: &Path,
+) -> Result<Vec<LintIssue>, std::io::Error> {
+    if !audit::has_pending_snapshot(audit_git_dir)? {
+        return Ok(Vec::new());
+    }
+
+    let marker_path = audit_git_dir.join(audit::PENDING_SNAPSHOT_MARKER_FILE_NAME);
+    Ok(vec![LintIssue {
+        kind: LintIssueKind::PendingAuditSnapshot,
+        subject: format!("audit_snapshot:{}", path_string(&marker_path)),
+        message: format!(
+            "audit snapshot is pending: marker exists at {}",
+            path_string(&marker_path)
+        ),
+    }])
 }
 
 fn find_adapter_block_drift_issues(repo_root: &Path) -> Vec<LintIssue> {
@@ -560,13 +628,13 @@ fn find_schema_drift_issues(connection: &Connection) -> Vec<LintIssue> {
     );
     push_schema_status_issue(
         &mut issues,
-        "schema_migrations:001_init",
+        &format!("schema_migrations:{REQUIRED_SCHEMA_MIGRATION_NAME}"),
         migration_status(
             connection,
             REQUIRED_SCHEMA_MIGRATION_VERSION,
             REQUIRED_SCHEMA_MIGRATION_NAME,
         ),
-        "required init migration marker is missing or unreadable",
+        "required schema migration marker is missing or unreadable",
     );
 
     for table in REQUIRED_SCHEMA_TABLES {
@@ -690,59 +758,57 @@ fn inspect_path(path: &Path) -> PathHealth {
     }
 }
 
-fn inspect_db(path: &Path) -> DbHealth {
-    let exists = path.is_file();
-    if !exists {
-        return DbHealth {
-            status: DoctorStatus::Missing,
-            path: path_string(path),
-            exists: false,
-            open_read_only: false,
-            error: None,
-        };
-    }
-
-    match Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
-        Ok(_) => DbHealth {
-            status: DoctorStatus::Ready,
-            path: path_string(path),
-            exists: true,
-            open_read_only: true,
-            error: None,
-        },
-        Err(error) => DbHealth {
-            status: DoctorStatus::Error,
-            path: path_string(path),
-            exists: true,
-            open_read_only: false,
-            error: Some(error.to_string()),
-        },
+fn inspect_database(
+    workspace_paths: &storage::WorkspacePaths,
+) -> (DbHealth, SchemaHealth, FtsHealth) {
+    let path = workspace_paths.db();
+    match storage::open_workspace_db_read_only(workspace_paths) {
+        Ok(connection) => (
+            DbHealth {
+                status: DoctorStatus::Ready,
+                path: path_string(path),
+                exists: true,
+                open_read_only: true,
+                error: None,
+            },
+            inspect_schema_with_connection(&connection),
+            inspect_fts_with_connection(&connection),
+        ),
+        Err(storage::OpenWorkspaceReadOnlyError::Missing(_)) => (
+            DbHealth {
+                status: DoctorStatus::Missing,
+                path: path_string(path),
+                exists: false,
+                open_read_only: false,
+                error: None,
+            },
+            unavailable_schema_health(None),
+            unavailable_fts_health(None),
+        ),
+        Err(error) => {
+            let error = error.to_string();
+            (
+                DbHealth {
+                    status: DoctorStatus::Error,
+                    path: path_string(path),
+                    exists: true,
+                    open_read_only: false,
+                    error: Some(error.clone()),
+                },
+                unavailable_schema_health(Some(&error)),
+                unavailable_fts_health(Some(&error)),
+            )
+        }
     }
 }
 
-fn inspect_schema(path: Option<&Path>, db_error: Option<&str>) -> SchemaHealth {
-    let Some(path) = path else {
-        return SchemaHealth {
-            status: missing_or_error_status(db_error),
-            schema_migrations: missing_or_error_status(db_error),
-            init_migration: missing_or_error_status(db_error),
-            required_tables: required_names(
-                REQUIRED_SCHEMA_TABLES,
-                missing_or_error_status(db_error),
-            ),
-            error: db_error.map(str::to_string),
-        };
-    };
-
-    match Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
-        Ok(connection) => inspect_schema_with_connection(&connection),
-        Err(error) => SchemaHealth {
-            status: DoctorStatus::Error,
-            schema_migrations: DoctorStatus::Error,
-            init_migration: DoctorStatus::Error,
-            required_tables: required_names(REQUIRED_SCHEMA_TABLES, DoctorStatus::Error),
-            error: Some(error.to_string()),
-        },
+fn unavailable_schema_health(db_error: Option<&str>) -> SchemaHealth {
+    SchemaHealth {
+        status: missing_or_error_status(db_error),
+        schema_migrations: missing_or_error_status(db_error),
+        init_migration: missing_or_error_status(db_error),
+        required_tables: required_names(REQUIRED_SCHEMA_TABLES, missing_or_error_status(db_error)),
+        error: db_error.map(str::to_string),
     }
 }
 
@@ -781,27 +847,12 @@ fn inspect_schema_with_connection(connection: &Connection) -> SchemaHealth {
     }
 }
 
-fn inspect_fts(path: Option<&Path>, db_error: Option<&str>) -> FtsHealth {
-    let Some(path) = path else {
-        return FtsHealth {
-            status: missing_or_error_status(db_error),
-            table: missing_or_error_status(db_error),
-            required_columns: required_names(
-                REQUIRED_FTS_COLUMNS,
-                missing_or_error_status(db_error),
-            ),
-            error: db_error.map(str::to_string),
-        };
-    };
-
-    match Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
-        Ok(connection) => inspect_fts_with_connection(&connection),
-        Err(error) => FtsHealth {
-            status: DoctorStatus::Error,
-            table: DoctorStatus::Error,
-            required_columns: required_names(REQUIRED_FTS_COLUMNS, DoctorStatus::Error),
-            error: Some(error.to_string()),
-        },
+fn unavailable_fts_health(db_error: Option<&str>) -> FtsHealth {
+    FtsHealth {
+        status: missing_or_error_status(db_error),
+        table: missing_or_error_status(db_error),
+        required_columns: required_names(REQUIRED_FTS_COLUMNS, missing_or_error_status(db_error)),
+        error: db_error.map(str::to_string),
     }
 }
 
@@ -885,6 +936,30 @@ fn inspect_artifacts_dirs(
     }
 }
 
+fn inspect_audit_snapshot(audit_git_dir: &Path) -> AuditSnapshotHealth {
+    let marker_path = audit_git_dir.join(audit::PENDING_SNAPSHOT_MARKER_FILE_NAME);
+    match audit::has_pending_snapshot(audit_git_dir) {
+        Ok(false) => AuditSnapshotHealth {
+            status: DoctorStatus::Ready,
+            pending: false,
+            marker_path: path_string(&marker_path),
+            error: None,
+        },
+        Ok(true) => AuditSnapshotHealth {
+            status: DoctorStatus::Error,
+            pending: true,
+            marker_path: path_string(&marker_path),
+            error: Some("pending audit snapshot marker exists".to_string()),
+        },
+        Err(error) => AuditSnapshotHealth {
+            status: DoctorStatus::Error,
+            pending: false,
+            marker_path: path_string(&marker_path),
+            error: Some(error.to_string()),
+        },
+    }
+}
+
 fn table_status(connection: &Connection, table_name: &str) -> DoctorStatus {
     match connection.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1;",
@@ -927,12 +1002,9 @@ fn fts_column_status(
 }
 
 fn combine_statuses(statuses: &[DoctorStatus]) -> DoctorStatus {
-    if statuses.iter().any(|status| *status == DoctorStatus::Error) {
+    if statuses.contains(&DoctorStatus::Error) {
         DoctorStatus::Error
-    } else if statuses
-        .iter()
-        .any(|status| *status == DoctorStatus::Missing)
-    {
+    } else if statuses.contains(&DoctorStatus::Missing) {
         DoctorStatus::Missing
     } else {
         DoctorStatus::Ready
@@ -1038,7 +1110,97 @@ mod tests {
         assert_eq!(report.checks.fts.status, DoctorStatus::Ready);
         assert_eq!(report.checks.adapter_block.status, DoctorStatus::Ready);
         assert_eq!(report.checks.artifacts_dirs.status, DoctorStatus::Ready);
+        assert_eq!(report.checks.audit_snapshot.status, DoctorStatus::Ready);
         assert_eq!(report.checks.tools_dirs.status, DoctorStatus::Ready);
+
+        fs::remove_dir_all(&override_home).expect("temp AOPMEM_HOME should be removed");
+        fs::remove_dir_all(&repo_root).expect("temp repo root should be removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_and_lint_reject_linked_external_database() {
+        use std::os::unix::fs::symlink;
+
+        let _lock = crate::install::test_env_lock()
+            .lock()
+            .expect("test lock should not be poisoned");
+        let override_home = temp_path("linked-db-home");
+        let home = temp_path("linked-db-fallback-home");
+        let repo_root = temp_path("linked-db-repo");
+        let outside_db = temp_path("linked-db-outside.sqlite");
+        let _aopmem_home = EnvGuard::set("AOPMEM_HOME", &override_home);
+        let _home = EnvGuard::set("HOME", &home);
+        fs::create_dir_all(&repo_root).expect("repo root should exist");
+        let repo_root = repo_root
+            .canonicalize()
+            .expect("repo root should canonicalize");
+        crate::install::init_workspace(&repo_root).expect("workspace should initialize");
+        let workspace_key =
+            storage::workspace_key(&repo_root).expect("workspace key should resolve");
+        let paths = storage::resolve_paths().expect("paths should resolve");
+        let workspace_paths = storage::workspace_paths_for_key(&paths, &workspace_key);
+        fs::rename(workspace_paths.db(), &outside_db).expect("DB should move outside");
+        symlink(&outside_db, workspace_paths.db()).expect("DB symlink should create");
+        let outside_before = fs::read(&outside_db).expect("outside DB should read");
+
+        let doctor = run_doctor(&repo_root).expect("doctor should return a health report");
+        let lint = run_lint(&repo_root).expect_err("lint must reject linked DB");
+
+        assert!(!doctor.healthy);
+        assert_eq!(doctor.checks.db.status, DoctorStatus::Error);
+        assert!(!doctor.checks.db.open_read_only);
+        assert!(matches!(lint, LintError::Io(_)));
+        assert_eq!(
+            fs::read(&outside_db).expect("outside DB should remain readable"),
+            outside_before
+        );
+        fs::remove_file(workspace_paths.db()).expect("DB symlink should remove");
+        fs::remove_dir_all(&override_home).expect("temp AOPMEM_HOME should remove");
+        fs::remove_dir_all(&repo_root).expect("temp repo root should remove");
+        fs::remove_file(outside_db).expect("outside DB should remove");
+    }
+
+    #[test]
+    fn doctor_and_lint_detect_pending_audit_snapshot() {
+        let _lock = crate::install::test_env_lock()
+            .lock()
+            .expect("test lock should not be poisoned");
+        let override_home = temp_path("pending-snapshot-home");
+        let home = temp_path("pending-snapshot-fallback-home");
+        let repo_root = temp_path("pending-snapshot-repo");
+        let _aopmem_home = EnvGuard::set("AOPMEM_HOME", &override_home);
+        let _home = EnvGuard::set("HOME", &home);
+
+        fs::create_dir_all(&repo_root).expect("repo root should exist");
+        let repo_root = repo_root
+            .canonicalize()
+            .expect("repo root should canonicalize");
+        crate::install::init_workspace(&repo_root).expect("workspace should initialize");
+
+        let workspace_key =
+            storage::workspace_key(&repo_root).expect("workspace key should resolve");
+        let marker_path = storage::resolve_paths()
+            .expect("paths should resolve")
+            .workspaces()
+            .join(&workspace_key)
+            .join("audit-git")
+            .join(audit::PENDING_SNAPSHOT_MARKER_FILE_NAME);
+        fs::write(&marker_path, "snapshot did not finish\n")
+            .expect("pending marker should be written");
+
+        let doctor = run_doctor(&repo_root).expect("doctor should succeed");
+        assert!(!doctor.healthy);
+        assert_eq!(doctor.checks.audit_snapshot.status, DoctorStatus::Error);
+        assert!(doctor.checks.audit_snapshot.pending);
+
+        let lint = run_lint(&repo_root).expect("lint should succeed");
+        assert!(!lint.clean);
+        assert_eq!(lint.summary.pending_audit_snapshot, 1);
+        assert!(lint.issues.iter().any(|issue| {
+            issue.kind == LintIssueKind::PendingAuditSnapshot
+                && issue.subject == format!("audit_snapshot:{}", marker_path.display())
+        }));
 
         fs::remove_dir_all(&override_home).expect("temp AOPMEM_HOME should be removed");
         fs::remove_dir_all(&repo_root).expect("temp repo root should be removed");
@@ -1074,6 +1236,31 @@ mod tests {
         assert_eq!(report.checks.adapter_block.status, DoctorStatus::Missing);
 
         fs::remove_dir_all(&override_home).expect("temp AOPMEM_HOME should be removed");
+        fs::remove_dir_all(&repo_root).expect("temp repo root should be removed");
+    }
+
+    #[test]
+    fn doctor_does_not_create_workspace_state_when_missing() {
+        let _lock = crate::install::test_env_lock()
+            .lock()
+            .expect("test lock should not be poisoned");
+        let override_home = temp_path("missing-read-only-home");
+        let home = temp_path("missing-read-only-fallback-home");
+        let repo_root = temp_path("missing-read-only-repo");
+        let _aopmem_home = EnvGuard::set("AOPMEM_HOME", &override_home);
+        let _home = EnvGuard::set("HOME", &home);
+
+        fs::create_dir_all(&repo_root).expect("repo root should exist");
+        let repo_root = repo_root
+            .canonicalize()
+            .expect("repo root should canonicalize");
+
+        let report = run_doctor(&repo_root).expect("doctor should succeed");
+
+        assert_eq!(report.checks.db.status, DoctorStatus::Missing);
+        assert!(!override_home.exists());
+        assert!(!home.exists());
+
         fs::remove_dir_all(&repo_root).expect("temp repo root should be removed");
     }
 
@@ -1333,7 +1520,7 @@ mod tests {
         assert_eq!(report.summary.schema_drift, 1);
         assert!(report.issues.iter().any(|issue| {
             issue.kind == LintIssueKind::SchemaDrift
-                && issue.subject == "schema:schema_migrations:001_init"
+                && issue.subject == "schema:schema_migrations:003_task_recall_exact_indexes"
         }));
 
         fs::remove_dir_all(&override_home).expect("temp AOPMEM_HOME should be removed");

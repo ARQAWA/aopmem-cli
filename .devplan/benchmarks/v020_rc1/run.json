@@ -1,0 +1,50 @@
+{
+  "benchmark_contract": "AOPMem v0.2.0-rc1 stage 34",
+  "build_profile": "release",
+  "clock": "time.perf_counter_ns",
+  "corpora": [
+    "small",
+    "medium",
+    "large"
+  ],
+  "generated_at_utc": "2026-07-15T11:33:44Z",
+  "generator_version": 1,
+  "host": {
+    "machine": "arm64",
+    "platform": "macOS-26.5.1-arm64-arm-64bit-Mach-O",
+    "processor": "arm",
+    "python": "3.14.5"
+  },
+  "measured_samples": 20,
+  "notes": [
+    "No retained workspace is used; all fixtures live below a disposable work directory.",
+    "Unsupported v0.1 operations are recorded, not emulated.",
+    "Every supported metric uses the requested warmup and measured sample counts.",
+    "Wall-clock process timings include startup and JSON serialization unless a metric says otherwise."
+  ],
+  "statistics": {
+    "median": "statistics.median",
+    "p95": "nearest-rank ceil(0.95*n)"
+  },
+  "toolchain": {
+    "cargo": "cargo 1.95.0 (f2d3ce0bd 2026-03-21) (Homebrew)",
+    "rustc": "rustc 1.95.0 (59807616e 2026-04-14) (Homebrew)"
+  },
+  "variants": {
+    "baseline": {
+      "binary_sha256": "dbc67aa27324310ac35d028cfef1c73e2dfd6308ed4ae73d1314e014a5f5e6d2",
+      "peeled_commit": "9877d39a4bc44cf62140aace8755720044c1d41f",
+      "product_version": "0.1.0",
+      "source_release": "v0.1.0-rc3 peeled tag"
+    },
+    "current": {
+      "binary_sha256": "12ec578dc641373e0e22b67f548fb2862620571eb9777026304cd46e10427e61",
+      "head_commit": "9877d39a4bc44cf62140aace8755720044c1d41f",
+      "product_version": "0.2.0-rc1",
+      "source_release": "v0.2.0-rc1 worktree",
+      "source_tree_sha256": "91976686ab74fa5b85b4d1c43419268ca3e508d606e1cd1da65f2b309ca7abc4",
+      "worktree_dirty": true
+    }
+  },
+  "warmups": 3
+}

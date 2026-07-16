@@ -1,0 +1,91 @@
+$ rtk cargo build
+cargo build (0 crates compiled)
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.39s
+[exit 0]
+
+$ rtk cargo test
+cargo test: 178 passed (1 suite, 2.37s)
+[exit 0]
+
+$ rtk cargo test --tests
+cargo test: 178 passed (1 suite, 1.77s)
+[exit 0]
+
+$ git diff --check
+[exit 0]
+
+$ file dist/aopmem-darwin-arm64/aopmem
+dist/aopmem-darwin-arm64/aopmem: Mach-O 64-bit executable arm64
+[exit 0]
+
+$ file dist/aopmem-windows-x86_64/aopmem.exe
+dist/aopmem-windows-x86_64/aopmem.exe: PE32+ executable (console) x86-64, for MS Windows
+[exit 0]
+
+$ shasum -a 256 dist/aopmem-darwin-arm64/aopmem
+d238071299d557cfdeabfce75a52b2bcd2f62635802ef34da5ba11767155c607  dist/aopmem-darwin-arm64/aopmem
+[exit 0]
+
+$ shasum -a 256 dist/aopmem-windows-x86_64/aopmem.exe
+01010aeffc20aead5f353353674621b367e6ad590769e4b5915b8d02d62f6d7a  dist/aopmem-windows-x86_64/aopmem.exe
+[exit 0]
+
+$ dist/aopmem-darwin-arm64/aopmem --version
+aopmem 0.1.0
+[exit 0]
+
+$ mac temp smoke: init/doctor/recall key, UTF-8, AGENTS, no .aopmem
+[exit 1: harness log path error before product assertion]
+
+$ mac temp smoke: init/doctor/recall key, UTF-8, AGENTS, no .aopmem
+init_ok=true doctor_ok=true recall_ok=true
+init_key=repo-9621ae12
+doctor_key=repo-9621ae12
+recall_key=repo-9621ae12
+PASS same workspace_key
+PASS no repo .aopmem
+FAIL AGENTS managed block
+[exit 1: harness omitted adapter seed before AGENTS assertion]
+
+$ mac temp smoke corrected: init + adapter seed/status + doctor + recall
+seed_ok=true status_ok=true managed_block_present=null
+init_key=repo-6a7725a9
+doctor_key=repo-6a7725a9
+recall_key=repo-6a7725a9
+PASS same workspace_key
+PASS no repo .aopmem
+PASS AGENTS real managed block
+PASS Cyrillic persisted
+PASS no ???? stored
+bad_status=5 bad_code=SUSPICIOUS_MOJIBAKE_INPUT
+PASS ???? rejected
+[exit 0]
+
+$ focused drift scan
+.devplan/RELEASE_CANDIDATE_v0.1.0-rc3.md:70:- Node.js rewrite.
+.devplan/RELEASE_CANDIDATE_v0.1.0-rc3.md:74:- CI/GitHub Actions.
+.devplan/RELEASE_CANDIDATE_v0.1.0-rc3.md:76:- Mem0, Hindsight, vector search, semantic search, embeddings, Qdrant, or
+.devplan/RELEASE_CANDIDATE_v0.1.0-rc3.md:77:  custom MCP server.
+.devplan/PROOF_LOG.md:1045:- Did not add aliases, tags, sources, events, FTS, semantic/vector search,
+.devplan/PROOF_LOG.md:1113:- Did not add events, registries, FTS, semantic/vector search, MCP server, or
+.devplan/PROOF_LOG.md:1415:- Did not add BM25 search CLI, recall logic, semantic search, vectors, or
+.devplan/PROOF_LOG.md:1416:  embeddings.
+.devplan/PROOF_LOG.md:1497:- Did not use FTS/BM25, graph traversal, semantic search, vectors, or
+.devplan/PROOF_LOG.md:1498:  embeddings.
+.devplan/PROOF_LOG.md:1725:- No semantic/vector search was added.
+.devplan/PROOF_LOG.md:1811:- No semantic, vector, Mem0, Hindsight, MCP, CI, or markdown export work.
+.devplan/PROOF_LOG.md:1890:- No semantic/vector search, Mem0, Hindsight, custom MCP, CI, or markdown
+.devplan/PROOF_LOG.md:1971:- No semantic/vector search, Mem0, Hindsight, custom MCP, CI, or markdown
+.devplan/PROOF_LOG.md:4643:rg -n -i "mem0|hindsight|qdrant|embedding|vector|semantic search|custom MCP server|migration old MVP|import old MVP|old MVP|background enrichment|current_state|task history|markdown export|markdown import|GitHub Actions|CI workflow" --glob '!target/**' --glob '!dist/**' --glob '!Cargo.lock' .
+.devplan/PROOF_LOG.md:4868:PASS no Linux, Windows ARM, WSL, CI, Node.js rewrite, or runtime feature drift
+.devplan/PROOF_LOG.md:4975:rg -n -i "node.js|npm start|wsl|linux support|windows arm|github actions|ci workflow|mem0|hindsight|qdrant|embedding|vector search|semantic search|custom mcp server|background enrichment|current_state|task history" --glob '!target/**' --glob '!dist/**' --glob '!Cargo.lock' .
+src/verify/mod.rs:31:    "mem0",
+src/verify/mod.rs:32:    "hindsight",
+src/verify/mod.rs:33:    "semantic search",
+src/verify/mod.rs:34:    "vector search",
+src/verify/mod.rs:35:    "embeddings",
+src/verify/mod.rs:36:    "qdrant",
+src/verify/mod.rs:1361:            "// Mem0 should not appear here\n",
+src/verify/mod.rs:1371:                && issue.message.contains("term=mem0")
+[exit 0]
+

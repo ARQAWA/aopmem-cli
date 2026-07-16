@@ -4921,3 +4921,82 @@ INFO install/v0.1/install_prompt.md had pre-existing modified status; this
 patch did not edit it.
 PASS native Windows smoke was not run on Mac.
 ```
+
+## WINDOWS_FIRST_INSTALL_REMEDIATION_RC3
+
+Status: `PASS`
+
+Objective:
+
+- Fix first real Windows install bugs and prepare rc3 for native Windows VDI
+  smoke.
+
+Files changed:
+
+- `src/storage/mod.rs`
+- `src/install/mod.rs`
+- `src/cli/mod.rs`
+- `src/adapter/mod.rs`
+- `templates/managed-block/AGENTS.managed-block.md`
+- `docs/WINDOWS_NATIVE_POWERSHELL_SMOKE.md`
+- `install/v0.1/install_prompt.md`
+- `dist/aopmem-darwin-arm64/aopmem`
+- `dist/aopmem-windows-x86_64/aopmem.exe`
+- `.devplan/WINDOWS_FIRST_INSTALL_REMEDIATION.md`
+- `.devplan/RELEASE_CANDIDATE_v0.1.0-rc3.md`
+- `.devplan/PROOF_LOG.md`
+
+Bugs fixed:
+
+- Windows native PowerShell no longer requires `HOME`.
+- Workspace key is shared and canonical across init, doctor, recall, adapter,
+  node, link, tool, reflect, and artifacts command paths.
+- Invalid stdin UTF-8 fails with `INVALID_UTF8_INPUT`.
+- Mojibake-like semantic answers fail with `SUSPICIOUS_MOJIBAKE_INPUT`.
+- AGENTS managed block now contains the real AOPMem operational contract.
+- Windows smoke doc now uses native PowerShell, UTF-8 preamble, and rc3 temp
+  proof.
+
+Commands run:
+
+```text
+cargo fmt
+rtk cargo build
+rtk cargo test
+rtk cargo test --tests
+git diff --check
+bash scripts/build_macos_arm.sh
+file dist/aopmem-darwin-arm64/aopmem
+dist/aopmem-darwin-arm64/aopmem --version
+shasum -a 256 dist/aopmem-darwin-arm64/aopmem
+bash scripts/build_windows_x64_from_macos.sh
+file dist/aopmem-windows-x86_64/aopmem.exe
+shasum -a 256 dist/aopmem-windows-x86_64/aopmem.exe
+rg -n -i "node.js|npm start|wsl|linux support|windows arm|github actions|ci workflow|mem0|hindsight|qdrant|embedding|vector search|semantic search|custom mcp server|background enrichment|current_state|task history" --glob '!target/**' --glob '!dist/**' --glob '!Cargo.lock' .
+```
+
+Results:
+
+```text
+PASS cargo fmt
+PASS rtk cargo build
+PASS rtk cargo test: 178 passed
+PASS rtk cargo test --tests: 178 passed
+PASS git diff --check
+PASS macOS ARM build
+PASS macOS binary file type: Mach-O 64-bit executable arm64
+PASS macOS binary version: aopmem 0.1.0
+PASS macOS binary sha256:
+  d238071299d557cfdeabfce75a52b2bcd2f62635802ef34da5ba11767155c607
+PASS Windows x64 build
+PASS Windows binary file type: PE32+ executable (console) x86-64, for MS Windows
+PASS Windows binary sha256:
+  01010aeffc20aead5f353353674621b367e6ad590769e4b5915b8d02d62f6d7a
+PASS drift scan: hits are negative docs or src/verify denylist/test evidence.
+PASS native Windows smoke was not run on Mac.
+```
+
+Release recommendation:
+
+- Ready for Windows VDI smoke: yes.
+- Ready to tag final after Windows smoke: yes, if native Windows smoke passes.

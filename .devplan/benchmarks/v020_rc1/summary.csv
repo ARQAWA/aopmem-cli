@@ -1,0 +1,69 @@
+variant,product_version,corpus,metric,supported,unsupported_reason,warmups,sample_count,median_ms,p95_ms,min_ms,max_ms
+baseline,0.1.0,seed,init,True,,3,20,13.191354,15.597625,12.005042,15.705875
+current,0.2.0-rc1,seed,init,True,,3,20,110.675646,117.562334,103.120666,119.786167
+baseline,0.1.0,small,node_list_first_page,False,v0.1.0-rc3 node list is unbounded and has no page-size or cursor contract,0,0,,,,
+baseline,0.1.0,small,node_list_full_pagination,True,,3,20,4.584208,5.485167,4.326125,5.563583
+baseline,0.1.0,small,recall_baseline,True,,3,20,4.2197295,4.399,4.1435,4.442625
+baseline,0.1.0,small,recall_query,False,v0.1.0-rc3 recall has no `--query` task-retrieval contract,0,0,,,,
+baseline,0.1.0,small,tool_list,True,,3,20,4.011167,4.152291,3.855375,4.185541
+baseline,0.1.0,small,doctor,True,,3,20,4.2588755,4.467542,4.166083,4.470792
+baseline,0.1.0,small,verify,True,,3,20,4.1699585,4.362583,4.035417,4.447584
+baseline,0.1.0,small,audit_snapshot_mutation,True,,3,20,7.186063,7.479459,6.976167,7.606292
+baseline,0.1.0,small,observability_wall_and_residual,False,v0.1.0-rc3 has no Local Observability collector or store,0,0,,,,
+baseline,0.1.0,small,ui_initial_overview_api,False,v0.1.0-rc3 has no `aopmem ui` command or local HTTP API,0,0,,,,
+baseline,0.1.0,small,export_debug_capsule,False,v0.1.0-rc3 has no `aopmem observe export` command,0,0,,,,
+current,0.2.0-rc1,small,node_list_first_page,True,,3,20,4.7527705000000005,4.984584,4.506459,5.025333
+current,0.2.0-rc1,small,node_list_full_pagination,True,,3,20,5.309583,5.809875,4.877417,5.937917
+current,0.2.0-rc1,small,recall_baseline,True,,3,20,7.235229,7.650375,6.963833,7.891
+current,0.2.0-rc1,small,recall_query,True,,3,20,8.372417,11.548208,7.75,17.465542
+current,0.2.0-rc1,small,tool_list,True,,3,20,4.2932295,4.473542,4.154084,4.636375
+current,0.2.0-rc1,small,doctor,True,,3,20,6.7615205,7.389625,6.560084,7.520458
+current,0.2.0-rc1,small,verify,True,,3,20,7.067458500000001,7.583,6.777875,7.67675
+current,0.2.0-rc1,small,audit_snapshot_mutation,True,,3,20,73.3005,76.557292,66.266875,80.115
+current,0.2.0-rc1,small,observability_wall_and_residual,True,,3,20,6.836667,7.441208,6.62175,7.9355
+current,0.2.0-rc1,small,ui_initial_overview_api,True,,3,20,6.025854,17.707209,5.735667,97.523708
+current,0.2.0-rc1,small,export_debug_capsule,True,,3,20,37.611999999999995,38.67625,35.382167,41.482959
+baseline,0.1.0,medium,node_list_first_page,False,v0.1.0-rc3 node list is unbounded and has no page-size or cursor contract,0,0,,,,
+baseline,0.1.0,medium,node_list_full_pagination,True,,3,20,13.376875,13.670167,12.279625,13.843334
+baseline,0.1.0,medium,recall_baseline,True,,3,20,9.3871875,9.932917,9.169833,10.263584
+baseline,0.1.0,medium,recall_query,False,v0.1.0-rc3 recall has no `--query` task-retrieval contract,0,0,,,,
+baseline,0.1.0,medium,tool_list,True,,3,20,4.3494375000000005,4.66775,4.148125,4.810541
+baseline,0.1.0,medium,doctor,True,,3,20,4.2949585,4.473125,4.101041,4.768042
+baseline,0.1.0,medium,verify,True,,3,20,9.853208500000001,10.003042,9.675459,10.200958
+baseline,0.1.0,medium,audit_snapshot_mutation,True,,3,20,43.8271455,49.3325,42.739916,121.893042
+baseline,0.1.0,medium,observability_wall_and_residual,False,v0.1.0-rc3 has no Local Observability collector or store,0,0,,,,
+baseline,0.1.0,medium,ui_initial_overview_api,False,v0.1.0-rc3 has no `aopmem ui` command or local HTTP API,0,0,,,,
+baseline,0.1.0,medium,export_debug_capsule,False,v0.1.0-rc3 has no `aopmem observe export` command,0,0,,,,
+current,0.2.0-rc1,medium,node_list_first_page,True,,3,20,4.7571465,4.8635,4.570542,5.024334
+current,0.2.0-rc1,medium,node_list_full_pagination,True,,3,20,28.8105835,29.977167,28.45125,30.315083
+current,0.2.0-rc1,medium,recall_baseline,True,,3,20,10.6625,11.751166,10.258708,11.802833
+current,0.2.0-rc1,medium,recall_query,True,,3,20,20.298208000000002,20.773916,19.58675,20.961709
+current,0.2.0-rc1,medium,tool_list,True,,3,20,4.5587915,4.792208,4.39675,4.837458
+current,0.2.0-rc1,medium,doctor,True,,3,20,9.465520999999999,9.816208,9.172208,9.895292
+current,0.2.0-rc1,medium,verify,True,,3,20,13.5314585,13.740292,13.2695,13.849583
+current,0.2.0-rc1,medium,audit_snapshot_mutation,True,,3,20,99.618187,103.252958,90.230875,104.0335
+current,0.2.0-rc1,medium,observability_wall_and_residual,True,,3,20,9.5430205,9.893125,9.212084,9.909834
+current,0.2.0-rc1,medium,ui_initial_overview_api,True,,3,20,8.223416499999999,9.588084,7.737708,9.851
+current,0.2.0-rc1,medium,export_debug_capsule,True,,3,20,459.170625,467.815208,454.753916,476.872666
+baseline,0.1.0,large,node_list_first_page,False,v0.1.0-rc3 node list is unbounded and has no page-size or cursor contract,0,0,,,,
+baseline,0.1.0,large,node_list_full_pagination,True,,3,20,47.2749795,48.723458,46.715417,48.871291
+baseline,0.1.0,large,recall_baseline,True,,3,20,32.8982295,33.792166,32.141125,33.948292
+baseline,0.1.0,large,recall_query,False,v0.1.0-rc3 recall has no `--query` task-retrieval contract,0,0,,,,
+baseline,0.1.0,large,tool_list,True,,3,20,4.723604,4.96925,4.532583,5.252375
+baseline,0.1.0,large,doctor,True,,3,20,4.581104,5.0155,4.431875,5.138208
+baseline,0.1.0,large,verify,True,,3,20,34.810520999999994,35.077625,34.686208,35.104584
+baseline,0.1.0,large,audit_snapshot_mutation,True,,3,20,196.1370415,202.644166,189.586,204.681083
+baseline,0.1.0,large,observability_wall_and_residual,False,v0.1.0-rc3 has no Local Observability collector or store,0,0,,,,
+baseline,0.1.0,large,ui_initial_overview_api,False,v0.1.0-rc3 has no `aopmem ui` command or local HTTP API,0,0,,,,
+baseline,0.1.0,large,export_debug_capsule,False,v0.1.0-rc3 has no `aopmem observe export` command,0,0,,,,
+current,0.2.0-rc1,large,node_list_first_page,True,,3,20,4.841042,5.235333,4.585917,5.58675
+current,0.2.0-rc1,large,node_list_full_pagination,True,,3,20,146.7856875,153.771709,145.250417,173.107791
+current,0.2.0-rc1,large,recall_baseline,True,,3,20,24.298354,25.942167,23.747625,26.806292
+current,0.2.0-rc1,large,recall_query,True,,3,20,70.720646,71.30325,69.6905,72.363875
+current,0.2.0-rc1,large,tool_list,True,,3,20,5.1204795,5.316125,4.913958,5.400375
+current,0.2.0-rc1,large,doctor,True,,3,20,21.647646,24.860125,21.007458,25.187833
+current,0.2.0-rc1,large,verify,True,,3,20,43.0358755,45.084292,42.440792,45.988458
+current,0.2.0-rc1,large,audit_snapshot_mutation,True,,3,20,206.19260450000002,218.505417,201.59,306.4005
+current,0.2.0-rc1,large,observability_wall_and_residual,True,,3,20,25.443687500000003,28.394708,21.81975,29.189333
+current,0.2.0-rc1,large,ui_initial_overview_api,True,,3,20,17.858625,19.533792,17.72875,44.7725
+current,0.2.0-rc1,large,export_debug_capsule,True,,3,20,2268.556187,2373.789125,2253.86475,2380.793958

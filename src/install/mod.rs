@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use rusqlite::Connection;
 use serde::Serialize;
 
+use crate::mutation;
 use crate::storage;
 
 const AOPMEM_BINARY_NAME: &str = "aopmem";
@@ -94,12 +95,20 @@ pub struct WorkspaceInitStatus {
     pub semantic_nodes_existing: usize,
     pub understand_anything_enabled: bool,
     pub codebase_memory_enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audit_warning: Option<mutation::MutationWarning>,
+    #[serde(skip)]
+    pub(crate) snapshot_observation: mutation::SnapshotObservation,
 }
 
 #[derive(Debug)]
 pub enum WorkspaceInitError {
     Path(storage::PathResolveError),
     WorkspaceKey(storage::WorkspaceKeyError),
+    WorkspaceResolve(storage::WorkspaceResolveError),
+    InvalidUtf8Input,
+    SuspiciousMojibakeInput,
+    InputTooLarge { max_bytes: usize },
     Io(io::Error),
     Db(rusqlite::Error),
     Seed(storage::NodeStorageError),
@@ -114,6 +123,12 @@ impl From<storage::PathResolveError> for WorkspaceInitError {
 impl From<storage::WorkspaceKeyError> for WorkspaceInitError {
     fn from(error: storage::WorkspaceKeyError) -> Self {
         Self::WorkspaceKey(error)
+    }
+}
+
+impl From<storage::WorkspaceResolveError> for WorkspaceInitError {
+    fn from(error: storage::WorkspaceResolveError) -> Self {
+        Self::WorkspaceResolve(error)
     }
 }
 
@@ -228,15 +243,18 @@ pub(crate) fn test_env_lock() -> &'static std::sync::Mutex<()> {
 pub fn init_workspace(
     repo_root: impl AsRef<Path>,
 ) -> Result<WorkspaceInitStatus, WorkspaceInitError> {
-    let repo_root = repo_root.as_ref();
+    let repo_root = storage::resolve_workspace_root_from(repo_root.as_ref())?;
     let paths = storage::resolve_paths()?;
-    let workspace_key = storage::workspace_key(repo_root)?;
+    let workspace_key = storage::resolve_workspace_key(&paths, &repo_root)?;
 
     storage::ensure_global_dirs(&paths)?;
     let workspace_paths = storage::ensure_workspace_dirs(&paths, &workspace_key)?;
     let db_created = !workspace_paths.db().is_file();
-    let connection = storage::open_workspace_db(&workspace_paths)?;
-    let (seeded_nodes_created, seeded_nodes_existing) = seed_base_workspace_nodes(&connection)?;
+    let outcome = mutation::mutate_workspace(&workspace_paths, |connection, _effects| {
+        seed_base_workspace_nodes(connection)
+    })
+    .map_err(workspace_mutation_error)?;
+    let (seeded_nodes_created, seeded_nodes_existing) = outcome.value;
 
     Ok(WorkspaceInitStatus {
         workspace_key,
@@ -247,6 +265,8 @@ pub fn init_workspace(
         semantic_nodes_existing: 0,
         understand_anything_enabled: false,
         codebase_memory_enabled: false,
+        audit_warning: outcome.warning,
+        snapshot_observation: outcome.snapshot_observation,
     })
 }
 
@@ -259,33 +279,86 @@ where
     R: BufRead,
     W: Write,
 {
-    let repo_root = repo_root.as_ref();
-    let mut status = init_workspace(repo_root)?;
+    let mut progress = None;
+    run_install_flow_with_progress(repo_root, reader, writer, &mut progress)
+}
+
+pub fn run_install_flow_with_progress<R, W>(
+    repo_root: impl AsRef<Path>,
+    reader: &mut R,
+    writer: &mut W,
+    progress: &mut Option<WorkspaceInitStatus>,
+) -> Result<WorkspaceInitStatus, WorkspaceInitError>
+where
+    R: BufRead,
+    W: Write,
+{
+    *progress = None;
+    let repo_root = storage::resolve_workspace_root_from(repo_root.as_ref())?;
     let answers = collect_install_answers(reader, writer)?;
     let paths = storage::resolve_paths()?;
-    let workspace_paths = storage::ensure_workspace_dirs(&paths, &status.workspace_key)?;
-    let connection = storage::open_workspace_db(&workspace_paths)?;
+    let workspace_key = storage::resolve_workspace_key(&paths, &repo_root)?;
+    storage::ensure_global_dirs(&paths)?;
+    let workspace_paths = storage::ensure_workspace_dirs(&paths, &workspace_key)?;
+    let db_created = !workspace_paths.db().is_file();
 
-    if answers.understand_anything_enabled {
-        ensure_understand_docs(repo_root)?;
-    }
+    let outcome = mutation::mutate_workspace(&workspace_paths, |connection, effects| {
+        if answers.understand_anything_enabled {
+            ensure_understand_docs(&repo_root, effects)?;
+        }
+        let (seeded_nodes_created, seeded_nodes_existing) = seed_base_workspace_nodes(connection)?;
+        register_understand_profile_best_effort(connection, answers.understand_anything_enabled);
+        register_codebase_memory_profile_best_effort(connection, answers.codebase_memory_enabled);
+        let (semantic_nodes_created, semantic_nodes_existing) =
+            seed_install_answers(connection, &answers)?;
+        Ok::<_, WorkspaceInitError>((
+            seeded_nodes_created,
+            seeded_nodes_existing,
+            semantic_nodes_created,
+            semantic_nodes_existing,
+        ))
+    })
+    .map_err(workspace_mutation_error)?;
+    let (
+        seeded_nodes_created,
+        seeded_nodes_existing,
+        semantic_nodes_created,
+        semantic_nodes_existing,
+    ) = outcome.value;
 
-    register_understand_profile_best_effort(&connection, answers.understand_anything_enabled);
-    register_codebase_memory_profile_best_effort(&connection, answers.codebase_memory_enabled);
-
-    let (semantic_nodes_created, semantic_nodes_existing) =
-        seed_install_answers(&connection, &answers)?;
+    let status = WorkspaceInitStatus {
+        workspace_key,
+        seeded_nodes_created,
+        seeded_nodes_existing,
+        db_created,
+        semantic_nodes_created,
+        semantic_nodes_existing,
+        understand_anything_enabled: answers.understand_anything_enabled,
+        codebase_memory_enabled: answers.codebase_memory_enabled,
+        audit_warning: outcome.warning,
+        snapshot_observation: outcome.snapshot_observation,
+    };
+    *progress = Some(status.clone());
 
     writer.write_all(STYLE_NOTE.as_bytes())?;
     writer.write_all(b"\n")?;
     writer.flush()?;
 
-    status.semantic_nodes_created = semantic_nodes_created;
-    status.semantic_nodes_existing = semantic_nodes_existing;
-    status.understand_anything_enabled = answers.understand_anything_enabled;
-    status.codebase_memory_enabled = answers.codebase_memory_enabled;
-
     Ok(status)
+}
+
+fn workspace_mutation_error(
+    error: mutation::MutationError<WorkspaceInitError>,
+) -> WorkspaceInitError {
+    match error {
+        mutation::MutationError::Operation(error) => error,
+        mutation::MutationError::Io(error)
+        | mutation::MutationError::FilesystemRollback { source: error } => {
+            WorkspaceInitError::Io(error)
+        }
+        mutation::MutationError::Db(error)
+        | mutation::MutationError::Rollback { source: error, .. } => WorkspaceInitError::Db(error),
+    }
 }
 
 fn register_understand_profile_best_effort(
@@ -342,23 +415,45 @@ fn optional_mcp_status(enabled: bool, detector_passed: Option<bool>) -> &'static
     }
 }
 
-fn ensure_understand_docs(repo_root: &Path) -> Result<(), WorkspaceInitError> {
+fn ensure_understand_docs(
+    repo_root: &Path,
+    effects: &mut mutation::MutationEffects,
+) -> Result<(), WorkspaceInitError> {
     let docs_root = repo_root.join(UNDERSTAND_DOCS_DIR);
-    fs::create_dir_all(&docs_root)?;
-    ensure_understand_docs_schema(&docs_root)?;
+    ensure_tracked_directory(&docs_root, effects)?;
+    let canonical_repo_root = repo_root.canonicalize()?;
+    let canonical_docs_root = docs_root.canonicalize()?;
+    if canonical_docs_root.parent() != Some(canonical_repo_root.as_path()) {
+        return Err(unsafe_understand_docs_path(&docs_root));
+    }
+    ensure_understand_docs_schema(&docs_root, effects)?;
 
     for directory in UNDERSTAND_DOCS_DIRECTORIES {
-        fs::create_dir_all(docs_root.join(directory))?;
+        let directory = docs_root.join(directory);
+        ensure_tracked_directory(&directory, effects)?;
+        if directory.canonicalize()?.parent() != Some(canonical_docs_root.as_path()) {
+            return Err(unsafe_understand_docs_path(&directory));
+        }
     }
 
-    ensure_understand_docs_exclude(repo_root)?;
+    ensure_understand_docs_exclude(repo_root, effects)?;
     Ok(())
 }
 
-fn ensure_understand_docs_schema(docs_root: &Path) -> Result<(), WorkspaceInitError> {
+fn ensure_understand_docs_schema(
+    docs_root: &Path,
+    effects: &mut mutation::MutationEffects,
+) -> Result<(), WorkspaceInitError> {
     let schema_path = docs_root.join(UNDERSTAND_DOCS_SCHEMA);
-    if schema_path.is_file() {
-        return Ok(());
+    match fs::symlink_metadata(&schema_path) {
+        Ok(metadata) => {
+            if path_is_link_or_reparse_point(&metadata) || !metadata.is_file() {
+                return Err(unsafe_understand_docs_path(&schema_path));
+            }
+            return Ok(());
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
     }
 
     let schema = concat!(
@@ -377,17 +472,36 @@ fn ensure_understand_docs_schema(docs_root: &Path) -> Result<(), WorkspaceInitEr
         "- testing-model/\n",
         "- maps/\n",
     );
+    effects.register_created_file(schema_path.clone());
     fs::write(schema_path, schema)?;
     Ok(())
 }
 
-fn ensure_understand_docs_exclude(repo_root: &Path) -> Result<(), WorkspaceInitError> {
+fn ensure_understand_docs_exclude(
+    repo_root: &Path,
+    effects: &mut mutation::MutationEffects,
+) -> Result<(), WorkspaceInitError> {
     let Some(git_dir) = resolve_git_dir(repo_root)? else {
         return Ok(());
     };
     let exclude_path = git_dir.join("info").join("exclude");
-    let existing = read_text_if_exists(&exclude_path)?;
-    if existing
+    let existing = match fs::symlink_metadata(&exclude_path) {
+        Ok(metadata) => {
+            if path_is_link_or_reparse_point(&metadata) || !metadata.is_file() {
+                return Err(unsafe_understand_docs_path(&exclude_path));
+            }
+            Some(fs::read(&exclude_path)?)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    let existing_text = match existing.as_deref() {
+        Some(bytes) => std::str::from_utf8(bytes).map_err(|error| {
+            WorkspaceInitError::Io(io::Error::new(io::ErrorKind::InvalidData, error))
+        })?,
+        None => "",
+    };
+    if existing_text
         .lines()
         .any(|line| line.trim() == UNDERSTAND_DOCS_EXCLUDE_ENTRY)
     {
@@ -395,10 +509,14 @@ fn ensure_understand_docs_exclude(repo_root: &Path) -> Result<(), WorkspaceInitE
     }
 
     if let Some(parent) = exclude_path.parent() {
-        fs::create_dir_all(parent)?;
+        ensure_tracked_directory(parent, effects)?;
     }
 
-    let mut updated = existing;
+    let mut updated = existing_text.to_string();
+    match existing {
+        Some(bytes) => effects.register_file_restore(exclude_path.clone(), bytes),
+        None => effects.register_created_file(exclude_path.clone()),
+    }
     if !updated.is_empty() && !updated.ends_with('\n') {
         updated.push('\n');
     }
@@ -406,6 +524,54 @@ fn ensure_understand_docs_exclude(repo_root: &Path) -> Result<(), WorkspaceInitE
     updated.push('\n');
     fs::write(exclude_path, updated)?;
     Ok(())
+}
+
+fn ensure_tracked_directory(
+    path: &Path,
+    effects: &mut mutation::MutationEffects,
+) -> Result<(), WorkspaceInitError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if path_is_link_or_reparse_point(&metadata) || !metadata.is_dir() {
+                return Err(unsafe_understand_docs_path(path));
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir(path)?;
+            effects.register_created_empty_directory(path.to_path_buf());
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+fn unsafe_understand_docs_path(path: &Path) -> WorkspaceInitError {
+    WorkspaceInitError::Io(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "understand docs path is not a direct real file or directory: {}",
+            path.display()
+        ),
+    ))
+}
+
+fn path_is_link_or_reparse_point(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+
+    #[cfg(not(windows))]
+    {
+        false
+    }
 }
 
 fn resolve_git_dir(repo_root: &Path) -> Result<Option<PathBuf>, WorkspaceInitError> {
@@ -435,14 +601,6 @@ fn resolve_git_dir(repo_root: &Path) -> Result<Option<PathBuf>, WorkspaceInitErr
     }
 
     Ok(Some(repo_root.join(git_dir)))
-}
-
-fn read_text_if_exists(path: &Path) -> Result<String, WorkspaceInitError> {
-    match fs::read_to_string(path) {
-        Ok(text) => Ok(text),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(String::new()),
-        Err(error) => Err(WorkspaceInitError::Io(error)),
-    }
 }
 
 fn seed_base_workspace_nodes(
@@ -614,6 +772,9 @@ where
     loop {
         write_question(writer, question)?;
         let answer = read_answer(reader)?;
+        if is_suspicious_mojibake_input(&answer) {
+            return Err(WorkspaceInitError::SuspiciousMojibakeInput);
+        }
         if !answer.is_empty() {
             return Ok(answer);
         }
@@ -637,16 +798,40 @@ fn read_answer<R>(reader: &mut R) -> Result<String, WorkspaceInitError>
 where
     R: BufRead,
 {
-    let mut answer = String::new();
-    let bytes_read = reader.read_line(&mut answer)?;
+    const MAX_LINE_BYTES: usize = storage::MAX_NODE_BODY_BYTES + 2;
+    let mut answer = Vec::new();
+    let mut bounded_reader = <&mut R as io::Read>::take(reader, (MAX_LINE_BYTES + 1) as u64);
+    let bytes_read = bounded_reader.read_until(b'\n', &mut answer)?;
     if bytes_read == 0 {
         return Err(WorkspaceInitError::Io(io::Error::new(
             io::ErrorKind::UnexpectedEof,
             "stdin closed during install flow",
         )));
     }
+    if answer.len() > MAX_LINE_BYTES {
+        return Err(WorkspaceInitError::InputTooLarge {
+            max_bytes: storage::MAX_NODE_BODY_BYTES,
+        });
+    }
 
-    Ok(answer.trim().to_string())
+    let answer = String::from_utf8(answer).map_err(|_| WorkspaceInitError::InvalidUtf8Input)?;
+    let answer = answer.trim().to_string();
+    if answer.len() > storage::MAX_NODE_BODY_BYTES {
+        return Err(WorkspaceInitError::InputTooLarge {
+            max_bytes: storage::MAX_NODE_BODY_BYTES,
+        });
+    }
+    Ok(answer)
+}
+
+fn is_suspicious_mojibake_input(answer: &str) -> bool {
+    let meaningful_chars = answer.chars().filter(|char| !char.is_whitespace()).count();
+    if meaningful_chars == 0 {
+        return false;
+    }
+
+    let question_marks = answer.chars().filter(|char| *char == '?').count();
+    question_marks >= 4 && question_marks * 2 >= meaningful_chars
 }
 
 #[cfg(test)]
@@ -690,6 +875,89 @@ mod tests {
         }
     }
 
+    fn prepare_second_seed_failure(repo_root: &Path) -> storage::WorkspacePaths {
+        let paths = storage::resolve_paths().expect("test AOPMem paths should resolve");
+        let workspace_key = storage::resolve_workspace_key(&paths, repo_root)
+            .expect("workspace key should resolve");
+        storage::ensure_global_dirs(&paths).expect("global dirs should create");
+        let workspace_paths = storage::ensure_workspace_dirs(&paths, workspace_key)
+            .expect("workspace dirs should create");
+        mutation::mutate_workspace(&workspace_paths, |_connection, _effects| {
+            Ok::<_, rusqlite::Error>(())
+        })
+        .expect("empty schema should initialize through coordinator");
+        let connection = storage::open_workspace_db(&workspace_paths)
+            .expect("test DB should open for trigger fixture");
+        connection
+            .execute_batch(
+                "
+                CREATE TRIGGER fail_second_seed
+                BEFORE INSERT ON nodes
+                WHEN (SELECT COUNT(*) FROM nodes) = 1
+                BEGIN
+                    SELECT RAISE(FAIL, 'forced second seed failure');
+                END;
+                ",
+            )
+            .expect("second seed failure trigger should create");
+        workspace_paths
+    }
+
+    fn tree_snapshot(root: &Path) -> Vec<(String, Option<Vec<u8>>)> {
+        fn collect(root: &Path, directory: &Path, rows: &mut Vec<(String, Option<Vec<u8>>)>) {
+            let mut entries = fs::read_dir(directory)
+                .expect("snapshot directory should list")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("snapshot entries should read");
+            entries.sort_by_key(|entry| entry.file_name());
+            for entry in entries {
+                let path = entry.path();
+                let relative = path
+                    .strip_prefix(root)
+                    .expect("snapshot path should stay under root")
+                    .to_string_lossy()
+                    .to_string();
+                let metadata =
+                    fs::symlink_metadata(&path).expect("snapshot metadata should be readable");
+                if metadata.is_dir() {
+                    rows.push((relative, None));
+                    collect(root, &path, rows);
+                } else {
+                    rows.push((
+                        relative,
+                        Some(fs::read(&path).expect("snapshot file should read")),
+                    ));
+                }
+            }
+        }
+
+        let mut rows = Vec::new();
+        collect(root, root, &mut rows);
+        rows
+    }
+
+    #[derive(Default)]
+    struct FailOnStyleWriter {
+        bytes: Vec<u8>,
+    }
+
+    impl Write for FailOnStyleWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            if buffer == STYLE_NOTE.as_bytes() {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "forced style-note write failure",
+                ));
+            }
+            self.bytes.extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn global_install_status_reports_missing_when_install_is_absent() {
         let _lock = test_env_lock()
@@ -708,6 +976,38 @@ mod tests {
         assert_eq!(status.templates, InstallCheckStatus::Missing);
         assert!(!override_home.exists());
         assert!(!home.exists());
+    }
+
+    #[test]
+    fn oversized_install_answer_is_bounded_before_workspace_creation() {
+        let _lock = test_env_lock()
+            .lock()
+            .expect("env lock should not be poisoned");
+        let override_home = temp_path("oversized-answer-home");
+        let home = temp_path("oversized-answer-fallback-home");
+        let repo_root = temp_path("oversized-answer-repo");
+        let _aopmem_home = EnvGuard::set(AOPMEM_HOME_ENV, &override_home);
+        let _home = EnvGuard::set(HOME_ENV, &home);
+        fs::create_dir_all(&repo_root).expect("repo root should create");
+        let mut input = vec![b'x'; storage::MAX_NODE_BODY_BYTES + 3];
+        input.push(b'\n');
+        let mut reader = Cursor::new(input);
+        let mut output = Vec::new();
+
+        let error = run_install_flow(&repo_root, &mut reader, &mut output)
+            .expect_err("oversized install answer must fail");
+
+        assert!(matches!(
+            error,
+            WorkspaceInitError::InputTooLarge { max_bytes }
+                if max_bytes == storage::MAX_NODE_BODY_BYTES
+        ));
+        assert!(
+            !override_home.exists(),
+            "oversized install input must not create AOPMEM_HOME"
+        );
+
+        fs::remove_dir_all(repo_root).expect("temp repo root should remove");
     }
 
     #[test]
@@ -912,6 +1212,321 @@ mod tests {
     }
 
     #[test]
+    fn install_progress_retains_committed_workspace_when_style_note_write_fails() {
+        let _lock = test_env_lock()
+            .lock()
+            .expect("env lock should not be poisoned");
+        let override_home = temp_path("style-note-failure-home");
+        let home = temp_path("style-note-failure-user-home");
+        let repo_root = temp_path("style-note-failure-repo");
+        let _aopmem_home = EnvGuard::set(AOPMEM_HOME_ENV, &override_home);
+        let _home = EnvGuard::set(HOME_ENV, &home);
+        fs::create_dir_all(&repo_root).expect("repo root should create");
+        let input = b"no\nno\nProject meaning\nUser and agent roles\nCore scope\n";
+        let mut reader = Cursor::new(input.as_slice());
+        let mut writer = FailOnStyleWriter::default();
+        let mut progress = None;
+
+        let error =
+            run_install_flow_with_progress(&repo_root, &mut reader, &mut writer, &mut progress)
+                .expect_err("style-note write should fail after commit");
+        let status = progress.expect("committed workspace status must survive output failure");
+        let paths = storage::resolve_paths().expect("paths should resolve");
+        let workspace_paths = storage::workspace_paths_for_key(&paths, &status.workspace_key);
+        let connection = storage::open_workspace_db_read_only(&workspace_paths)
+            .expect("committed workspace DB should remain readable");
+        let node_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM nodes", [], |row| row.get(0))
+            .expect("committed nodes should count");
+
+        assert!(matches!(error, WorkspaceInitError::Io(_)));
+        assert!(node_count > 0);
+        assert_eq!(status.seeded_nodes_created, BASE_WORKSPACE_NODES.len());
+        assert_eq!(status.semantic_nodes_created, 5);
+
+        drop(connection);
+        fs::remove_dir_all(override_home).expect("temp AOPMEM_HOME should remove");
+        fs::remove_dir_all(repo_root).expect("temp repo root should remove");
+    }
+
+    #[test]
+    fn failed_second_seed_rolls_back_new_docs_exclude_and_database_rows() {
+        let _lock = test_env_lock()
+            .lock()
+            .expect("env lock should not be poisoned");
+        let override_home = temp_path("docs-new-rollback-home");
+        let home = temp_path("docs-new-rollback-user-home");
+        let repo_root = temp_path("docs-new-rollback-repo");
+        let _aopmem_home = EnvGuard::set(AOPMEM_HOME_ENV, &override_home);
+        let _home = EnvGuard::set(HOME_ENV, &home);
+        let exclude_path = repo_root.join(".git").join("info").join("exclude");
+        let original_exclude = b"# user rule\r\n/local-only-without-newline".to_vec();
+        fs::create_dir_all(exclude_path.parent().expect("exclude parent should exist"))
+            .expect("git info should create");
+        fs::write(&exclude_path, &original_exclude).expect("exclude fixture should write");
+        let workspace_paths = prepare_second_seed_failure(&repo_root);
+        let input = b"yes\nno\nProject meaning\nUser and agent roles\nCore and no-touch areas\n";
+        let mut reader = Cursor::new(input.as_slice());
+        let mut output = Vec::new();
+
+        let error = run_install_flow(&repo_root, &mut reader, &mut output)
+            .expect_err("forced second seed must fail install");
+
+        assert!(matches!(error, WorkspaceInitError::Seed(_)));
+        let connection = storage::open_workspace_db_read_only(&workspace_paths)
+            .expect("rolled-back DB should open");
+        let rows: i64 = connection
+            .query_row("SELECT COUNT(*) FROM nodes;", [], |row| row.get(0))
+            .expect("node count should read");
+        assert_eq!(rows, 0, "first seed insert must roll back with second");
+        assert!(!repo_root.join(UNDERSTAND_DOCS_DIR).exists());
+        assert_eq!(
+            fs::read(&exclude_path).expect("exclude should read"),
+            original_exclude
+        );
+        assert!(
+            !crate::audit::has_pending_snapshot(workspace_paths.audit_git())
+                .expect("pending marker should read")
+        );
+
+        fs::remove_dir_all(&override_home).expect("temp AOPMEM_HOME should remove");
+        fs::remove_dir_all(&repo_root).expect("temp repo root should remove");
+    }
+
+    #[test]
+    fn failed_seed_preserves_preexisting_docs_tree_and_exclude_exactly() {
+        let _lock = test_env_lock()
+            .lock()
+            .expect("env lock should not be poisoned");
+        let override_home = temp_path("docs-existing-rollback-home");
+        let home = temp_path("docs-existing-rollback-user-home");
+        let repo_root = temp_path("docs-existing-rollback-repo");
+        let _aopmem_home = EnvGuard::set(AOPMEM_HOME_ENV, &override_home);
+        let _home = EnvGuard::set(HOME_ENV, &home);
+        let docs_root = repo_root.join(UNDERSTAND_DOCS_DIR);
+        let exclude_path = repo_root.join(".git").join("info").join("exclude");
+        let original_exclude = b"# exact bytes\r\nkeep-me".to_vec();
+        fs::create_dir_all(docs_root.join("raw")).expect("existing raw dir should create");
+        fs::create_dir_all(docs_root.join("index")).expect("existing index dir should create");
+        fs::write(
+            docs_root.join(UNDERSTAND_DOCS_SCHEMA),
+            b"user schema\0bytes",
+        )
+        .expect("existing schema should write");
+        fs::write(docs_root.join("raw").join("sentinel.bin"), b"raw\0sentinel")
+            .expect("raw sentinel should write");
+        fs::write(docs_root.join("custom.bin"), b"custom\xffbytes")
+            .expect("custom sentinel should write");
+        fs::create_dir_all(exclude_path.parent().expect("exclude parent should exist"))
+            .expect("git info should create");
+        fs::write(&exclude_path, &original_exclude).expect("exclude fixture should write");
+        let original_docs = tree_snapshot(&docs_root);
+        let workspace_paths = prepare_second_seed_failure(&repo_root);
+        let input = b"yes\nno\nProject meaning\nUser and agent roles\nCore and no-touch areas\n";
+        let mut reader = Cursor::new(input.as_slice());
+        let mut output = Vec::new();
+
+        run_install_flow(&repo_root, &mut reader, &mut output)
+            .expect_err("forced second seed must fail install");
+
+        assert_eq!(tree_snapshot(&docs_root), original_docs);
+        assert_eq!(
+            fs::read(&exclude_path).expect("exclude should read"),
+            original_exclude
+        );
+        let connection = storage::open_workspace_db_read_only(&workspace_paths)
+            .expect("rolled-back DB should open");
+        let rows: i64 = connection
+            .query_row("SELECT COUNT(*) FROM nodes;", [], |row| row.get(0))
+            .expect("node count should read");
+        assert_eq!(rows, 0);
+        assert!(
+            !crate::audit::has_pending_snapshot(workspace_paths.audit_git())
+                .expect("pending marker should read")
+        );
+
+        fs::remove_dir_all(&override_home).expect("temp AOPMEM_HOME should remove");
+        fs::remove_dir_all(&repo_root).expect("temp repo root should remove");
+    }
+
+    #[test]
+    fn partial_docs_setup_failure_removes_only_new_entries() {
+        let _lock = test_env_lock()
+            .lock()
+            .expect("env lock should not be poisoned");
+        let override_home = temp_path("docs-partial-rollback-home");
+        let home = temp_path("docs-partial-rollback-user-home");
+        let repo_root = temp_path("docs-partial-rollback-repo");
+        let _aopmem_home = EnvGuard::set(AOPMEM_HOME_ENV, &override_home);
+        let _home = EnvGuard::set(HOME_ENV, &home);
+        let docs_root = repo_root.join(UNDERSTAND_DOCS_DIR);
+        fs::create_dir_all(&docs_root).expect("existing docs root should create");
+        fs::write(docs_root.join("raw"), b"user blocker must survive")
+            .expect("blocking user file should write");
+        let original_docs = tree_snapshot(&docs_root);
+        let workspace_paths = prepare_second_seed_failure(&repo_root);
+        let input = b"yes\nno\nProject meaning\nUser and agent roles\nCore and no-touch areas\n";
+        let mut reader = Cursor::new(input.as_slice());
+        let mut output = Vec::new();
+
+        let error = run_install_flow(&repo_root, &mut reader, &mut output)
+            .expect_err("non-directory docs entry must fail safely");
+
+        assert!(matches!(error, WorkspaceInitError::Io(_)));
+        assert_eq!(tree_snapshot(&docs_root), original_docs);
+        assert!(
+            !crate::audit::has_pending_snapshot(workspace_paths.audit_git())
+                .expect("pending marker should read")
+        );
+        let connection = storage::open_workspace_db_read_only(&workspace_paths)
+            .expect("rolled-back DB should open");
+        let rows: i64 = connection
+            .query_row("SELECT COUNT(*) FROM nodes;", [], |row| row.get(0))
+            .expect("node count should read");
+        assert_eq!(rows, 0);
+
+        fs::remove_dir_all(&override_home).expect("temp AOPMEM_HOME should remove");
+        fs::remove_dir_all(&repo_root).expect("temp repo root should remove");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn understand_docs_symlink_escape_is_rejected_before_repo_writes() {
+        use std::os::unix::fs::symlink;
+
+        let _lock = test_env_lock()
+            .lock()
+            .expect("env lock should not be poisoned");
+        let override_home = temp_path("docs-symlink-home");
+        let home = temp_path("docs-symlink-user-home");
+        let repo_root = temp_path("docs-symlink-repo");
+        let outside = temp_path("docs-symlink-outside");
+        let _aopmem_home = EnvGuard::set(AOPMEM_HOME_ENV, &override_home);
+        let _home = EnvGuard::set(HOME_ENV, &home);
+        fs::create_dir_all(&repo_root).expect("repo root should create");
+        fs::create_dir_all(&outside).expect("outside dir should create");
+        fs::write(outside.join("sentinel.bin"), b"outside must stay exact")
+            .expect("outside sentinel should write");
+        let original_outside = tree_snapshot(&outside);
+        symlink(&outside, repo_root.join(UNDERSTAND_DOCS_DIR))
+            .expect("docs symlink fixture should create");
+        let workspace_paths = prepare_second_seed_failure(&repo_root);
+        let input = b"yes\nno\nProject meaning\nUser and agent roles\nCore and no-touch areas\n";
+        let mut reader = Cursor::new(input.as_slice());
+        let mut output = Vec::new();
+
+        let error = run_install_flow(&repo_root, &mut reader, &mut output)
+            .expect_err("docs symlink must be rejected");
+
+        assert!(matches!(error, WorkspaceInitError::Io(_)));
+        assert_eq!(tree_snapshot(&outside), original_outside);
+        assert!(fs::symlink_metadata(repo_root.join(UNDERSTAND_DOCS_DIR))
+            .expect("docs symlink should remain")
+            .file_type()
+            .is_symlink());
+        assert!(
+            !crate::audit::has_pending_snapshot(workspace_paths.audit_git())
+                .expect("pending marker should read")
+        );
+
+        fs::remove_dir_all(&override_home).expect("temp AOPMEM_HOME should remove");
+        fs::remove_dir_all(&repo_root).expect("temp repo root should remove");
+        fs::remove_dir_all(&outside).expect("outside dir should remove");
+    }
+
+    #[test]
+    fn run_install_flow_stores_valid_cyrillic_answers() {
+        let _lock = test_env_lock()
+            .lock()
+            .expect("env lock should not be poisoned");
+        let override_home = temp_path("flow-cyrillic-home");
+        let home = temp_path("home");
+        let repo_root = temp_path("repo");
+        let _aopmem_home = EnvGuard::set(AOPMEM_HOME_ENV, &override_home);
+        let _home = EnvGuard::set(HOME_ENV, &home);
+        fs::create_dir_all(&repo_root).expect("repo root should be created");
+        let input = concat!(
+            "no\n",
+            "no\n",
+            "Тестовый Windows workspace для AOPMem rc3.\n",
+            "Пользователь проверяет установку; агент ведет operational memory.\n",
+            "Вся папка рабочая; ничего запрещенного нет.\n",
+        );
+        let mut reader = Cursor::new(input.as_bytes());
+        let mut output = Vec::new();
+
+        let outcome =
+            run_install_flow(&repo_root, &mut reader, &mut output).expect("flow should succeed");
+        let paths = storage::resolve_paths().expect("paths should resolve");
+        let workspace_paths = storage::ensure_workspace_dirs(&paths, &outcome.workspace_key)
+            .expect("workspace dirs should resolve");
+        let connection =
+            storage::open_workspace_db(&workspace_paths).expect("workspace DB should open");
+        let nodes = storage::list_nodes(&connection).expect("seeded nodes should list");
+        let profile = nodes
+            .iter()
+            .find(|node| node.node_type == "project_profile" && node.title == PROJECT_MEANING_TITLE)
+            .expect("project profile should be stored");
+
+        assert_eq!(
+            profile.body.as_deref(),
+            Some("Тестовый Windows workspace для AOPMem rc3.")
+        );
+        assert!(!profile.body.as_deref().unwrap_or_default().contains("????"));
+
+        fs::remove_dir_all(&override_home).expect("temp AOPMEM_HOME should be removed");
+        fs::remove_dir_all(&repo_root).expect("temp repo root should be removed");
+    }
+
+    #[test]
+    fn run_install_flow_rejects_invalid_utf8_input() {
+        let _lock = test_env_lock()
+            .lock()
+            .expect("env lock should not be poisoned");
+        let override_home = temp_path("flow-invalid-utf8-home");
+        let home = temp_path("home");
+        let repo_root = temp_path("repo");
+        let _aopmem_home = EnvGuard::set(AOPMEM_HOME_ENV, &override_home);
+        let _home = EnvGuard::set(HOME_ENV, &home);
+        fs::create_dir_all(&repo_root).expect("repo root should be created");
+        let input = b"no\nno\n\xff\xff\nRoles\nScope\n";
+        let mut reader = Cursor::new(input.as_slice());
+        let mut output = Vec::new();
+
+        let error = run_install_flow(&repo_root, &mut reader, &mut output)
+            .expect_err("invalid UTF-8 should fail");
+
+        assert!(matches!(error, WorkspaceInitError::InvalidUtf8Input));
+        assert!(!override_home.exists());
+
+        fs::remove_dir_all(&repo_root).expect("temp repo root should be removed");
+    }
+
+    #[test]
+    fn run_install_flow_rejects_mojibake_question_marks() {
+        let _lock = test_env_lock()
+            .lock()
+            .expect("env lock should not be poisoned");
+        let override_home = temp_path("flow-mojibake-home");
+        let home = temp_path("home");
+        let repo_root = temp_path("repo");
+        let _aopmem_home = EnvGuard::set(AOPMEM_HOME_ENV, &override_home);
+        let _home = EnvGuard::set(HOME_ENV, &home);
+        fs::create_dir_all(&repo_root).expect("repo root should be created");
+        let input = b"no\nno\n????\nRoles\nScope\n";
+        let mut reader = Cursor::new(input.as_slice());
+        let mut output = Vec::new();
+
+        let error = run_install_flow(&repo_root, &mut reader, &mut output)
+            .expect_err("mojibake-like input should fail");
+
+        assert!(matches!(error, WorkspaceInitError::SuspiciousMojibakeInput));
+        assert!(!override_home.exists());
+
+        fs::remove_dir_all(&repo_root).expect("temp repo root should be removed");
+    }
+
+    #[test]
     fn optional_mcp_status_model_matches_detector_state() {
         assert_eq!(
             optional_mcp_status(false, None),
@@ -975,8 +1590,8 @@ mod tests {
         assert_eq!(first.semantic_nodes_existing, 0);
         assert_eq!(second.semantic_nodes_created, 0);
         assert_eq!(second.semantic_nodes_existing, 5);
-        assert_eq!(first.codebase_memory_enabled, true);
-        assert_eq!(second.codebase_memory_enabled, false);
+        assert!(first.codebase_memory_enabled);
+        assert!(!second.codebase_memory_enabled);
         assert_eq!(codebase_memory_profile.status, MCP_PROFILE_STATUS_DISABLED);
         assert_eq!(
             exclude

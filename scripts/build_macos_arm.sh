@@ -6,26 +6,32 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
 target_triple="aarch64-apple-darwin"
-dist_dir="$repo_root/dist/aopmem-darwin-arm64"
-dist_bin="$dist_dir/aopmem"
+dist_bin="$repo_root/dist/aopmem-darwin-arm64"
+built_bin="$repo_root/target/$target_triple/release/aopmem"
 
-host_triple="$(rustc -vV | awk '/^host: / { print $2 }')"
-
-if [[ "$host_triple" == "$target_triple" ]]; then
-  cargo build --release
-  built_bin="$repo_root/target/release/aopmem"
-else
-  cargo build --release --target "$target_triple"
-  built_bin="$repo_root/target/$target_triple/release/aopmem"
+if [[ -d "$dist_bin" ]]; then
+  echo "legacy nested dist layout blocks flat asset: $dist_bin" >&2
+  exit 1
 fi
+
+MACOSX_DEPLOYMENT_TARGET=11.0 \
+  CARGO_PROFILE_RELEASE_STRIP=false \
+  cargo build --locked --release --target "$target_triple"
 
 if [[ ! -f "$built_bin" ]]; then
   echo "missing built binary: $built_bin" >&2
   exit 1
 fi
 
-mkdir -p "$dist_dir"
+mkdir -p "$repo_root/dist"
 cp "$built_bin" "$dist_bin"
 chmod 755 "$dist_bin"
+
+file "$dist_bin"
+otool -l "$dist_bin" | awk '
+  $1 == "cmd" && $2 == "LC_BUILD_VERSION" { in_version = 1; next }
+  in_version && $1 == "minos" { print "minimum macOS " $2; exit }
+'
+shasum -a 256 "$dist_bin"
 
 echo "built $dist_bin"

@@ -1,0 +1,20 @@
+{
+  "aliases": 100,
+  "deterministic_timestamp": "2026-07-15T00:00:00.000Z",
+  "fixture_persistence": "generated in disposable work dir; not retained",
+  "generator_events_in_logical_hash": 99,
+  "generator_version": 1,
+  "links": 300,
+  "logical_sha256": "6df66b15ebf02bce6eb82ea5bd8664ada961772aa1debc2d6c0ed8011a087f8b",
+  "mcp_profiles": 2,
+  "name": "small",
+  "nodes": 100,
+  "observability_events_baseline": 0,
+  "observability_events_current": 100,
+  "operational_events": 100,
+  "product_snapshot_finalize_events": 1,
+  "query_probe": "Deploy release workflow",
+  "sources": 100,
+  "tags": 100,
+  "tools": 5
+}

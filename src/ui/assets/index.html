@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en" data-ui-ready="loading">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="referrer" content="no-referrer">
+    <title>AOPMem Local UI</title>
+    <link rel="stylesheet" href="app.css">
+    <script src="app.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content">Skip to content</a>
+
+    <header class="app-header">
+      <div class="brand-block" aria-label="AOPMem local browser">
+        <span class="brand-mark" aria-hidden="true">A</span>
+        <span>
+          <strong>AOPMem</strong>
+          <small>Local memory browser</small>
+        </span>
+      </div>
+      <div class="workspace-identity" aria-label="Current workspace">
+        <span id="workspace-name" class="workspace-name">Loading workspace…</span>
+        <span id="product-version" class="version-label"></span>
+      </div>
+      <div class="header-actions">
+        <span class="readonly-badge">Read-only</span>
+        <button id="refresh-view" class="button button-quiet" type="button">
+          Refresh view
+        </button>
+      </div>
+    </header>
+
+    <div class="app-shell">
+      <nav id="primary-nav" class="primary-nav" aria-label="AOPMem sections">
+        <p class="nav-label">Workspace</p>
+        <button class="nav-item" type="button" data-view="overview"
+                aria-controls="view-content">
+          <span aria-hidden="true">01</span> Overview
+        </button>
+        <button class="nav-item" type="button" data-view="memory"
+                aria-controls="view-content">
+          <span aria-hidden="true">02</span> Memory
+        </button>
+        <button class="nav-item" type="button" data-view="graph"
+                aria-controls="view-content">
+          <span aria-hidden="true">03</span> Graph
+        </button>
+        <p class="nav-label">Evidence</p>
+        <button class="nav-item" type="button" data-view="activity"
+                aria-controls="view-content">
+          <span aria-hidden="true">04</span> Activity
+        </button>
+        <button class="nav-item" type="button" data-view="effectiveness"
+                aria-controls="view-content">
+          <span aria-hidden="true">05</span> Effectiveness
+        </button>
+        <button class="nav-item" type="button" data-view="tools"
+                aria-controls="view-content">
+          <span aria-hidden="true">06</span> Tools / MCP
+        </button>
+        <div class="local-notice">
+          <strong>Local only</strong>
+          <span>Local read-only browser UI.</span>
+          <span>No editing, tool runs, or external network.</span>
+        </div>
+      </nav>
+
+      <div class="content-shell">
+        <main id="main-content" class="main-content" tabindex="-1">
+          <div class="view-heading">
+            <div>
+              <p id="view-kicker" class="view-kicker">Workspace status</p>
+              <h1 id="view-title" tabindex="-1">Overview</h1>
+            </div>
+            <p id="view-summary" class="view-summary">
+              Local facts from the current AOPMem workspace.
+            </p>
+          </div>
+          <div id="view-content" data-view-state="loading" aria-busy="true"></div>
+        </main>
+
+        <aside id="detail-panel" class="detail-panel" aria-labelledby="detail-title"
+               hidden>
+          <div class="detail-heading">
+            <div>
+              <p class="view-kicker">Read-only detail</p>
+              <h2 id="detail-title">Details</h2>
+            </div>
+            <button id="close-detail" class="icon-button" type="button"
+                    aria-label="Close details">Close</button>
+          </div>
+          <div id="detail-content" class="detail-content"></div>
+        </aside>
+      </div>
+    </div>
+
+    <div id="live-status" class="visually-hidden" role="status"
+         aria-live="polite" aria-atomic="true"></div>
+    <noscript>
+      <p class="noscript-message">JavaScript is required for the local read-only UI.</p>
+    </noscript>
+  </body>
+</html>

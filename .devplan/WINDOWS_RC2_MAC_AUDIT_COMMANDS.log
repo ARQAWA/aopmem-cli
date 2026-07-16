@@ -1,0 +1,1427 @@
+# Windows RC2 Mac Audit Commands Log
+cwd: /Users/arkadijcukavin/PycharmProjects/aopmem-cli
+date: Mon Jun 29 00:14:40 MSK 2026
+
+
+$ for f in .devplan/RELEASE_CANDIDATE_v0.1.0-rc1.md .devplan/PROOF_LOG.md install/v0.1/install_prompt.md scripts/build_macos_arm.sh scripts/build_windows_x64_from_macos.sh docs/WINDOWS_NATIVE_POWERSHELL_SMOKE.md .devplan/WINDOWS_BUILD_PROOF.md .devplan/RELEASE_CANDIDATE_v0.1.0-rc2.md; do if [ -e "$f" ]; then echo "===== $f"; nl -ba "$f" | sed -n "1,240p"; else echo "MISSING $f"; fi; done
+===== .devplan/RELEASE_CANDIDATE_v0.1.0-rc1.md
+     1	# AOPMem v0.1.0-rc1 Release Candidate
+     2	
+     3	## Status
+     4	
+     5	RC ready.
+     6	
+     7	## Evidence
+     8	
+     9	- Global audit: `.devplan/GLOBAL_AUDIT_REPORT.md` verdict is `PASS`.
+    10	  The only release risk, `GA-001`, is documented as resolved by final
+    11	  decision update.
+    12	- GA001 re-audit: `.devplan/GA001_REAUDIT_REPORT.md` verdict is `PASS`.
+    13	  No new P1/P2 findings were found.
+    14	- Ledger: `.devplan/EXECUTION_LEDGER.json` has 55 stages, all with status
+    15	  `VERIFIED`.
+    16	- Build/test:
+    17	  - `rtk cargo build`: PASS.
+    18	  - `rtk cargo test`: PASS, 164 passed.
+    19	  - `rtk cargo test --tests`: PASS, 164 passed.
+    20	  - `git diff --check`: PASS.
+    21	- Temp install proof:
+    22	  - copied `dist/aopmem-darwin-arm64/aopmem` to temp
+    23	    `AOPMEM_HOME/bin/aopmem`;
+    24	  - ran `aopmem --json init` in a temp repo with the 5 install answers;
+    25	  - ran `aopmem --json adapter seed --file AGENTS.md`;
+    26	  - ran `aopmem --json adapter status --file AGENTS.md`;
+    27	  - ran `aopmem --json doctor`;
+    28	  - ran `aopmem --json recall`;
+    29	  - confirmed one workspace under temp `AOPMEM_HOME/workspaces`;
+    30	  - confirmed `aopmem.sqlite`, `tools`, `artifacts`, `logs`, `runtimes`,
+    31	    and `audit-git`;
+    32	  - confirmed no `.aopmem` in the target repo;
+    33	  - confirmed `.understand.docs` is absent when Understand Anything is
+    34	    disabled;
+    35	  - confirmed the managed AOPMem block is `in_sync`.
+    36	- Binary proof:
+    37	  - `rtk bash scripts/build_macos_arm.sh`: PASS.
+    38	  - `file dist/aopmem-darwin-arm64/aopmem`: Mach-O 64-bit executable arm64.
+    39	  - `dist/aopmem-darwin-arm64/aopmem --version`: `aopmem 0.1.0`.
+    40	  - SHA-256:
+    41	    `798af720030081367969fb36a2913de98956d700fbdd6e87ae176d4e05caaefc`.
+    42	
+    43	## Included Scope
+    44	
+    45	- One Rust crate: `aopmem`.
+    46	- macOS ARM / Apple Silicon CLI binary.
+    47	- User-level runtime under `~/.aopmem` or `AOPMEM_HOME`.
+    48	- Per-repo workspace storage under `workspaces/<workspace-key>`.
+    49	- SQLite memory with typed nodes, links, events, registries, FTS5, and BM25.
+    50	- Core CLI flows: init, status, doctor, verify, recall, node/link/source/tag,
+    51	  MCP registry, tool registry/runner, artifacts cleanup, remember, teach, and
+    52	  reflect.
+    53	- Managed adapter block for agent instruction files.
+    54	- Optional `.understand.docs` only when Understand Anything is enabled.
+    55	- Local SQL audit snapshot under workspace `audit-git/memory.sql`.
+    56	
+    57	## Explicitly Out of Scope
+    58	
+    59	- Linux, Windows, and non-Apple-Silicon builds.
+    60	- GitHub Actions / CI.
+    61	- Mem0, Hindsight, Qdrant, vector search, semantic search, and embeddings.
+    62	- Custom MCP server implementation.
+    63	- Background enrichment or daemon behavior.
+    64	- Old MVP import/migration.
+    65	- Markdown memory import/export implementation.
+    66	- Global host memory as a product feature.
+    67	- Any new feature beyond the v0.1 final decisions.
+    68	
+    69	## Install Path
+    70	
+    71	The user install path is `install/v0.1/install_prompt.md`.
+    72	
+    73	Expected release flow:
+    74	
+    75	1. Publish the repo/release artifact for `v0.1.0-rc1`.
+    76	2. Provide the user with `install/v0.1/install_prompt.md`.
+    77	3. The installing agent checks macOS ARM silently.
+    78	4. The agent installs the macOS ARM binary to `~/.aopmem/bin/aopmem`.
+    79	5. The agent initializes the current repo under
+    80	   `~/.aopmem/workspaces/<workspace-key>`.
+    81	6. The agent asks only the 5 install questions from the prompt.
+    82	7. Optional Understand Anything and Codebase Memory MCP setup stays
+    83	   best-effort.
+    84	8. The agent inserts or updates only the managed AOPMem block.
+    85	9. The agent runs `aopmem doctor` and the first recall bundle.
+    86	
+    87	## Known Non-Blocking Notes
+    88	
+    89	- `GA-002` P3: root recovery docs path is not the canonical pack path. This
+    90	  is documentation/bookkeeping only and is not release-blocking.
+    91	- `GA-003` P3: the Stage 055 handoff text is stale, while ledger/proof show
+    92	  `STAGE_055` verified. This is not release-blocking.
+    93	- `GA-004` INFO: the repo baseline is mostly untracked. This is expected for
+    94	  the current proof baseline and is not a runtime issue.
+    95	- Optional MCP status `configured_unverified` is valid and non-blocking when
+    96	  the CLI has no deterministic detector.
+    97	
+    98	## Release Recommendation
+    99	
+   100	Yes, this repo can be pushed to GitHub and tested as `v0.1.0-rc1`.
+   101	
+   102	Release checklist:
+   103	
+   104	- Tag or label the candidate as `v0.1.0-rc1`.
+   105	- Include `dist/aopmem-darwin-arm64/aopmem` as the macOS ARM binary artifact.
+   106	- Include `install/v0.1/install_prompt.md` as the user install entry point.
+   107	- Run one fresh user-style install test from the published artifact before
+   108	  promoting to final `v0.1.0`.
+===== .devplan/PROOF_LOG.md
+     1	# PROOF LOG — AOPMem v0.1
+     2	
+     3	## STAGE_001
+     4	
+     5	Status: `DONE`
+     6	
+     7	Requirements covered:
+     8	
+     9	- `REQ-DERC-001`
+    10	- `REQ-DERC-002`
+    11	- `REQ-DERC-003`
+    12	- `REQ-DERC-004`
+    13	
+    14	Files changed:
+    15	
+    16	- `.devplan/MASTER_SPEC.md`
+    17	- `.devplan/FINAL_DECISION_LOG.md`
+    18	- `.devplan/REQUIREMENTS_MATRIX.md`
+    19	- `.devplan/STAGE_GRAPH.md`
+    20	- `.devplan/EXECUTION_LEDGER.md`
+    21	- `.devplan/EXECUTION_LEDGER.json`
+    22	- `.devplan/CURRENT_STAGE.md`
+    23	- `.devplan/BLOCKERS.md`
+    24	- `.devplan/PROOF_LOG.md`
+    25	- `.devplan/HANDOFFS/STAGE_001.md`
+    26	- `DEPS_JUSTIFICATION.md`
+    27	
+    28	Commands run:
+    29	
+    30	```text
+    31	git status --short
+    32	test -d .devplan
+    33	test -f .devplan/EXECUTION_LEDGER.md
+    34	test -f .devplan/CURRENT_STAGE.md
+    35	python3 -m json.tool .devplan/EXECUTION_LEDGER.json >/dev/null
+    36	cmp -s aopmem_v0_1_final_orchestrated_pack/reference/FINAL_DECISION_LOG.md .devplan/FINAL_DECISION_LOG.md
+    37	cmp -s aopmem_v0_1_final_orchestrated_pack/reference/REQUIREMENTS_MATRIX.md .devplan/REQUIREMENTS_MATRIX.md
+    38	cmp -s aopmem_v0_1_final_orchestrated_pack/reference/STAGE_GRAPH.md .devplan/STAGE_GRAPH.md
+    39	wc -c .devplan/BLOCKERS.md
+    40	```
+    41	
+    42	Results:
+    43	
+    44	```text
+    45	PASS test -d .devplan
+    46	PASS test -f .devplan/EXECUTION_LEDGER.md
+    47	PASS test -f .devplan/CURRENT_STAGE.md
+    48	PASS json valid
+    49	PASS final decision log copied
+    50	PASS requirements matrix copied
+    51	PASS stage graph copied
+    52	PASS .devplan/BLOCKERS.md is empty
+    53	```
+    54	
+    55	Final `git status --short`:
+    56	
+    57	```text
+    58	?? .DS_Store
+    59	?? .devplan/
+    60	?? DEPS_JUSTIFICATION.md
+    61	?? aopmem_v0_1_final_orchestrated_pack/
+    62	```
+    63	
+    64	Known limitations:
+    65	
+    66	- No Rust crate exists yet. This is expected before Stage 002.
+    67	- No cargo checks are required or useful in Stage 001.
+    68	
+    69	Next stage:
+    70	
+    71	- `STAGE_002`
+    72	
+    73	Audit result:
+    74	
+    75	```text
+    76	AUDIT RESULT: PASS
+    77	Stage audited: STAGE_001
+    78	Requirements checked: REQ-DERC-001..REQ-DERC-004
+    79	Findings: No issues found. Stage stayed inside allowed files.
+    80	Required fixes: None.
+    81	Out-of-scope drift: None.
+    82	Decision log conflicts: None.
+    83	Recommended next action: Mark STAGE_001 as VERIFIED, then run STAGE_002.
+    84	```
+    85	
+    86	## STAGE_002
+    87	
+    88	Status: `DONE`
+    89	
+    90	Requirements covered:
+    91	
+    92	- `REQ-PROD-001`
+    93	
+    94	Files changed:
+    95	
+    96	- `Cargo.toml`
+    97	- `src/main.rs`
+    98	- `src/adapter/mod.rs`
+    99	- `src/artifacts/mod.rs`
+   100	- `src/audit/mod.rs`
+   101	- `src/cli/mod.rs`
+   102	- `src/install/mod.rs`
+   103	- `src/recall/mod.rs`
+   104	- `src/reflection/mod.rs`
+   105	- `src/schema/mod.rs`
+   106	- `src/storage/mod.rs`
+   107	- `src/tools/mod.rs`
+   108	- `src/verify/mod.rs`
+   109	- `.devplan/EXECUTION_LEDGER.md`
+   110	- `.devplan/EXECUTION_LEDGER.json`
+   111	- `.devplan/CURRENT_STAGE.md`
+   112	- `.devplan/PROOF_LOG.md`
+   113	- `.devplan/HANDOFFS/STAGE_002.md`
+   114	
+   115	Commands run:
+   116	
+   117	```text
+   118	git status --short
+   119	rg --files -g 'Cargo.toml' -g 'src/**' -g 'tests/**'
+   120	rtk cargo build
+   121	rm -rf Cargo.lock target
+   122	python3 -m json.tool .devplan/EXECUTION_LEDGER.json >/dev/null
+   123	git status --short
+   124	```
+   125	
+   126	Results:
+   127	
+   128	```text
+   129	PASS recovery git status matched expected Stage 001 state
+   130	PASS no existing Cargo.toml/src/tests found before Stage 002
+   131	PASS rtk cargo build
+   132	PASS removed generated Cargo.lock and target because they are outside Stage 002 scope
+   133	PASS json valid
+   134	```
+   135	
+   136	Final `git status --short`:
+   137	
+   138	```text
+   139	?? .DS_Store
+   140	?? .devplan/
+   141	?? Cargo.toml
+   142	?? DEPS_JUSTIFICATION.md
+   143	?? aopmem_v0_1_final_orchestrated_pack/
+   144	?? src/
+   145	```
+   146	
+   147	Known limitations:
+   148	
+   149	- The crate is a minimal skeleton only.
+   150	- No CLI routing or commands are implemented yet.
+   151	- No dependencies were added.
+   152	- Stage 002 is not audited yet.
+   153	
+   154	Next stage:
+   155	
+   156	- `STAGE_003`
+   157	
+   158	Audit result:
+   159	
+   160	```text
+   161	AUDIT RESULT: PASS
+   162	Stage audited: STAGE_002
+   163	Requirements checked: REQ-PROD-001
+   164	Findings: Single crate is named aopmem. Module skeleton matches decision log.
+   165	Required fixes: None.
+   166	Out-of-scope drift: None from Stage 002 implementation.
+   167	Decision log conflicts: None.
+   168	Recommended next action: Mark STAGE_002 as VERIFIED, then run STAGE_003.
+   169	```
+   170	
+   171	Audit cleanup:
+   172	
+   173	```text
+   174	rm -rf Cargo.lock target
+   175	```
+   176	
+   177	Reason:
+   178	
+   179	- Audit `cargo build` generated `Cargo.lock` and `target/`.
+   180	- `Cargo.lock` was not part of Stage 002 allowed files.
+   181	- `target/` is generated build output.
+   182	
+   183	## STAGE_003
+   184	
+   185	Status: `DONE`
+   186	
+   187	Requirements covered:
+   188	
+   189	- `REQ-PROD-001`
+   190	
+   191	Files changed:
+   192	
+   193	- `Cargo.toml`
+   194	- `DEPS_JUSTIFICATION.md`
+   195	- `.devplan/EXECUTION_LEDGER.md`
+   196	- `.devplan/EXECUTION_LEDGER.json`
+   197	- `.devplan/CURRENT_STAGE.md`
+   198	- `.devplan/PROOF_LOG.md`
+   199	- `.devplan/HANDOFFS/STAGE_003.md`
+   200	
+   201	Dependencies added:
+   202	
+   203	- `clap`
+   204	- `directories`
+   205	- `rusqlite` with `bundled`
+   206	- `serde` with `derive`
+   207	- `serde_json`
+   208	- `thiserror`
+   209	
+   210	Commands run:
+   211	
+   212	```text
+   213	git status --short
+   214	rtk cargo build
+   215	grep -q "crate:" DEPS_JUSTIFICATION.md
+   216	rm -rf Cargo.lock target
+   217	python3 -m json.tool .devplan/EXECUTION_LEDGER.json
+   218	git status --short
+   219	```
+   220	
+   221	Results:
+   222	
+   223	```text
+   224	PASS recovery git status matched expected Stage 002 state
+   225	PASS rtk cargo build
+   226	PASS grep -q "crate:" DEPS_JUSTIFICATION.md
+   227	PASS removed generated Cargo.lock and target because they are outside Stage 003 scope
+   228	PASS json valid
+   229	```
+   230	
+   231	Known limitations:
+   232	
+   233	- Dependencies are declared and justified only.
+   234	- No CLI routing, JSON envelope code, path resolver, or SQLite code is implemented yet.
+   235	- Stage 003 is not audited yet.
+   236	
+   237	Next stage:
+   238	
+   239	- `STAGE_004`
+   240	
+===== install/v0.1/install_prompt.md
+     1	Use this prompt to install and initialize AOPMem v0.1 for the current
+     2	repository.
+     3	
+     4	````text
+     5	You are installing AOPMem v0.1 into the user's current host and initializing
+     6	it for the current repository.
+     7	
+     8	Important rules:
+     9	
+    10	- Do the full install and workspace init flow.
+    11	- Stay inside user-level install only.
+    12	- Detect technical facts silently.
+    13	- Do not ask the user about things you can detect yourself.
+    14	- Do not ask any irrelevant technical questionnaire.
+    15	- Ask only the 5 semantic questions listed below.
+    16	- No final confirmation ceremony.
+    17	- If the managed AOPMem block already exists, update only that block.
+    18	- If the managed block is damaged, stop with an explicit error.
+    19	- Do not build from source during user install when a matching binary artifact
+    20	  exists.
+    21	- If the matching binary artifact is missing, fail fast with:
+    22	  binary artifact missing for current platform.
+    23	- Do not create `.aopmem` in the target repository.
+    24	- Do not use WSL as the Windows install path.
+    25	
+    26	Supported platforms:
+    27	
+    28	- macOS Apple Silicon:
+    29	  - detect macOS + arm64 silently.
+    30	  - install from `dist/aopmem-darwin-arm64/aopmem`.
+    31	  - install to `~/.aopmem/bin/aopmem`.
+    32	- Windows x64 native PowerShell:
+    33	  - detect Windows + x64 silently.
+    34	  - install from `dist\aopmem-windows-x86_64\aopmem.exe`.
+    35	  - install to `%USERPROFILE%\.aopmem\bin\aopmem.exe`.
+    36	  - use PowerShell commands only.
+    37	  - use backslashes in Windows path examples.
+    38	
+    39	Unsupported platforms:
+    40	
+    41	- Linux is unsupported in v0.1 rc2.
+    42	- Windows ARM is unsupported in v0.1 rc2.
+    43	- Intel macOS is unsupported in v0.1 rc2.
+    44	
+    45	Silent technical detection:
+    46	
+    47	- current OS and architecture
+    48	- current repo root
+    49	- current agent environment and instruction file
+    50	- existing managed AOPMem block
+    51	- whether AOPMem is already installed globally
+    52	- workspace key
+    53	- backend path under the user-level AOPMem home
+    54	- whether .understand.docs already exists
+    55	
+    56	Install flow:
+    57	
+    58	1. Check whether AOPMem is already installed globally.
+    59	2. Select the matching prebuilt binary for the current platform.
+    60	3. If the matching binary artifact is missing, fail fast.
+    61	4. If AOPMem is missing, install the AOPMem CLI into the user-level bin dir.
+    62	5. Create and verify the required global directories under the user-level
+    63	   AOPMem home.
+    64	6. Create or reuse the workspace for the current repository under
+    65	   <AOPMem home>/workspaces/<workspace-key>.
+    66	7. Ask whether to enable Understand Anything.
+    67	8. If enabled, do best-effort local setup and create .understand.docs.
+    68	9. Ask whether to enable Codebase Memory MCP.
+    69	10. If enabled, do best-effort local setup.
+    70	11. Ask the semantic project onboarding questions.
+    71	12. Seed the collected semantic answers into AOPMem.
+    72	13. Seed the required default kernel/contracts/gates data.
+    73	14. Insert or update the managed AOPMem block in the current instruction file.
+    74	15. Initialize local audit snapshots.
+    75	16. Run `aopmem doctor`.
+    76	17. Run the first recall bundle.
+    77	
+    78	macOS Apple Silicon install commands:
+    79	
+    80	```sh
+    81	mkdir -p "$HOME/.aopmem/bin"
+    82	test -s "dist/aopmem-darwin-arm64/aopmem" || {
+    83	  echo "binary artifact missing for current platform" >&2
+    84	  exit 1
+    85	}
+    86	cp "dist/aopmem-darwin-arm64/aopmem" "$HOME/.aopmem/bin/aopmem"
+    87	chmod 755 "$HOME/.aopmem/bin/aopmem"
+    88	"$HOME/.aopmem/bin/aopmem" --version
+    89	```
+    90	
+    91	Windows x64 native PowerShell install commands:
+    92	
+    93	```powershell
+    94	$InstallDir = "$env:USERPROFILE\.aopmem\bin"
+    95	New-Item -ItemType Directory -Force $InstallDir | Out-Null
+    96	if (-not (Test-Path ".\dist\aopmem-windows-x86_64\aopmem.exe")) {
+    97	  Write-Error "binary artifact missing for current platform"
+    98	  exit 1
+    99	}
+   100	Copy-Item ".\dist\aopmem-windows-x86_64\aopmem.exe" "$InstallDir\aopmem.exe" -Force
+   101	& "$InstallDir\aopmem.exe" --version
+   102	```
+   103	
+   104	Temp proof paths:
+   105	
+   106	- macOS: use `AOPMEM_HOME` with a temp path outside the target repo.
+   107	- Windows PowerShell: use `$env:AOPMEM_HOME`, for example:
+   108	
+   109	```powershell
+   110	$env:AOPMEM_HOME = "$env:TEMP\aopmem-proof"
+   111	```
+   112	
+   113	Workspace rule:
+   114	
+   115	- Create or reuse the workspace under the selected AOPMem home:
+   116	  `workspaces\<workspace-key>` on Windows and `workspaces/<workspace-key>` on
+   117	  macOS.
+   118	- Do not create `.aopmem` in the target repository.
+   119	
+   120	Ask only these 5 user-facing questions, exactly in this order:
+   121	
+   122	1. Включаем Understand Anything для локального понимания проекта и
+   123	   .understand.docs?
+   124	2. Включаем Codebase Memory MCP для навигации по коду?
+   125	3. Объясни, что это за проект, зачем он нужен и чем мы тут занимаемся.
+   126	4. Какая твоя роль в этом проекте и какая роль у агента?
+   127	5. Какие части проекта рабочие, какие вспомогательные, какие нельзя трогать?
+   128	
+   129	Do not ask about:
+   130	
+   131	- OS
+   132	- shell
+   133	- repo path
+   134	- workspace id
+   135	- database location
+   136	- adapter type
+   137	- instruction file name
+   138	- whether to use the default communication style
+   139	- any long preferences/style questionnaire
+   140	- any other technical facts you can detect silently
+   141	
+   142	After install:
+   143	
+   144	- briefly report what was done
+   145	- report any optional setup that was skipped or failed in best-effort mode
+   146	- confirm doctor result
+   147	- do not dump unnecessary technical detail unless there is an error
+   148	````
+===== scripts/build_macos_arm.sh
+     1	#!/usr/bin/env bash
+     2	
+     3	set -euo pipefail
+     4	
+     5	repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+     6	cd "$repo_root"
+     7	
+     8	target_triple="aarch64-apple-darwin"
+     9	dist_dir="$repo_root/dist/aopmem-darwin-arm64"
+    10	dist_bin="$dist_dir/aopmem"
+    11	
+    12	host_triple="$(rustc -vV | awk '/^host: / { print $2 }')"
+    13	
+    14	if [[ "$host_triple" == "$target_triple" ]]; then
+    15	  cargo build --release
+    16	  built_bin="$repo_root/target/release/aopmem"
+    17	else
+    18	  cargo build --release --target "$target_triple"
+    19	  built_bin="$repo_root/target/$target_triple/release/aopmem"
+    20	fi
+    21	
+    22	if [[ ! -f "$built_bin" ]]; then
+    23	  echo "missing built binary: $built_bin" >&2
+    24	  exit 1
+    25	fi
+    26	
+    27	mkdir -p "$dist_dir"
+    28	cp "$built_bin" "$dist_bin"
+    29	chmod 755 "$dist_bin"
+    30	
+    31	echo "built $dist_bin"
+===== scripts/build_windows_x64_from_macos.sh
+     1	#!/usr/bin/env bash
+     2	
+     3	set -euo pipefail
+     4	
+     5	repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+     6	cd "$repo_root"
+     7	
+     8	target_triple="x86_64-pc-windows-msvc"
+     9	rel_dist_bin="dist/aopmem-windows-x86_64/aopmem.exe"
+    10	dist_dir="$repo_root/dist/aopmem-windows-x86_64"
+    11	dist_bin="$dist_dir/aopmem.exe"
+    12	built_bin="$repo_root/target/$target_triple/release/aopmem.exe"
+    13	
+    14	if [[ ! -f "$repo_root/Cargo.toml" ]]; then
+    15	  echo "Cargo.toml not found at repo root: $repo_root" >&2
+    16	  exit 1
+    17	fi
+    18	
+    19	mkdir -p "$dist_dir"
+    20	
+    21	if cargo xwin --version >/dev/null 2>&1; then
+    22	  rustup target add "$target_triple"
+    23	  cargo xwin build --release --target "$target_triple"
+    24	elif docker --version >/dev/null 2>&1; then
+    25	  docker run --rm --platform linux/amd64 \
+    26	    -v "$PWD":/io \
+    27	    -w /io \
+    28	    messense/cargo-xwin \
+    29	    cargo xwin build --release --target "$target_triple"
+    30	else
+    31	  cat >&2 <<'EOF'
+    32	BLOCKED_BUILD_ENV
+    33	
+    34	Install native cargo-xwin support, then rerun:
+    35	
+    36	brew install llvm
+    37	cargo install --locked cargo-xwin
+    38	rustup target add x86_64-pc-windows-msvc
+    39	EOF
+    40	  exit 1
+    41	fi
+    42	
+    43	if [[ ! -s "$built_bin" ]]; then
+    44	  echo "missing or empty built binary: $built_bin" >&2
+    45	  exit 1
+    46	fi
+    47	
+    48	cp "$built_bin" "$dist_bin"
+    49	
+    50	if [[ ! -s "$dist_bin" ]]; then
+    51	  echo "missing or empty dist binary: $dist_bin" >&2
+    52	  exit 1
+    53	fi
+    54	
+    55	file_output="$(file "$rel_dist_bin")"
+    56	echo "$file_output"
+    57	
+    58	if [[ "$file_output" != *"PE32+ executable"* ]] || \
+    59	  [[ "$file_output" != *"x86-64"* ]]; then
+    60	  echo "unexpected Windows binary type: $file_output" >&2
+    61	  exit 1
+    62	fi
+    63	
+    64	shasum -a 256 "$rel_dist_bin"
+===== docs/WINDOWS_NATIVE_POWERSHELL_SMOKE.md
+     1	# Windows Native PowerShell Smoke
+     2	
+     3	Target:
+     4	
+     5	- Windows 11
+     6	- x64
+     7	- native PowerShell
+     8	- no WSL
+     9	
+    10	Run from the AOPMem repo root after the Windows artifact exists.
+    11	
+    12	```powershell
+    13	$InstallDir = "$env:USERPROFILE\.aopmem\bin"
+    14	New-Item -ItemType Directory -Force $InstallDir | Out-Null
+    15	Copy-Item ".\dist\aopmem-windows-x86_64\aopmem.exe" "$InstallDir\aopmem.exe" -Force
+    16	& "$InstallDir\aopmem.exe" --version
+    17	& "$InstallDir\aopmem.exe" --help
+    18	```
+    19	
+    20	Optional temp proof home:
+    21	
+    22	```powershell
+    23	$env:AOPMEM_HOME = "$env:TEMP\aopmem-proof"
+    24	```
+    25	
+    26	Do not create `.aopmem` in the target repo.
+===== .devplan/WINDOWS_BUILD_PROOF.md
+     1	# Windows x64 Build Proof
+     2	
+     3	Date: 2026-06-28
+     4	
+     5	## Scope
+     6	
+     7	Add Windows x64 native PowerShell build/install support for AOPMem
+     8	v0.1.0-rc2.
+     9	
+    10	## Target
+    11	
+    12	- OS/runtime target: Windows 11 native PowerShell
+    13	- CPU/OS architecture: x64
+    14	- Rust target: `x86_64-pc-windows-msvc`
+    15	- Output: `dist/aopmem-windows-x86_64/aopmem.exe`
+    16	
+    17	## Files
+    18	
+    19	- `scripts/build_windows_x64_from_macos.sh`
+    20	- `dist/aopmem-windows-x86_64/aopmem.exe`
+    21	- `install/v0.1/install_prompt.md`
+    22	- `docs/WINDOWS_NATIVE_POWERSHELL_SMOKE.md`
+    23	
+    24	## Build Environment
+    25	
+    26	Native `cargo xwin --version` did not return a usable command in this Mac
+    27	environment.
+    28	
+    29	Docker fallback was available:
+    30	
+    31	```text
+    32	Docker version 29.5.3, build d1c06ef
+    33	```
+    34	
+    35	The build script used Docker image:
+    36	
+    37	```text
+    38	messense/cargo-xwin
+    39	```
+    40	
+    41	## Commands
+    42	
+    43	```text
+    44	bash scripts/build_windows_x64_from_macos.sh
+    45	file dist/aopmem-windows-x86_64/aopmem.exe
+    46	shasum -a 256 dist/aopmem-windows-x86_64/aopmem.exe
+    47	bash -n scripts/build_windows_x64_from_macos.sh
+    48	git diff --check
+    49	rtk cargo test
+    50	```
+    51	
+    52	## Results
+    53	
+    54	```text
+    55	PASS Windows x64 build script completed
+    56	PASS dist/aopmem-windows-x86_64/aopmem.exe exists
+    57	PASS artifact is non-empty
+    58	PASS file reports PE32+ executable
+    59	PASS file reports x86-64
+    60	PASS bash syntax check
+    61	PASS git diff --check
+    62	PASS cargo test: 164 passed
+    63	```
+    64	
+    65	`file` output:
+    66	
+    67	```text
+    68	dist/aopmem-windows-x86_64/aopmem.exe: PE32+ executable (console) x86-64, for MS Windows
+    69	```
+    70	
+    71	Size:
+    72	
+    73	```text
+    74	4193792 bytes
+    75	```
+    76	
+    77	SHA-256:
+    78	
+    79	```text
+    80	d7d11a863c65877a31a203626764e3aaa2cc58c1403fbb37d6c1d22cdb17db0e
+    81	```
+    82	
+    83	## Runtime Proof
+    84	
+    85	Not run on Mac. No Wine run was attempted.
+    86	
+    87	Native Windows runtime proof belongs to Windows VDI and is documented in:
+    88	
+    89	```text
+    90	docs/WINDOWS_NATIVE_POWERSHELL_SMOKE.md
+    91	```
+    92	
+    93	## Scope Guard
+    94	
+    95	- No `src/**` changes.
+    96	- No `tests/**` changes.
+    97	- No Linux support added.
+    98	- No Windows ARM support added.
+    99	- No WSL install path added.
+   100	- No CI/GitHub Actions added.
+   101	- No runtime behavior changed.
+===== .devplan/RELEASE_CANDIDATE_v0.1.0-rc2.md
+     1	# AOPMem v0.1.0-rc2 Release Candidate
+     2	
+     3	## Status
+     4	
+     5	RC2 build artifact ready for Windows VDI smoke.
+     6	
+     7	## Delta From rc1
+     8	
+     9	- Added Windows x64 build script:
+    10	  `scripts/build_windows_x64_from_macos.sh`.
+    11	- Added Windows x64 binary:
+    12	  `dist/aopmem-windows-x86_64/aopmem.exe`.
+    13	- Updated install prompt platform logic for:
+    14	  - macOS Apple Silicon;
+    15	  - Windows x64 native PowerShell.
+    16	- Added Windows native PowerShell smoke doc:
+    17	  `docs/WINDOWS_NATIVE_POWERSHELL_SMOKE.md`.
+    18	
+    19	## Evidence
+    20	
+    21	- rc1 evidence remains valid:
+    22	  `.devplan/RELEASE_CANDIDATE_v0.1.0-rc1.md`.
+    23	- Windows build proof:
+    24	  `.devplan/WINDOWS_BUILD_PROOF.md`.
+    25	- Build command:
+    26	  `bash scripts/build_windows_x64_from_macos.sh`.
+    27	- Artifact type:
+    28	  `PE32+ executable (console) x86-64, for MS Windows`.
+    29	- SHA-256:
+    30	  `d7d11a863c65877a31a203626764e3aaa2cc58c1403fbb37d6c1d22cdb17db0e`.
+    31	
+    32	## Included Scope
+    33	
+    34	- macOS ARM binary remains:
+    35	  `dist/aopmem-darwin-arm64/aopmem`.
+    36	- Windows x64 binary added:
+    37	  `dist/aopmem-windows-x86_64/aopmem.exe`.
+    38	- Windows install path is native PowerShell, no WSL:
+    39	  `%USERPROFILE%\.aopmem\bin\aopmem.exe`.
+    40	- Runtime storage remains user-level AOPMem home.
+    41	- Target repo still must not receive `.aopmem`.
+    42	
+    43	## Explicitly Out of Scope
+    44	
+    45	- Linux.
+    46	- Windows ARM.
+    47	- Intel macOS.
+    48	- WSL as primary Windows path.
+    49	- CI/GitHub Actions.
+    50	- Node.js rewrite.
+    51	- Runtime behavior changes.
+    52	- DERC logic changes.
+    53	- AOPMem memory model changes.
+    54	- Mem0, Hindsight, MCP server, vector, semantic, or embedding features.
+    55	
+    56	## Verification
+    57	
+    58	Passed on Mac:
+    59	
+    60	- Windows cross-build via Docker `messense/cargo-xwin`.
+    61	- `file dist/aopmem-windows-x86_64/aopmem.exe`.
+    62	- `shasum -a 256 dist/aopmem-windows-x86_64/aopmem.exe`.
+    63	- `bash -n scripts/build_windows_x64_from_macos.sh`.
+    64	- `git diff --check`.
+    65	- `rtk cargo test`: 164 passed.
+    66	
+    67	Pending outside Mac:
+    68	
+    69	- Native Windows 11 PowerShell smoke:
+    70	  `docs/WINDOWS_NATIVE_POWERSHELL_SMOKE.md`.
+    71	
+    72	## Release Recommendation
+    73	
+    74	Use rc2 for Windows VDI smoke.
+    75	
+    76	Promote only after native Windows PowerShell smoke passes:
+    77	
+    78	- `aopmem.exe --version`
+    79	- `aopmem.exe --help`
+
+$ wc -l .devplan/PROOF_LOG.md && rg -n "STAGE_055|aopmem-darwin-arm64|build_macos_arm|cargo test|git diff --check|Windows|rc1|0\.1\.0|Out-of-scope|Linux|Mem0|Qdrant|semantic search|vector search|Custom MCP|background enrichment|Old MVP" .devplan/PROOF_LOG.md | sed -n "1,220p"
+    4879 .devplan/PROOF_LOG.md
+81:Out-of-scope drift: None.
+166:Out-of-scope drift: None from Stage 002 implementation.
+248:Out-of-scope drift: None.
+294:cargo test
+306:PASS cargo test: 62 passed
+335:Out-of-scope drift: None found.
+363:rtk cargo test
+377:PASS rtk cargo test: 3 passed
+379:PASS --version exits 0 and prints aopmem 0.1.0
+404:Out-of-scope drift: None found for Stage 004.
+444:rtk cargo test
+455:PASS rtk cargo test: 6 passed
+472:rtk cargo test
+483:PASS rtk cargo test: 7 passed
+502:Out-of-scope drift: None from Stage 005 patch.
+541:rtk cargo test
+545:rtk cargo test
+554:PASS rtk cargo test: 10 passed
+577:Out-of-scope drift: None.
+590:- Audit `cargo test` generated `Cargo.lock` and `target/`.
+615:rtk cargo test
+625:PASS rtk cargo test: 15 passed
+656:Out-of-scope drift: None from Stage 007.
+669:- Audit `cargo test` generated `Cargo.lock` and `target/`.
+695:rtk cargo test
+705:PASS rtk cargo test: 18 passed
+708:PASS final rtk cargo test after test robustness patch: 18 passed
+741:Out-of-scope drift: None.
+754:- Audit `cargo test` generated `Cargo.lock` and `target/`.
+779:rtk cargo test
+790:PASS rtk cargo test: 19 passed
+822:Out-of-scope drift: None found.
+835:- Audit `cargo test` generated `Cargo.lock` and `target/`.
+862:rtk cargo test
+874:PASS rtk cargo test: 22 passed
+909:Out-of-scope drift: None found for Stage 010.
+922:- Audit `cargo test` generated `Cargo.lock` and `target/`.
+951:rtk cargo test
+962:FAIL first rtk cargo test found one Rust lifetime error in list_nodes
+963:PASS final rtk cargo test: 28 passed
+1017:rtk cargo test
+1028:PASS rtk cargo test: 32 passed
+1045:- Did not add aliases, tags, sources, events, FTS, semantic/vector search,
+1084:rtk cargo test
+1085:cargo fmt && rtk cargo test
+1096:FAIL first rtk cargo test found three Rust lifetime errors in metadata list
+1098:PASS final rtk cargo test: 36 passed
+1113:- Did not add events, registries, FTS, semantic/vector search, MCP server, or
+1135:Out-of-scope drift: None found.
+1148:- Audit `cargo test` generated build output.
+1157:Out-of-scope drift: None found.
+1170:- Audit `cargo test` generated build output.
+1181:Out-of-scope drift: None found.
+1194:- Audit `cargo test` / `cargo run` generated build output.
+1219:rtk cargo test
+1220:cargo fmt && rtk cargo test
+1231:FAIL first rtk cargo test found one Rust lifetime error in audit list_events
+1232:PASS final rtk cargo test: 40 passed
+1267:Out-of-scope drift: None found.
+1280:- Re-audit `cargo test` generated build output.
+1307:rtk cargo test
+1318:PASS rtk cargo test: 47 passed
+1352:Out-of-scope drift: None found.
+1365:- Audit `cargo test/run` generated build output.
+1391:rtk cargo test
+1402:PASS rtk cargo test: 50 passed
+1415:- Did not add BM25 search CLI, recall logic, semantic search, vectors, or
+1436:Out-of-scope drift: None found.
+1449:- Audit `cargo test` generated build output.
+1474:rtk cargo test
+1485:PASS rtk cargo test: 52 passed
+1497:- Did not use FTS/BM25, graph traversal, semantic search, vectors, or
+1518:Out-of-scope drift: None found.
+1544:rtk cargo test
+1554:PASS rtk cargo test: 52 passed
+1588:Out-of-scope drift: None found.
+1618:rtk cargo test
+1629:PASS rtk cargo test: 54 passed
+1662:Out-of-scope drift: None found beyond user-approved minimal CLI recall wiring.
+1690:rtk cargo test
+1702:PASS rtk cargo test: 54 passed
+1725:- No semantic/vector search was added.
+1740:Out-of-scope drift: None found.
+1779:cargo fmt && rtk cargo test
+1780:cargo fmt && rtk cargo test
+1792:FAIL first rtk cargo test: Rust lifetime error in new FTS search method
+1794:PASS rtk cargo test: 57 passed
+1811:- No semantic, vector, Mem0, Hindsight, MCP, CI, or markdown export work.
+1828:Out-of-scope drift: None found; dependency scope stayed minimal.
+1860:cargo fmt && rtk cargo test
+1873:PASS rtk cargo test: 59 passed
+1890:- No semantic/vector search, Mem0, Hindsight, custom MCP, CI, or markdown
+1908:Out-of-scope drift: None found.
+1941:cargo fmt && rtk cargo test
+1954:PASS rtk cargo test: 61 passed
+1971:- No semantic/vector search, Mem0, Hindsight, custom MCP, CI, or markdown
+1989:Out-of-scope drift: None found.
+2232:cargo test
+2244:PASS cargo test: 68 passed
+2269:Out-of-scope drift: None found.
+2311:cargo test
+2324:PASS cargo test: 74 passed
+2359:Out-of-scope drift: None found.
+2395:cargo test
+2406:PASS cargo test: 77 passed
+2429:Out-of-scope drift: None found.
+2472:cargo test
+2473:RUST_TEST_THREADS=1 cargo test
+2485:PASS cargo test: 80 passed
+2486:PASS RUST_TEST_THREADS=1 cargo test: 80 passed
+2511:- After the fix, both `cargo test` and `RUST_TEST_THREADS=1 cargo test`
+2555:cargo test
+2566:PASS cargo test: 82 passed
+2576:  workspace state, reran `cargo test`, revalidated
+2629:cargo test
+2640:PASS cargo test: 83 passed
+2733:cargo test
+2745:PASS cargo test: 85 passed
+2803:cargo test
+2815:PASS cargo test: 86 passed
+2868:cargo test
+2878:PASS cargo test: 98 passed
+2938:cargo test tools:: -- --nocapture
+2939:cargo test
+2949:PASS cargo test tools::: 3 passed
+2950:PASS cargo test: 91 passed
+3009:cargo test
+3019:PASS cargo test: 94 passed
+3080:cargo test
+3090:PASS cargo test: 88 passed
+3129:cargo test
+3138:PASS cargo test: 86 passed
+3189:cargo test
+3199:PASS cargo test: 103 passed
+3252:cargo test
+3262:PASS cargo test: 144 passed
+3311:cargo test
+3320:PASS cargo test: 149 passed
+3358:cargo test
+3367:PASS cargo test: 155 passed
+3404:cargo test
+3413:PASS cargo test: 158 passed
+3464:PASS cargo test inside script: 158 passed
+3512:PASS cargo test inside script: 158 passed
+3549:PASS cargo test inside script: 158 passed
+3610:## STAGE_055_MILESTONE_AUDIT
+3616:- `STAGE_001`–`STAGE_055`
+3620:- `STAGE_051`–`STAGE_055`
+3632:PASS cumulative milestone audit through STAGE_055
+3634:PASS verified_through_stage can advance to STAGE_055
+3672:cargo test
+3680:PASS cargo test: 158 passed
+3707:- `scripts/build_macos_arm.sh`
+3708:- `dist/aopmem-darwin-arm64/aopmem`
+3718:bash scripts/build_macos_arm.sh || true
+3719:ls -l dist/aopmem-darwin-arm64/aopmem
+3720:file dist/aopmem-darwin-arm64/aopmem
+3729:PASS dist/aopmem-darwin-arm64/aopmem exists
+3738:- Produced binary at `dist/aopmem-darwin-arm64/aopmem`.
+3843:## STAGE_055
+3861:- `.devplan/HANDOFFS/STAGE_055.md`
+3920:cargo test
+3930:PASS cargo test: 139 passed
+3980:cargo test
+3990:PASS cargo test: 137 passed
+4044:cargo test
+4054:PASS cargo test: 134 passed
+4094:cargo test
+4104:PASS cargo test: 130 passed
+4152:cargo test init_writes_sql_snapshot_under_workspace_audit_git -- --nocapture
+4153:cargo test doctor_json_reports_missing_health_for_uninitialized_workspace -- --nocapture
+4154:cargo test cleanup_keeps_today_dir_even_when_only_today_exceeds_size_limit -- --nocapture
+4155:cargo test
+4164:PASS cargo test: 127 passed
+4192:cargo test
+4200:PASS cargo test: 127 passed
+4232:cargo test
+4241:PASS cargo test: 144 passed
+4290:cargo test
+4292:cargo test
+4302:PASS cargo test: 124 passed
+4304:PASS cargo test after fmt: 124 passed
+4350:cargo test
+4360:PASS cargo test: 122 passed
+4401:cargo test
+4409:PASS cargo test: 118 passed
+4455:cargo test
+4465:PASS cargo test: 111 passed
+4515:cargo test
+4525:PASS cargo test: 114 passed
+4580:cargo test validate_tool_rejects_sqlite_and_tool_json_drift
+4581:cargo test run_tool_rejects_sqlite_and_tool_json_drift_before_local_policy_override
+4582:cargo test
+4593:PASS cargo test: 105 passed
+4640:rtk cargo test
+4641:rtk cargo test --tests
+4643:rg -n -i "mem0|hindsight|qdrant|embedding|vector|semantic search|custom MCP server|migration old MVP|import old MVP|old MVP|background enrichment|current_state|task history|markdown export|markdown import|GitHub Actions|CI workflow" --glob '!target/**' --glob '!dist/**' --glob '!Cargo.lock' .
+4651:PASS cargo test: 164 passed
+4652:PASS cargo test --tests: 164 passed
+4710:rtk cargo test
+4711:rtk cargo test --tests
+4720:PASS cargo test
+4721:PASS cargo test --tests
+4749:cargo test
+4757:PASS cargo test: 105 passed
+4773:## RC_PREP_v0.1.0-rc1
+4779:- Prepare AOPMem v0.1.0-rc1 release candidate without product code changes.
+4783:- `.devplan/RELEASE_CANDIDATE_v0.1.0-rc1.md`
+4790:rtk cargo test
+4791:rtk cargo test --tests
+4792:git diff --check
+4793:rtk bash scripts/build_macos_arm.sh
+4794:file dist/aopmem-darwin-arm64/aopmem
+4795:shasum -a 256 dist/aopmem-darwin-arm64/aopmem
+4796:dist/aopmem-darwin-arm64/aopmem --version
+4809:PASS rtk cargo test: 164 passed
+4810:PASS rtk cargo test --tests: 164 passed
+4811:PASS git diff --check
+4814:PASS binary version: aopmem 0.1.0
+4822:- RC ready for GitHub push and user-style install testing as `v0.1.0-rc1`.
+[exit ]
+
+$ test -f dist/aopmem-darwin-arm64/aopmem && echo exists
+exists
+[exit 0]
+
+$ file dist/aopmem-darwin-arm64/aopmem
+dist/aopmem-darwin-arm64/aopmem: Mach-O 64-bit executable arm64
+[exit 0]
+
+$ dist/aopmem-darwin-arm64/aopmem --version
+aopmem 0.1.0
+[exit 0]
+
+$ test -f dist/aopmem-windows-x86_64/aopmem.exe && echo exists
+exists
+[exit 0]
+
+$ file dist/aopmem-windows-x86_64/aopmem.exe
+dist/aopmem-windows-x86_64/aopmem.exe: PE32+ executable (console) x86-64, for MS Windows
+[exit 0]
+
+$ shasum -a 256 dist/aopmem-windows-x86_64/aopmem.exe
+d7d11a863c65877a31a203626764e3aaa2cc58c1403fbb37d6c1d22cdb17db0e  dist/aopmem-windows-x86_64/aopmem.exe
+[exit 0]
+
+$ test -f scripts/build_windows_x64_from_macos.sh && echo exists
+exists
+[exit 0]
+
+$ test -x scripts/build_windows_x64_from_macos.sh && echo executable || echo runnable_by_bash
+executable
+[exit 0]
+
+$ bash -n scripts/build_windows_x64_from_macos.sh
+[exit 0]
+
+$ rg -n "set -euo pipefail|target_triple=|rel_dist_bin=|dist_bin=|cargo xwin|messense/cargo-xwin|docker|WSL|wsl|PowerShell|windows-msvc|aopmem-windows-x86_64" scripts/build_windows_x64_from_macos.sh
+3:set -euo pipefail
+8:target_triple="x86_64-pc-windows-msvc"
+9:rel_dist_bin="dist/aopmem-windows-x86_64/aopmem.exe"
+10:dist_dir="$repo_root/dist/aopmem-windows-x86_64"
+11:dist_bin="$dist_dir/aopmem.exe"
+21:if cargo xwin --version >/dev/null 2>&1; then
+23:  cargo xwin build --release --target "$target_triple"
+24:elif docker --version >/dev/null 2>&1; then
+25:  docker run --rm --platform linux/amd64 \
+28:    messense/cargo-xwin \
+29:    cargo xwin build --release --target "$target_triple"
+38:rustup target add x86_64-pc-windows-msvc
+[exit 0]
+
+$ rg -n "dist/aopmem-darwin-arm64/aopmem|dist\\\\aopmem-windows-x86_64\\\\aopmem.exe|%USERPROFILE%\\\\.aopmem\\\\bin\\\\aopmem.exe|PowerShell|WSL|build from source|binary artifact missing|Unsupported platforms|Linux is unsupported" install/v0.1/install_prompt.md
+19:- Do not build from source during user install when a matching binary artifact
+22:  binary artifact missing for current platform.
+24:- Do not use WSL as the Windows install path.
+30:  - install from `dist/aopmem-darwin-arm64/aopmem`.
+32:- Windows x64 native PowerShell:
+34:  - install from `dist\aopmem-windows-x86_64\aopmem.exe`.
+35:  - install to `%USERPROFILE%\.aopmem\bin\aopmem.exe`.
+36:  - use PowerShell commands only.
+39:Unsupported platforms:
+41:- Linux is unsupported in v0.1 rc2.
+82:test -s "dist/aopmem-darwin-arm64/aopmem" || {
+83:  echo "binary artifact missing for current platform" >&2
+86:cp "dist/aopmem-darwin-arm64/aopmem" "$HOME/.aopmem/bin/aopmem"
+91:Windows x64 native PowerShell install commands:
+96:if (-not (Test-Path ".\dist\aopmem-windows-x86_64\aopmem.exe")) {
+97:  Write-Error "binary artifact missing for current platform"
+100:Copy-Item ".\dist\aopmem-windows-x86_64\aopmem.exe" "$InstallDir\aopmem.exe" -Force
+107:- Windows PowerShell: use `$env:AOPMEM_HOME`, for example:
+[exit 0]
+
+$ rg -n "PowerShell|WSL|USERPROFILE|AOPMEM_HOME|--version|--help|init|doctor|recall|\.aopmem" docs/WINDOWS_NATIVE_POWERSHELL_SMOKE.md
+1:# Windows Native PowerShell Smoke
+7:- native PowerShell
+8:- no WSL
+13:$InstallDir = "$env:USERPROFILE\.aopmem\bin"
+16:& "$InstallDir\aopmem.exe" --version
+17:& "$InstallDir\aopmem.exe" --help
+23:$env:AOPMEM_HOME = "$env:TEMP\aopmem-proof"
+26:Do not create `.aopmem` in the target repo.
+[exit 0]
+
+$ rg -n "RC2|RC ready|ready|macOS|darwin|PE32\+|SHA-256|PowerShell proof pending|pending|No runtime behavior changed|runtime behavior" .devplan/RELEASE_CANDIDATE_v0.1.0-rc2.md
+5:RC2 build artifact ready for Windows VDI smoke.
+14:  - macOS Apple Silicon;
+28:  `PE32+ executable (console) x86-64, for MS Windows`.
+29:- SHA-256:
+34:- macOS ARM binary remains:
+35:  `dist/aopmem-darwin-arm64/aopmem`.
+47:- Intel macOS.
+[exit 0]
+
+$ rtk cargo build
+cargo build (0 crates compiled)
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.14s
+[exit 0]
+
+$ rtk cargo test
+cargo test: 164 passed (1 suite, 2.06s)
+[exit 0]
+
+$ rtk cargo test --tests
+cargo test: 164 passed (1 suite, 1.68s)
+[exit 0]
+
+$ git diff --check
+[exit 0]
+
+$ rg -n -i "Node\.js rewrite|npm start|Linux support|WSL primary|WSL as primary|GitHub Actions|CI workflow|Mem0|Hindsight|Qdrant|vector search|semantic search|custom MCP server|old MVP|background enrichment|current_state|task history" src Cargo.toml scripts install docs .devplan --glob "!target/**" --glob "!dist/**" --glob "!Cargo.lock" | sed -n "1,260p"
+.devplan/MASTER_SPEC.md:57:- Mem0;
+.devplan/MASTER_SPEC.md:58:- Hindsight;
+.devplan/MASTER_SPEC.md:59:- semantic search;
+.devplan/MASTER_SPEC.md:60:- vector search;
+.devplan/MASTER_SPEC.md:62:- Qdrant;
+.devplan/MASTER_SPEC.md:63:- custom MCP server;
+.devplan/GLOBAL_AUDIT_REPORT.md:20:with FTS5/BM25. No Mem0, Hindsight, Qdrant, vector/semantic backend, custom MCP
+.devplan/GLOBAL_AUDIT_REPORT.md:21:server, CI workflow, old-MVP import, background enrichment, or markdown memory
+.devplan/GLOBAL_AUDIT_REPORT.md:56:| No CI/GitHub Actions | PASS | no `.github` or YAML workflow files |  |
+.devplan/GLOBAL_AUDIT_REPORT.md:65:| No semantic/vector search | PASS | no deps/tables/backend; only FTS5/BM25 |  |
+.devplan/GLOBAL_AUDIT_REPORT.md:70:| No Mem0/Hindsight | PASS | drift scan |  |
+.devplan/GLOBAL_AUDIT_REPORT.md:71:| No custom MCP server | PASS | registry/profile only |  |
+.devplan/GLOBAL_AUDIT_REPORT.md:72:| No old MVP migration/import | PASS | only schema migrations; no old-MVP import path |  |
+.devplan/GLOBAL_AUDIT_REPORT.md:73:| No background enrichment | PASS | no daemon/background loop found |  |
+.devplan/GLOBAL_AUDIT_REPORT.md:74:| No current_state/task history | PASS | docs-only out-of-scope mentions |  |
+.devplan/GLOBAL_AUDIT_REPORT.md:174:| Mem0 / Hindsight / Qdrant | docs/scanner hits only | allowed |
+.devplan/GLOBAL_AUDIT_REPORT.md:176:| custom MCP server | docs only | allowed |
+.devplan/GLOBAL_AUDIT_REPORT.md:177:| old MVP import/migration | docs only; DB schema migrations are allowed | allowed |
+.devplan/GLOBAL_AUDIT_REPORT.md:178:| background enrichment | docs only | allowed |
+.devplan/GLOBAL_AUDIT_REPORT.md:179:| current_state/task history | docs only | allowed |
+.devplan/GLOBAL_AUDIT_REPORT.md:181:| GitHub Actions / CI | no workflow files | pass |
+src/verify/mod.rs:31:    "mem0",
+src/verify/mod.rs:32:    "hindsight",
+src/verify/mod.rs:33:    "semantic search",
+src/verify/mod.rs:34:    "vector search",
+src/verify/mod.rs:36:    "qdrant",
+src/verify/mod.rs:1361:            "// Mem0 should not appear here\n",
+src/verify/mod.rs:1371:                && issue.message.contains("term=mem0")
+.devplan/RELEASE_CANDIDATE_v0.1.0-rc1.md:60:- GitHub Actions / CI.
+.devplan/RELEASE_CANDIDATE_v0.1.0-rc1.md:61:- Mem0, Hindsight, Qdrant, vector search, semantic search, and embeddings.
+.devplan/RELEASE_CANDIDATE_v0.1.0-rc1.md:62:- Custom MCP server implementation.
+.devplan/RELEASE_CANDIDATE_v0.1.0-rc1.md:63:- Background enrichment or daemon behavior.
+.devplan/RELEASE_CANDIDATE_v0.1.0-rc1.md:64:- Old MVP import/migration.
+.devplan/EXECUTION_LEDGER.md:129:- No semantic, vector, Mem0, Hindsight, MCP, CI, or markdown export work.
+.devplan/EXECUTION_LEDGER.md:187:- No semantic, vector, Mem0, Hindsight, MCP, CI, or markdown export work.
+.devplan/EXECUTION_LEDGER.md:882:- No semantic, vector, Mem0, Hindsight, MCP, CI, or markdown export work.
+.devplan/EXECUTION_LEDGER.md:1566:  semantic/vector search, MCP server, or markdown memory exports.
+.devplan/EXECUTION_LEDGER.md:1686:- Did not add aliases, tags, sources, events, FTS, semantic/vector search,
+.devplan/EXECUTION_LEDGER.md:1747:- Did not add events, registries, FTS, semantic/vector search, MCP server, or
+.devplan/EXECUTION_LEDGER.md:1925:- Did not add BM25 search CLI, recall logic, semantic search, vectors, or
+.devplan/EXECUTION_LEDGER.md:1980:- Did not use FTS, BM25, graph traversal, semantic search, vectors, or
+.devplan/EXECUTION_LEDGER.md:2100:- Did not add FTS/BM25, semantic/vector search, Mem0, Hindsight, custom MCP,
+.devplan/EXECUTION_LEDGER.md:2166:- Did not implement semantic/vector search.
+.devplan/HANDOFFS/STAGE_020.md:46:- No semantic/vector search was added.
+.devplan/HANDOFFS/STAGE_020.md:47:- No Mem0, Hindsight, custom MCP, CI, or markdown export work was added.
+.devplan/HANDOFFS/STAGE_012.md:39:- No FTS, semantic/vector search, MCP server, or markdown import/export was
+.devplan/AUDITS/GLOBAL_AUDIT_001.md:41:- `find .github ...`: PASS, no CI/GitHub Actions found.
+.devplan/AUDITS/GLOBAL_AUDIT_001.md:174:| no migration | ✅ | No old MVP import/migration found; schema migrations are DB versioning. |
+.devplan/AUDITS/GLOBAL_AUDIT_001.md:175:| no external memory backend | ✅ | No Mem0/Hindsight/Qdrant/vector backend found. |
+.devplan/AUDITS/GLOBAL_AUDIT_001.md:179:No forbidden implementation drift found for Mem0, Hindsight, semantic search,
+.devplan/AUDITS/GLOBAL_AUDIT_001.md:180:vector search, embeddings, Qdrant, custom MCP server, markdown AOPMem memory
+.devplan/AUDITS/GLOBAL_AUDIT_001.md:181:exports/views, old MVP migration/import, background enrichment daemon, QA
+.devplan/AUDITS/GLOBAL_AUDIT_001.md:182:domain pack, PR/handoff pack, current_state/task-history memory, or CI/GitHub
+.devplan/AUDITS/GLOBAL_AUDIT_001.md:190:  not semantic/vector search.
+.devplan/GLOBAL_AUDIT_COMMANDS.log:77:Result: PASS. No GitHub Actions or CI workflow files found.
+.devplan/GLOBAL_AUDIT_COMMANDS.log:80:`rg -n -i "mem0|hindsight|qdrant|embedding|vector|semantic search|custom MCP server|migration old MVP|import old MVP|old MVP|background enrichment|current_state|task history|markdown export|markdown import|GitHub Actions|CI workflow" --glob '!target/**' --glob '!dist/**' --glob '!Cargo.lock' .`
+.devplan/GLOBAL_AUDIT_COMMANDS.log:86:`rg -n -i "vector|embedding|semantic|qdrant|mem0|hindsight|current_state|task_history|markdown_export|markdown_import|background_enrichment" Cargo.toml src install templates scripts docs proof .devplan --glob '!target/**' --glob '!dist/**'`
+.devplan/FINAL_DECISION_LOG.md:61:GitHub Actions / CI out of scope.
+.devplan/FINAL_DECISION_LOG.md:257:- semantic search;
+.devplan/FINAL_DECISION_LOG.md:258:- vector search;
+.devplan/FINAL_DECISION_LOG.md:260:- Qdrant;
+.devplan/FINAL_DECISION_LOG.md:357:No background enrichment.
+.devplan/FINAL_DECISION_LOG.md:523:## 32. Current state/task history
+.devplan/FINAL_DECISION_LOG.md:527:No current_state. No task history memory.
+.devplan/WINDOWS_BUILD_PROOF.md:97:- No Linux support added.
+.devplan/WINDOWS_BUILD_PROOF.md:100:- No CI/GitHub Actions added.
+.devplan/HANDOFFS/STAGE_018.md:37:- Did not add FTS/BM25, semantic/vector search, Mem0, Hindsight, custom MCP,
+.devplan/REQUIREMENTS_MATRIX.md:13:| REQ-PROD-005 | No Mem0/Hindsight/semantic/vector/MCP-server/CI/migration. |
+.devplan/RELEASE_CANDIDATE_v0.1.0-rc2.md:48:- WSL as primary Windows path.
+.devplan/RELEASE_CANDIDATE_v0.1.0-rc2.md:49:- CI/GitHub Actions.
+.devplan/RELEASE_CANDIDATE_v0.1.0-rc2.md:50:- Node.js rewrite.
+.devplan/RELEASE_CANDIDATE_v0.1.0-rc2.md:54:- Mem0, Hindsight, MCP server, vector, semantic, or embedding features.
+.devplan/WINDOWS_RC2_MAC_AUDIT_COMMANDS.log:67:    60	- GitHub Actions / CI.
+.devplan/WINDOWS_RC2_MAC_AUDIT_COMMANDS.log:68:    61	- Mem0, Hindsight, Qdrant, vector search, semantic search, and embeddings.
+.devplan/WINDOWS_RC2_MAC_AUDIT_COMMANDS.log:69:    62	- Custom MCP server implementation.
+.devplan/WINDOWS_RC2_MAC_AUDIT_COMMANDS.log:70:    63	- Background enrichment or daemon behavior.
+.devplan/WINDOWS_RC2_MAC_AUDIT_COMMANDS.log:71:    64	- Old MVP import/migration.
+.devplan/WINDOWS_RC2_MAC_AUDIT_COMMANDS.log:727:    97	- No Linux support added.
+.devplan/WINDOWS_RC2_MAC_AUDIT_COMMANDS.log:730:   100	- No CI/GitHub Actions added.
+.devplan/WINDOWS_RC2_MAC_AUDIT_COMMANDS.log:780:    48	- WSL as primary Windows path.
+.devplan/WINDOWS_RC2_MAC_AUDIT_COMMANDS.log:781:    49	- CI/GitHub Actions.
+.devplan/WINDOWS_RC2_MAC_AUDIT_COMMANDS.log:782:    50	- Node.js rewrite.
+.devplan/WINDOWS_RC2_MAC_AUDIT_COMMANDS.log:786:    54	- Mem0, Hindsight, MCP server, vector, semantic, or embedding features.
+.devplan/WINDOWS_RC2_MAC_AUDIT_COMMANDS.log:813:$ wc -l .devplan/PROOF_LOG.md && rg -n "STAGE_055|aopmem-darwin-arm64|build_macos_arm|cargo test|git diff --check|Windows|rc1|0\.1\.0|Out-of-scope|Linux|Mem0|Qdrant|semantic search|vector search|Custom MCP|background enrichment|Old MVP" .devplan/PROOF_LOG.md | sed -n "1,220p"
+.devplan/WINDOWS_RC2_MAC_AUDIT_COMMANDS.log:857:1045:- Did not add aliases, tags, sources, events, FTS, semantic/vector search,
+.devplan/WINDOWS_RC2_MAC_AUDIT_COMMANDS.log:862:1113:- Did not add events, registries, FTS, semantic/vector search, MCP server, or
+.devplan/WINDOWS_RC2_MAC_AUDIT_COMMANDS.log:881:1415:- Did not add BM25 search CLI, recall logic, semantic search, vectors, or
+.devplan/WINDOWS_RC2_MAC_AUDIT_COMMANDS.log:886:1497:- Did not use FTS/BM25, graph traversal, semantic search, vectors, or
+.devplan/WINDOWS_RC2_MAC_AUDIT_COMMANDS.log:896:1725:- No semantic/vector search was added.
+.devplan/WINDOWS_RC2_MAC_AUDIT_COMMANDS.log:902:1811:- No semantic, vector, Mem0, Hindsight, MCP, CI, or markdown export work.
+.devplan/WINDOWS_RC2_MAC_AUDIT_COMMANDS.log:906:1890:- No semantic/vector search, Mem0, Hindsight, custom MCP, CI, or markdown
+.devplan/WINDOWS_RC2_MAC_AUDIT_COMMANDS.log:910:1971:- No semantic/vector search, Mem0, Hindsight, custom MCP, CI, or markdown
+.devplan/WINDOWS_RC2_MAC_AUDIT_COMMANDS.log:1011:4643:rg -n -i "mem0|hindsight|qdrant|embedding|vector|semantic search|custom MCP server|migration old MVP|import old MVP|old MVP|background enrichment|current_state|task history|markdown export|markdown import|GitHub Actions|CI workflow" --glob '!target/**' --glob '!dist/**' --glob '!Cargo.lock' .
+.devplan/WINDOWS_RC2_MAC_AUDIT_COMMANDS.log:1145:$ rg -n -i "Node\.js rewrite|npm start|Linux support|WSL primary|WSL as primary|GitHub Actions|CI workflow|Mem0|Hindsight|Qdrant|vector search|semantic search|custom MCP server|old MVP|background enrichment|current_state|task history" src Cargo.toml scripts install docs .devplan --glob "!target/**" --glob "!dist/**" --glob "!Cargo.lock" | sed -n "1,260p"
+.devplan/HANDOFFS/STAGE_011.md:40:- No FTS, semantic/vector search, MCP server, or markdown import/export was
+.devplan/PROOF_LOG.md:1045:- Did not add aliases, tags, sources, events, FTS, semantic/vector search,
+.devplan/PROOF_LOG.md:1113:- Did not add events, registries, FTS, semantic/vector search, MCP server, or
+.devplan/PROOF_LOG.md:1415:- Did not add BM25 search CLI, recall logic, semantic search, vectors, or
+.devplan/PROOF_LOG.md:1497:- Did not use FTS/BM25, graph traversal, semantic search, vectors, or
+.devplan/PROOF_LOG.md:1725:- No semantic/vector search was added.
+.devplan/PROOF_LOG.md:1811:- No semantic, vector, Mem0, Hindsight, MCP, CI, or markdown export work.
+.devplan/PROOF_LOG.md:1890:- No semantic/vector search, Mem0, Hindsight, custom MCP, CI, or markdown
+.devplan/PROOF_LOG.md:1971:- No semantic/vector search, Mem0, Hindsight, custom MCP, CI, or markdown
+.devplan/PROOF_LOG.md:4643:rg -n -i "mem0|hindsight|qdrant|embedding|vector|semantic search|custom MCP server|migration old MVP|import old MVP|old MVP|background enrichment|current_state|task history|markdown export|markdown import|GitHub Actions|CI workflow" --glob '!target/**' --glob '!dist/**' --glob '!Cargo.lock' .
+.devplan/PROOF_LOG.md:4868:PASS no Linux, Windows ARM, WSL, CI, Node.js rewrite, or runtime feature drift
+.devplan/HANDOFFS/STAGE_019.md:44:- No semantic/vector search was added.
+.devplan/HANDOFFS/STAGE_019.md:45:- No Mem0, Hindsight, custom MCP, CI, or markdown export work was added.
+.devplan/HANDOFFS/STAGE_013.md:39:- No events, registries, FTS, semantic/vector search, MCP server, or markdown
+.devplan/HANDOFFS/STAGE_017.md:30:- No FTS/BM25, graph traversal, semantic search, vectors, or embeddings were
+.devplan/HANDOFFS/STAGE_021.md:52:- No semantic/vector search was added.
+.devplan/HANDOFFS/STAGE_021.md:53:- No Mem0, Hindsight, custom MCP, CI, or markdown export work was added.
+.devplan/HANDOFFS/STAGE_016.md:32:- No vector, semantic, embedding, custom MCP server, BM25 CLI, or recall code
+.devplan/HANDOFFS/STAGE_015.md:71:- No custom MCP server was added.
+[exit 0]
+
+$ rg -n -i "Node\.js rewrite|npm start|Linux support|WSL primary|WSL as primary|GitHub Actions|CI workflow|Mem0|Hindsight|Qdrant|vector search|semantic search|custom MCP server|old MVP|background enrichment|current_state|task history" src Cargo.toml scripts --glob "!target/**" --glob "!dist/**" --glob "!Cargo.lock" || true
+src/verify/mod.rs:31:    "mem0",
+src/verify/mod.rs:32:    "hindsight",
+src/verify/mod.rs:33:    "semantic search",
+src/verify/mod.rs:34:    "vector search",
+src/verify/mod.rs:36:    "qdrant",
+src/verify/mod.rs:1361:            "// Mem0 should not appear here\n",
+src/verify/mod.rs:1371:                && issue.message.contains("term=mem0")
+[exit 0]
+
+$ find .github -maxdepth 3 -type f 2>/dev/null | sed -n "1,80p" || true
+[exit 0]
+
+$ git status --short -- .devplan/WINDOWS_RC2_MAC_AUDIT_COMMANDS.log .devplan/WINDOWS_RC2_MAC_AUDIT_REPORT.md src tests Cargo.toml Cargo.lock install scripts dist templates .devplan/PROOF_LOG.md .devplan/EXECUTION_LEDGER.md .devplan/EXECUTION_LEDGER.json
+ M .devplan/PROOF_LOG.md
+ M install/v0.1/install_prompt.md
+?? .devplan/WINDOWS_RC2_MAC_AUDIT_COMMANDS.log
+?? dist/aopmem-windows-x86_64/
+?? scripts/build_windows_x64_from_macos.sh
+[exit 0]
+
+$ nl -ba src/verify/mod.rs | sed -n "1,45p;1348,1380p"
+     1	use std::collections::{BTreeMap, BTreeSet};
+     2	use std::fs;
+     3	use std::path::Path;
+     4	
+     5	use rusqlite::{Connection, OpenFlags};
+     6	use serde::Serialize;
+     7	use thiserror::Error;
+     8	
+     9	use crate::adapter;
+    10	use crate::storage;
+    11	
+    12	const REQUIRED_SCHEMA_TABLES: &[&str] = &[
+    13	    "nodes",
+    14	    "links",
+    15	    "aliases",
+    16	    "tags",
+    17	    "sources",
+    18	    "events",
+    19	    "registries",
+    20	    "tool_contracts",
+    21	    "mcp_profiles",
+    22	];
+    23	const REQUIRED_SCHEMA_MIGRATION_VERSION: &str = "001";
+    24	const REQUIRED_SCHEMA_MIGRATION_NAME: &str = "001_init";
+    25	const REQUIRED_FTS_TABLE: &str = "fts_nodes";
+    26	const REQUIRED_FTS_COLUMNS: &[&str] = &["title", "summary", "body", "aliases"];
+    27	const MIN_REQUIRED_ACTIVE_GATES: usize = 1;
+    28	const CODE_SCAN_ROOTS: &[&str] = &["src", "tests/cli"];
+    29	const CODE_SCAN_FILE_EXTENSIONS: &[&str] = &["rs"];
+    30	const FORBIDDEN_FEATURE_TERMS: &[&str] = &[
+    31	    "mem0",
+    32	    "hindsight",
+    33	    "semantic search",
+    34	    "vector search",
+    35	    "embeddings",
+    36	    "qdrant",
+    37	];
+    38	
+    39	#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+    40	#[serde(rename_all = "snake_case")]
+    41	pub enum DoctorStatus {
+    42	    Ready,
+    43	    Missing,
+    44	    Error,
+    45	}
+  1348	        let override_home = temp_path("lint-forbidden-term-home");
+  1349	        let home = temp_path("lint-forbidden-term-fallback-home");
+  1350	        let repo_root = temp_path("lint-forbidden-term-repo");
+  1351	        let _aopmem_home = EnvGuard::set("AOPMEM_HOME", &override_home);
+  1352	        let _home = EnvGuard::set("HOME", &home);
+  1353	
+  1354	        fs::create_dir_all(repo_root.join("src")).expect("src dir should exist");
+  1355	        let repo_root = repo_root
+  1356	            .canonicalize()
+  1357	            .expect("repo root should canonicalize");
+  1358	        crate::install::init_workspace(&repo_root).expect("workspace should initialize");
+  1359	        fs::write(
+  1360	            repo_root.join("src").join("forbidden.rs"),
+  1361	            "// Mem0 should not appear here\n",
+  1362	        )
+  1363	        .expect("forbidden source file should be written");
+  1364	
+  1365	        let report = run_lint(&repo_root).expect("lint should succeed");
+  1366	
+  1367	        assert_eq!(report.summary.forbidden_feature_terms, 1);
+  1368	        assert!(report.issues.iter().any(|issue| {
+  1369	            issue.kind == LintIssueKind::ForbiddenFeatureTerm
+  1370	                && issue.subject == "file:src/forbidden.rs"
+  1371	                && issue.message.contains("term=mem0")
+  1372	        }));
+  1373	
+  1374	        fs::remove_dir_all(&override_home).expect("temp AOPMEM_HOME should be removed");
+  1375	        fs::remove_dir_all(&repo_root).expect("temp repo root should be removed");
+  1376	    }
+  1377	}
+[exit 0]
+
+$ printf "Smoke doc required terms:\n"; for term in "PowerShell" "WSL" "USERPROFILE" "AOPMEM_HOME" "--version" "--help" "init" "doctor" "recall" ".aopmem"; do if rg -q -- "$term" docs/WINDOWS_NATIVE_POWERSHELL_SMOKE.md; then echo "PASS $term"; else echo "FAIL $term"; fi; done
+Smoke doc required terms:
+PASS PowerShell
+PASS WSL
+PASS USERPROFILE
+PASS AOPMEM_HOME
+PASS --version
+PASS --help
+FAIL init
+FAIL doctor
+FAIL recall
+PASS .aopmem
+[exit 0]
+
+$ printf "RC2 report required terms:\n"; for term in "macOS ARM" "PE32+" "SHA-256" "Pending outside Mac" "runtime behavior" "dist/aopmem-darwin-arm64/aopmem" "dist/aopmem-windows-x86_64/aopmem.exe"; do if rg -q -- "$term" .devplan/RELEASE_CANDIDATE_v0.1.0-rc2.md; then echo "PASS $term"; else echo "FAIL $term"; fi; done
+RC2 report required terms:
+PASS macOS ARM
+PASS PE32+
+PASS SHA-256
+PASS Pending outside Mac
+FAIL runtime behavior
+PASS dist/aopmem-darwin-arm64/aopmem
+PASS dist/aopmem-windows-x86_64/aopmem.exe
+[exit 0]
+
+$ printf "Install prompt exact checks:\n"; for term in "dist/aopmem-darwin-arm64/aopmem" "dist\\aopmem-windows-x86_64\\aopmem.exe" "%USERPROFILE%\\.aopmem\\bin\\aopmem.exe" "PowerShell commands only" "Do not use WSL as the Windows install path" "binary artifact missing for current platform" "Do not build from source"; do if rg -q -- "$term" install/v0.1/install_prompt.md; then echo "PASS $term"; else echo "FAIL $term"; fi; done
+Install prompt exact checks:
+PASS dist/aopmem-darwin-arm64/aopmem
+FAIL dist\aopmem-windows-x86_64\aopmem.exe
+FAIL %USERPROFILE%\.aopmem\bin\aopmem.exe
+PASS PowerShell commands only
+PASS Do not use WSL as the Windows install path
+PASS binary artifact missing for current platform
+PASS Do not build from source
+[exit 0]
+
+$ printf "Build script exact checks:\n"; for term in "target_triple=\"x86_64-pc-windows-msvc\"" "rel_dist_bin=\"dist/aopmem-windows-x86_64/aopmem.exe\"" "cargo xwin" "messense/cargo-xwin" "set -euo pipefail"; do if rg -q -- "$term" scripts/build_windows_x64_from_macos.sh; then echo "PASS $term"; else echo "FAIL $term"; fi; done; if rg -qi "wsl|Windows native|PowerShell required" scripts/build_windows_x64_from_macos.sh; then echo "FAIL native/WSL wording found"; else echo "PASS no native Windows or WSL requirement"; fi
+Build script exact checks:
+PASS target_triple="x86_64-pc-windows-msvc"
+PASS rel_dist_bin="dist/aopmem-windows-x86_64/aopmem.exe"
+PASS cargo xwin
+PASS messense/cargo-xwin
+PASS set -euo pipefail
+PASS no native Windows or WSL requirement
+[exit 0]
+
+$ printf "Install prompt literal recheck:\n"; for term in "dist\\aopmem-windows-x86_64\\aopmem.exe" "%USERPROFILE%\\.aopmem\\bin\\aopmem.exe"; do if rg -F -q -- "$term" install/v0.1/install_prompt.md; then echo "PASS $term"; else echo "FAIL $term"; fi; done
+Install prompt literal recheck:
+PASS dist\aopmem-windows-x86_64\aopmem.exe
+PASS %USERPROFILE%\.aopmem\bin\aopmem.exe
+[exit 0]
+
+$ shasum -a 256 dist/aopmem-darwin-arm64/aopmem
+798af720030081367969fb36a2913de98956d700fbdd6e87ae176d4e05caaefc  dist/aopmem-darwin-arm64/aopmem
+[exit 0]
+
+$ test -s .devplan/WINDOWS_RC2_MAC_AUDIT_REPORT.md && test -s .devplan/WINDOWS_RC2_MAC_AUDIT_COMMANDS.log && echo audit_files_present
+audit_files_present
+[exit 0]
+
+$ git status --short -- .devplan/WINDOWS_RC2_MAC_AUDIT_REPORT.md .devplan/WINDOWS_RC2_MAC_AUDIT_COMMANDS.log src tests Cargo.toml Cargo.lock install scripts dist templates .devplan/PROOF_LOG.md .devplan/EXECUTION_LEDGER.md .devplan/EXECUTION_LEDGER.json
+ M .devplan/PROOF_LOG.md
+ M install/v0.1/install_prompt.md
+?? .devplan/WINDOWS_RC2_MAC_AUDIT_COMMANDS.log
+?? .devplan/WINDOWS_RC2_MAC_AUDIT_REPORT.md
+?? dist/aopmem-windows-x86_64/
+?? scripts/build_windows_x64_from_macos.sh
+[exit 0]

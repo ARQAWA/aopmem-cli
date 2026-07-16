@@ -6,9 +6,8 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
 target_triple="x86_64-pc-windows-msvc"
-rel_dist_bin="dist/aopmem-windows-x86_64/aopmem.exe"
-dist_dir="$repo_root/dist/aopmem-windows-x86_64"
-dist_bin="$dist_dir/aopmem.exe"
+rel_dist_bin="dist/aopmem-windows-x86_64.exe"
+dist_bin="$repo_root/$rel_dist_bin"
 built_bin="$repo_root/target/$target_triple/release/aopmem.exe"
 
 if [[ ! -f "$repo_root/Cargo.toml" ]]; then
@@ -16,17 +15,24 @@ if [[ ! -f "$repo_root/Cargo.toml" ]]; then
   exit 1
 fi
 
-mkdir -p "$dist_dir"
+if [[ -d "$dist_bin" ]]; then
+  echo "legacy nested dist layout blocks flat asset: $dist_bin" >&2
+  exit 1
+fi
+
+mkdir -p "$repo_root/dist"
 
 if cargo xwin --version >/dev/null 2>&1; then
   rustup target add "$target_triple"
-  cargo xwin build --release --target "$target_triple"
+  CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS="-C target-feature=+crt-static" \
+    cargo xwin build --locked --release --target "$target_triple"
 elif docker --version >/dev/null 2>&1; then
   docker run --rm --platform linux/amd64 \
     -v "$PWD":/io \
     -w /io \
+    -e CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS="-C target-feature=+crt-static" \
     messense/cargo-xwin \
-    cargo xwin build --release --target "$target_triple"
+    cargo xwin build --locked --release --target "$target_triple"
 else
   cat >&2 <<'EOF'
 BLOCKED_BUILD_ENV
@@ -58,6 +64,28 @@ echo "$file_output"
 if [[ "$file_output" != *"PE32+ executable"* ]] || \
   [[ "$file_output" != *"x86-64"* ]]; then
   echo "unexpected Windows binary type: $file_output" >&2
+  exit 1
+fi
+
+if command -v llvm-readobj >/dev/null 2>&1; then
+  imports="$(llvm-readobj --coff-imports "$rel_dist_bin")"
+elif command -v llvm-objdump >/dev/null 2>&1; then
+  imports="$(llvm-objdump -p "$rel_dist_bin")"
+elif command -v objdump >/dev/null 2>&1; then
+  imports="$(objdump -p "$rel_dist_bin")"
+else
+  echo "missing PE import inspection tool (llvm-readobj, llvm-objdump, or objdump)" >&2
+  exit 1
+fi
+
+printf '%s\n' "$imports" | awk '
+  BEGIN { IGNORECASE = 1 }
+  /^[[:space:]]+Name:|DLLName:|DLL Name:/ { print }
+'
+
+if printf '%s\n' "$imports" | \
+  grep -Eiq '(VCRUNTIME|MSVCP|UCRTBASE)[^[:space:]]*\.dll|api-ms-win-crt'; then
+  echo "dynamic MSVC runtime import found in $rel_dist_bin" >&2
   exit 1
 fi
 

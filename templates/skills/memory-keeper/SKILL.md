@@ -13,15 +13,24 @@ No fallback inside main chat.
 
 ## Recall contract
 
-1. Classify intent.
-2. Load active project profile.
-3. Load active kernel and gates.
-4. Load workflows, tool contracts, and MCP profiles.
-5. Traverse typed links.
-6. Use SQLite FTS5/BM25 fallback.
-7. Select 1-3 hunches.
-8. Exclude deprecated and superseded nodes.
-9. Build compact context bundle.
+1. Classify intent and call `aopmem recall --query "<current task>"` without
+   global `--bundle-id`; the first recall creates it.
+2. Keep the returned `bundle_id` for the whole logical retrieval and all later
+   AOPMem operations for the same work.
+3. Load the complete mandatory section on every page.
+4. Follow `continuation_cursor` with the same query and exact global
+   `--bundle-id <bundle_id>` while `more_results=true` and
+   `budget.task.exhausted=false`.
+5. Stop when `more_results=false` or `budget.task.exhausted=true`.
+6. Treat `more_results=true` with a null cursor as a contract error.
+7. Exclude deprecated, superseded, and broken nodes.
+8. Build the bounded task context from nodes with explicit selection reasons.
+
+Never use `aopmem recall --full` in normal task flow. It is only for local
+debug, audit, export, and migration proof.
+
+Do not pass global `--bundle-id` to a first, bare, or `--full` recall. Pass it
+to continuation and every later AOPMem operation for that work.
 
 ## Recall bundle
 
@@ -36,6 +45,21 @@ Bundle contains:
 - hunches
 - source node refs
 - confidence and trust markers
+
+## Pagination contract
+
+List results may contain only one page.
+
+When a complete set is needed, Memory Keeper must:
+
+1. Read `more_results` after every page.
+2. If it is `true`, call the same list with its returned `next_cursor`.
+3. Preserve the same list kind and filters on every continuation.
+4. Stop only when `more_results` is `false`.
+
+Never treat the first page, a short page, or a non-null cursor as proof that
+the set is complete. `--all` is allowed only for an explicit controlled full
+traversal.
 
 ## Hunch rules
 
@@ -56,6 +80,16 @@ User-triggered only:
 - reflect
 
 Memory Keeper creates structured nodes via CLI.
+
+## Feedback contract
+
+Feedback is user-triggered or agent post-task:
+
+`aopmem --bundle-id <bundle_id> feedback record --outcome useful|partial|wrong [--reason "<short reason>"]`
+
+Feedback stays only in Local Observability. It does not change operational
+memory. The optional reason is short and must not contain the full task, raw
+chat, raw tool output, secrets, environment values, or hidden reasoning.
 
 ## Reflection contract
 
