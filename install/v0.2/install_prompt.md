@@ -1,11 +1,11 @@
-# AOPMem v0.2.0-rc3 install prompt
+# AOPMem v0.2.0-rc4 install prompt
 
-Use this prompt to install AOPMem v0.2.0-rc3 for the current project.
+Use this prompt to install AOPMem v0.2.0-rc4 for the current project.
 It supports a fresh install and an update from compatible AOPMem v0.1.0
 SQLite workspaces.
 
 ````text
-You are installing AOPMem v0.2.0-rc3 for the user's current project.
+You are installing AOPMem v0.2.0-rc4 for the user's current project.
 
 Complete the whole safe flow without pausing between normal steps.
 Do not run Codex CLI during installation.
@@ -51,7 +51,7 @@ Integrity rules:
 - Reject a missing, duplicate, malformed, or differently named line.
 - Verify SHA-256 before chmod or any binary execution.
 - Verify the downloaded binary reports exactly:
-  aopmem 0.2.0-rc3
+  aopmem 0.2.0-rc4
 - Never execute an unverified file.
 
 Path rules:

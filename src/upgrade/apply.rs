@@ -11,11 +11,14 @@ use serde::Serialize;
 use thiserror::Error;
 
 use super::{
-    backup::online_backup_to_path, enumerate_workspace_entries, installed_binary_name,
-    nearest_existing_directory, path_with_suffix, plan_all_workspaces_with_probe,
-    regular_file_size, validate_existing_root, validate_optional_managed_directory, DiskSpacePlan,
-    DiskSpaceProbe, SystemDiskSpaceProbe, WorkspaceSchemaPlan, DATABASE_FILE_NAME,
-    DATABASE_SIDECAR_SUFFIXES,
+    backup::{
+        create_unique_backup_run_root, online_backup_to_path_with_faults, BackupError,
+        BackupFaultInjector, BackupPhase, WorkspaceBackupFailureDetails,
+    },
+    enumerate_workspace_entries, installed_binary_name, nearest_existing_directory,
+    path_with_suffix, plan_all_workspaces_with_probe, regular_file_size, validate_existing_root,
+    validate_optional_managed_directory, DiskSpacePlan, DiskSpaceProbe, SystemDiskSpaceProbe,
+    WorkspaceSchemaPlan, DATABASE_FILE_NAME, DATABASE_SIDECAR_SUFFIXES,
 };
 use crate::adapter;
 use crate::audit::{self, AnchoredDir, PendingSnapshotMarker};
@@ -29,9 +32,9 @@ use crate::storage::{self, AopmemPaths, WorkspacePaths};
 use crate::verify;
 
 const SOURCE_VERSION: &str = "0.1.0-rc3";
-const TARGET_VERSION: &str = "0.2.0-rc3";
+const TARGET_VERSION: &str = "0.2.0-rc4";
 const BACKUPS_DIRECTORY: &str = "backups";
-const BACKUP_RUN_PREFIX: &str = "upgrade-0.2.0-rc3-";
+const BACKUP_RUN_PREFIX: &str = "upgrade-0.2.0-rc4-";
 const COMMAND_ID: &str = "upgrade_apply";
 
 const OWNED_GLOBAL_ASSETS: &[OwnedGlobalAsset] = &[
@@ -89,6 +92,8 @@ pub struct UpgradeApplyFailure {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace_key: Option<String>,
+    #[serde(flatten)]
+    pub(crate) backup_details: Option<Box<WorkspaceBackupFailureDetails>>,
 }
 
 #[derive(Debug, Error)]
@@ -273,6 +278,7 @@ enum ApplyFaultPoint {
     BeforeBinaryBackup,
     BeforeWorkspaceMigration,
     AfterWorkspaceBackup,
+    BeforeMigrationApply,
     AfterMigrationBeforeSchemaInspect,
     BeforeMigrationRollback,
     BeforeRollbackRecoveryCheck,
@@ -286,11 +292,26 @@ trait ApplyFaultInjector {
     fn check(&self, _point: ApplyFaultPoint, _workspace_key: Option<&str>) -> io::Result<()> {
         Ok(())
     }
+
+    fn check_backup(&self, _phase: BackupPhase, _workspace_key: &str) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 struct NoFaults;
 
 impl ApplyFaultInjector for NoFaults {}
+
+struct ApplyBackupFaults<'a> {
+    faults: &'a dyn ApplyFaultInjector,
+    workspace_key: &'a str,
+}
+
+impl BackupFaultInjector for ApplyBackupFaults<'_> {
+    fn check(&self, phase: BackupPhase) -> io::Result<()> {
+        self.faults.check_backup(phase, self.workspace_key)
+    }
+}
 
 #[derive(Debug, Clone)]
 struct WorkspaceCandidate {
@@ -1221,15 +1242,7 @@ fn preflight_adapter(context: &CurrentRepoContext) -> Result<(), adapter::SeedEr
 fn create_backup_run(paths: &AopmemPaths) -> io::Result<BackupRun> {
     storage::ensure_owned_direct_directory(paths.home(), &paths.home().join(BACKUPS_DIRECTORY))?;
     let backups = paths.home().join(BACKUPS_DIRECTORY);
-    let mut random = [0_u8; 16];
-    getrandom::fill(&mut random).map_err(|_| io::Error::other("random backup id failed"))?;
-    let mut id = String::with_capacity(32);
-    for byte in random {
-        use std::fmt::Write as _;
-        write!(id, "{byte:02x}").map_err(io::Error::other)?;
-    }
-    let root = backups.join(format!("{BACKUP_RUN_PREFIX}{id}"));
-    storage::ensure_owned_direct_directory(&backups, &root)?;
+    let root = create_unique_backup_run_root(&backups, BACKUP_RUN_PREFIX)?;
     let binary_dir = root.join("binary");
     let adapter_dir = root.join("adapter");
     let assets_dir = root.join("owned-assets");
@@ -1370,18 +1383,24 @@ fn backup_and_migrate_workspace(
         restoration: WorkspaceRestorationReport::default(),
     };
     let workspace_backup_dir = run.workspaces_dir.join(&candidate.key);
+    let backup_path = workspace_backup_dir.join(DATABASE_FILE_NAME);
     if let Err(error) =
         storage::ensure_owned_direct_directory(&run.workspaces_dir, &workspace_backup_dir)
     {
-        let failure = failure(
-            "WORKSPACE_BACKUP_FAILED",
-            error.to_string(),
-            Some(&candidate.key),
+        let failure = backup_failure(
+            BackupError::from_io(
+                BackupPhase::CreateBackupRoot,
+                Some(candidate.paths.db()),
+                None,
+                Some(&backup_path),
+                false,
+                error,
+            ),
+            &candidate.key,
         );
         partial.database_backup = ApplyStep::failed(failure.clone());
         return Err(workspace_migration_failure(failure, partial));
     }
-    let backup_path = workspace_backup_dir.join(DATABASE_FILE_NAME);
 
     let identity = match storage::validate_workspace_mutation_paths(&candidate.paths) {
         Ok(identity) => identity,
@@ -1483,101 +1502,74 @@ fn backup_and_migrate_workspace(
     };
     partial.schema_before = Some(schema_before.clone());
 
-    let marker = if schema_before.pending_migrations.is_empty() {
-        None
-    } else {
-        match audit::ensure_pending_snapshot_marker_locked(locks.snapshot_lock()) {
-            Ok(marker) => Some(marker),
-            Err(error) => {
-                let _ = connection.execute_batch("ROLLBACK;");
-                let failure = failure(
-                    "AUDIT_MARKER_FAILED",
-                    error.to_string(),
-                    Some(&candidate.key),
-                );
-                partial.migration = ApplyStep::failed(failure.clone());
-                return Err(workspace_migration_failure(failure, partial));
-            }
-        }
-    };
-
     let backup_source = match open_read_only_operational_database(&candidate.paths) {
         Ok(connection) => connection,
         Err(error) => {
-            if let Some(marker) = marker {
-                recover_failed_migration(
-                    connection,
-                    &rollback_monitor,
-                    rollback_data_version,
-                    marker,
-                    candidate,
-                    &locks,
-                    &schema_before,
-                    &mut partial,
-                    faults,
-                );
-            } else {
-                let _ = connection.execute_batch("ROLLBACK;");
-            }
-            let failure = failure(
-                "WORKSPACE_BACKUP_FAILED",
-                error.to_string(),
-                Some(&candidate.key),
+            let _ = connection.execute_batch("ROLLBACK;");
+            let failure = backup_failure(
+                BackupError::from_io(
+                    BackupPhase::OpenSourceDatabase,
+                    Some(candidate.paths.db()),
+                    None,
+                    Some(&backup_path),
+                    false,
+                    io::Error::other(error),
+                ),
+                &candidate.key,
             );
             partial.database_backup = ApplyStep::failed(failure.clone());
             return Err(workspace_migration_failure(failure, partial));
         }
     };
-    if let Err(error) = online_backup_to_path(&backup_source, &workspace_backup_dir, &backup_path) {
-        if let Some(marker) = marker {
-            recover_failed_migration(
-                connection,
-                &rollback_monitor,
-                rollback_data_version,
-                marker,
-                candidate,
-                &locks,
-                &schema_before,
-                &mut partial,
-                faults,
-            );
-        } else {
+    let backup_faults = ApplyBackupFaults {
+        faults,
+        workspace_key: &candidate.key,
+    };
+    let backup = match online_backup_to_path_with_faults(
+        backup_source,
+        candidate.paths.db(),
+        &workspace_backup_dir,
+        &backup_path,
+        &schema_before,
+        &backup_faults,
+    ) {
+        Ok(backup) => backup,
+        Err(error) => {
             let _ = connection.execute_batch("ROLLBACK;");
+            let failure = backup_failure(error, &candidate.key);
+            partial.database_backup = ApplyStep::failed(failure.clone());
+            return Err(workspace_migration_failure(failure, partial));
         }
-        let failure = failure(
-            "WORKSPACE_BACKUP_FAILED",
-            error.to_string(),
-            Some(&candidate.key),
+    };
+    let backup_path = backup.final_path;
+    let backup_bytes = backup.bytes;
+    if backup.schema != schema_before {
+        let _ = connection.execute_batch("ROLLBACK;");
+        let failure = backup_failure(
+            BackupError::from_io(
+                BackupPhase::FinalizeBackupMetadata,
+                Some(candidate.paths.db()),
+                None,
+                Some(&backup_path),
+                true,
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "published backup schema identity differs from source",
+                ),
+            ),
+            &candidate.key,
         );
         partial.database_backup = ApplyStep::failed(failure.clone());
         return Err(workspace_migration_failure(failure, partial));
     }
-    drop(backup_source);
-    let backup_bytes = fs::metadata(&backup_path)
-        .map(|metadata| metadata.len())
-        .unwrap_or_default();
     partial.database_backup = ApplyStep::completed(
         Some(&backup_path),
         Some(backup_bytes),
-        "WAL-safe SQLite Online Backup completed under mutation lock",
+        "SQLite handles closed; temporary and published backups validated under mutation lock",
     );
 
     if let Err(error) = faults.check(ApplyFaultPoint::AfterWorkspaceBackup, Some(&candidate.key)) {
-        if let Some(marker) = marker {
-            recover_failed_migration(
-                connection,
-                &rollback_monitor,
-                rollback_data_version,
-                marker,
-                candidate,
-                &locks,
-                &schema_before,
-                &mut partial,
-                faults,
-            );
-        } else {
-            let _ = connection.execute_batch("ROLLBACK;");
-        }
+        let _ = connection.execute_batch("ROLLBACK;");
         let failure = failure(
             "WORKSPACE_BACKUP_BOUNDARY_FAILED",
             error.to_string(),
@@ -1610,7 +1602,35 @@ fn backup_and_migrate_workspace(
             warning: None,
         });
     }
-    let marker = marker.expect("pending migrations always create an audit marker");
+    let marker = match audit::ensure_pending_snapshot_marker_locked(locks.snapshot_lock()) {
+        Ok(marker) => marker,
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK;");
+            let failure = failure(
+                "AUDIT_MARKER_FAILED",
+                error.to_string(),
+                Some(&candidate.key),
+            );
+            partial.migration = ApplyStep::failed(failure.clone());
+            return Err(workspace_migration_failure(failure, partial));
+        }
+    };
+    if let Err(error) = faults.check(ApplyFaultPoint::BeforeMigrationApply, Some(&candidate.key)) {
+        recover_failed_migration(
+            connection,
+            &rollback_monitor,
+            rollback_data_version,
+            marker,
+            candidate,
+            &locks,
+            &schema_before,
+            &mut partial,
+            faults,
+        );
+        let failure = failure("MIGRATION_FAILED", error.to_string(), Some(&candidate.key));
+        partial.migration = ApplyStep::failed(failure.clone());
+        return Err(workspace_migration_failure(failure, partial));
+    }
     if let Err(error) = schema::apply_pending_migrations_in(&connection) {
         recover_failed_migration(
             connection,
@@ -2435,6 +2455,17 @@ fn failure(
         code,
         message: message.into(),
         workspace_key: workspace_key.map(str::to_string),
+        backup_details: None,
+    }
+}
+
+fn backup_failure(error: BackupError, workspace_key: &str) -> UpgradeApplyFailure {
+    let message = error.to_string();
+    UpgradeApplyFailure {
+        code: "WORKSPACE_BACKUP_FAILED",
+        message,
+        workspace_key: Some(workspace_key.to_string()),
+        backup_details: Some(Box::new(error.details(workspace_key, false))),
     }
 }
 
@@ -2777,6 +2808,18 @@ mod tests {
         }
     }
 
+    struct BackupFailAt(BackupPhase);
+
+    impl ApplyFaultInjector for BackupFailAt {
+        fn check_backup(&self, phase: BackupPhase, _workspace_key: &str) -> io::Result<()> {
+            if phase == self.0 {
+                Err(io::Error::from_raw_os_error(5))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
     struct EditAt {
         point: ApplyFaultPoint,
         path: PathBuf,
@@ -2964,13 +3007,11 @@ mod tests {
         let home_guard = EnvGuard::set(&home);
         let cwd_guard = CurrentDirGuard::set(&repo);
         let fixture = create_current_fixture(root, home, repo);
-        Connection::open(fixture.workspace.db())
-            .expect("database should open")
-            .execute_batch("PRAGMA foreign_keys = OFF; DROP TABLE nodes;")
-            .expect("nodes table should drop");
-
-        let execution = apply_all_workspaces_with(&FixedDiskProbe(u64::MAX), &NoFaults)
-            .expect("upgrade apply should report failure");
+        let execution = apply_all_workspaces_with(
+            &FixedDiskProbe(u64::MAX),
+            &FailAt(ApplyFaultPoint::BeforeMigrationApply),
+        )
+        .expect("upgrade apply should report failure");
         let failure = execution.failure.as_ref().expect("failure should exist");
 
         assert_eq!(failure.code, "MIGRATION_FAILED");
@@ -3137,6 +3178,134 @@ mod tests {
         drop(cwd_guard);
         drop(home_guard);
         fs::remove_dir_all(fixture.root).expect("fixture should remove");
+    }
+
+    #[test]
+    fn access_denied_backup_phase_preserves_evidence_and_blocks_migration() {
+        let _lock = crate::install::test_env_lock()
+            .lock()
+            .expect("environment lock should not be poisoned");
+        let (root, home, repo) = create_roots("backup-access-denied");
+        let home_guard = EnvGuard::set(&home);
+        let cwd_guard = CurrentDirGuard::set(&repo);
+        let fixture = create_current_fixture(root, home, repo);
+
+        let execution = apply_all_workspaces_with(
+            &FixedDiskProbe(u64::MAX),
+            &BackupFailAt(BackupPhase::FlushTemporaryFile),
+        )
+        .expect("upgrade apply should report backup failure");
+        let failure = execution.failure.as_ref().expect("failure should exist");
+        let details = failure
+            .backup_details
+            .as_ref()
+            .expect("backup details should exist");
+
+        assert_eq!(failure.code, "WORKSPACE_BACKUP_FAILED");
+        assert_eq!(details.backup_phase, BackupPhase::FlushTemporaryFile);
+        assert_eq!(details.raw_os_error, Some(5));
+        assert!(details.partial_file_exists);
+        assert!(details.partial_file_validated);
+        assert!(!details.migration_started);
+        assert_eq!(migration_versions(fixture.workspace.db()), vec!["001"]);
+        assert_eq!(
+            execution.report.workspaces[0].migration.status,
+            ApplyStepStatus::NotStarted
+        );
+        assert!(!audit::has_pending_snapshot(fixture.workspace.audit_git())
+            .expect("pending marker should inspect"));
+        assert!(backup_root(&execution).is_dir());
+        assert!(Path::new(
+            details
+                .temporary_path
+                .as_deref()
+                .expect("temporary path should exist")
+        )
+        .is_file());
+        assert!(!Path::new(
+            details
+                .final_path
+                .as_deref()
+                .expect("final path should exist")
+        )
+        .exists());
+
+        drop(cwd_guard);
+        drop(home_guard);
+        fs::remove_dir_all(fixture.root).expect("fixture should remove");
+    }
+
+    #[test]
+    fn two_workspaces_upgrade_in_stable_order_and_retain_failed_rc3_root() {
+        let _lock = crate::install::test_env_lock()
+            .lock()
+            .expect("environment lock should not be poisoned");
+        let (root, home, repo) = create_roots("two-workspaces-success");
+        let home_guard = EnvGuard::set(&home);
+        let cwd_guard = CurrentDirGuard::set(&repo);
+        let paths = storage::resolve_paths().expect("paths should resolve");
+        storage::ensure_global_dirs(&paths).expect("global directories should create");
+        let first = create_v010_workspace(&paths, "alpha-workspace");
+        let second = create_v010_workspace(&paths, "beta-workspace");
+        fs::write(paths.bin().join(installed_binary_name()), OLD_BINARY)
+            .expect("old binary should write");
+        seed_old_owned_assets(&paths);
+        let backups = paths.home().join(BACKUPS_DIRECTORY);
+        fs::create_dir(&backups).expect("backup parent should create");
+        let failed_rc3 = backups.join("upgrade-0.2.0-rc3-2ea0b5a589d8f2422bc2e4cbb60a3495");
+        fs::create_dir(&failed_rc3).expect("failed rc3 root should create");
+        fs::write(failed_rc3.join("retained.txt"), b"failed-run evidence")
+            .expect("failed-run evidence should write");
+
+        let execution = apply_all_workspaces_with(&FixedDiskProbe(u64::MAX), &NoFaults)
+            .expect("two-workspace upgrade should run");
+
+        assert!(execution.failure.is_none());
+        assert!(execution.report.success);
+        assert_eq!(
+            execution
+                .report
+                .workspaces
+                .iter()
+                .map(|workspace| workspace.workspace_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha-workspace", "beta-workspace"]
+        );
+        assert!(execution
+            .report
+            .workspaces
+            .iter()
+            .all(|workspace| workspace.status == WorkspaceApplyStatus::Applied));
+        assert_eq!(migration_versions(first.db()), vec!["001", "002", "003"]);
+        assert_eq!(migration_versions(second.db()), vec!["001", "002", "003"]);
+        for workspace in &execution.report.workspaces {
+            let backup = workspace
+                .database_backup
+                .path
+                .as_deref()
+                .expect("workspace backup path should exist");
+            let connection = Connection::open_with_flags(backup, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .expect("published backup should reopen read-only");
+            assert_eq!(
+                super::super::inspect_schema(&connection)
+                    .expect("published backup schema should inspect")
+                    .current_version,
+                "001"
+            );
+        }
+        assert_eq!(
+            fs::read(failed_rc3.join("retained.txt")).expect("failed-run evidence should remain"),
+            b"failed-run evidence"
+        );
+        let rc4_root = backup_root(&execution);
+        assert_ne!(rc4_root, failed_rc3);
+        assert!(rc4_root
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with(BACKUP_RUN_PREFIX)));
+
+        drop(cwd_guard);
+        drop(home_guard);
+        fs::remove_dir_all(root).expect("fixture should remove");
     }
 
     #[test]

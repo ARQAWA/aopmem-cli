@@ -8,7 +8,7 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = "Stop"
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
-$script:ProductVersion = "0.2.0-rc3"
+$script:ProductVersion = "0.2.0-rc4"
 $script:OldReleaseLabel = "0.1.0-rc3"
 $script:OldBinaryVersion = "0.1.0"
 $script:OldBinarySha256 = "01010aeffc20aead5f353353674621b367e6ad590769e4b5915b8d02d62f6d7a"
@@ -328,6 +328,14 @@ function Invoke-AopmemJson {
         }
         $code = Get-OptionalJsonProperty -Object $firstError -Name "code"
         $message = Get-OptionalJsonProperty -Object $firstError -Name "message"
+        $details = Get-OptionalJsonProperty -Object $firstError -Name "details"
+        $backupPhase = Get-OptionalJsonProperty -Object $details -Name "backup_phase"
+        $rawOsError = Get-OptionalJsonProperty -Object $details -Name "raw_os_error"
+        $partialPath = Get-OptionalJsonProperty -Object $details -Name "temporary_path"
+        $partialValidated = Get-OptionalJsonProperty `
+            -Object $details -Name "partial_file_validated"
+        $migrationStarted = Get-OptionalJsonProperty `
+            -Object $details -Name "migration_started"
         $data = Get-OptionalJsonProperty -Object $json -Name "data"
         $workspace = Get-OptionalJsonProperty -Object $data -Name "stopped_workspace"
         $backupRoot = Get-OptionalJsonProperty -Object $data -Name "backup_root"
@@ -340,6 +348,21 @@ function Invoke-AopmemJson {
         }
         if (-not [string]::IsNullOrWhiteSpace([string]$message)) {
             $failureText += " message=$message"
+        }
+        if (-not [string]::IsNullOrWhiteSpace([string]$backupPhase)) {
+            $failureText += " backup_phase=$backupPhase"
+        }
+        if ($null -ne $rawOsError) {
+            $failureText += " raw_os_error=$rawOsError"
+        }
+        if (-not [string]::IsNullOrWhiteSpace([string]$partialPath)) {
+            $failureText += " partial_backup=$partialPath"
+        }
+        if ($null -ne $partialValidated) {
+            $failureText += " partial_validated=$partialValidated"
+        }
+        if ($null -ne $migrationStarted) {
+            $failureText += " migration_started=$migrationStarted"
         }
         if (-not [string]::IsNullOrWhiteSpace([string]$backupRoot)) {
             $script:UpgradeBackupRoot = [string]$backupRoot

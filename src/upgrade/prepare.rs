@@ -8,9 +8,12 @@ use serde::Serialize;
 use thiserror::Error;
 
 use super::{
-    backup::online_backup_to_path, display_path, enumerate_workspace_entries,
-    open_immutable_database, path_with_suffix, validate_existing_root,
-    validate_optional_managed_directory, DATABASE_FILE_NAME,
+    backup::{
+        create_unique_backup_run_root, online_backup_to_path_with_faults, BackupError,
+        BackupFaultInjector, BackupPhase, NoBackupFaults, WorkspaceBackupFailureDetails,
+    },
+    display_path, enumerate_workspace_entries, open_immutable_database, path_with_suffix,
+    validate_existing_root, validate_optional_managed_directory, DATABASE_FILE_NAME,
 };
 use crate::audit::{self, AnchoredDir};
 use crate::mutation;
@@ -18,7 +21,7 @@ use crate::storage::{self, AopmemPaths, WorkspacePaths};
 
 const PREPARE_SCOPE: &str = "all_workspaces";
 const BACKUPS_DIRECTORY: &str = "backups";
-const BACKUP_RUN_PREFIX: &str = "upgrade-prepare-rc3-";
+const BACKUP_RUN_PREFIX: &str = "upgrade-prepare-rc4-";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct UpgradePrepareReport {
@@ -49,6 +52,8 @@ pub struct UpgradePrepareFailure {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace_key: Option<String>,
+    #[serde(flatten)]
+    pub(crate) backup_details: Option<Box<WorkspaceBackupFailureDetails>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -103,8 +108,6 @@ struct PrepareBackupRun {
     workspaces: PathBuf,
 }
 
-type BackupOperation = fn(&Connection, &Path, &Path) -> io::Result<()>;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CheckpointValidationError {
     Busy {
@@ -150,11 +153,11 @@ impl std::fmt::Display for CheckpointValidationError {
 }
 
 pub fn prepare_all_workspaces() -> Result<UpgradePrepareExecution, UpgradePrepareError> {
-    prepare_all_workspaces_with_backup(online_backup_to_path)
+    prepare_all_workspaces_with_backup(&NoBackupFaults)
 }
 
 fn prepare_all_workspaces_with_backup(
-    backup_operation: BackupOperation,
+    backup_faults: &dyn BackupFaultInjector,
 ) -> Result<UpgradePrepareExecution, UpgradePrepareError> {
     let paths = storage::resolve_paths()?;
     validate_existing_root(paths.home()).map_err(map_plan_error)?;
@@ -206,7 +209,7 @@ fn prepare_all_workspaces_with_backup(
             &mut backup_run,
             &mut report.workspaces[index],
             &mut report.writes_performed,
-            backup_operation,
+            backup_faults,
         ) {
             report.success = false;
             report.stopped_workspace = Some(key.clone());
@@ -232,7 +235,7 @@ fn prepare_workspace(
     backup_run: &mut Option<PrepareBackupRun>,
     report: &mut WorkspacePrepareReport,
     writes_performed: &mut bool,
-    backup_operation: BackupOperation,
+    backup_faults: &dyn BackupFaultInjector,
 ) -> Result<(), UpgradePrepareFailure> {
     let identity = storage::validate_workspace_mutation_paths(workspace)
         .map_err(|error| workspace_failure("UNSAFE_WORKSPACE_PATH", error, key, report))?;
@@ -299,44 +302,74 @@ fn prepare_workspace(
     if backup_run.is_none() {
         let created = create_prepare_backup_run(paths).map_err(|error| {
             let _ = connection.execute_batch("ROLLBACK;");
-            workspace_failure("BACKUP_CREATE_FAILED", error, key, report)
+            workspace_backup_failure(
+                BackupError::from_io(
+                    BackupPhase::CreateBackupRoot,
+                    Some(workspace.db()),
+                    None,
+                    None,
+                    false,
+                    error,
+                ),
+                key,
+                report,
+            )
         })?;
         *backup_run = Some(created);
         *writes_performed = true;
     }
     let run = backup_run.as_ref().expect("backup run initialized above");
     let workspace_backup_dir = run.workspaces.join(key);
+    let backup_path = workspace_backup_dir.join(DATABASE_FILE_NAME);
     storage::ensure_owned_direct_directory(&run.workspaces, &workspace_backup_dir).map_err(
         |error| {
             let _ = connection.execute_batch("ROLLBACK;");
-            workspace_failure("WORKSPACE_BACKUP_FAILED", error, key, report)
+            workspace_backup_failure(
+                BackupError::from_io(
+                    BackupPhase::CreateBackupRoot,
+                    Some(workspace.db()),
+                    None,
+                    Some(&backup_path),
+                    false,
+                    error,
+                ),
+                key,
+                report,
+            )
         },
     )?;
-    let backup_path = workspace_backup_dir.join(DATABASE_FILE_NAME);
     let backup_source = open_read_only_database(workspace).map_err(|error| {
         let _ = connection.execute_batch("ROLLBACK;");
-        workspace_failure(
-            "WORKSPACE_BACKUP_FAILED",
-            io::Error::other(error),
+        workspace_backup_failure(
+            BackupError::from_io(
+                BackupPhase::OpenSourceDatabase,
+                Some(workspace.db()),
+                None,
+                Some(&backup_path),
+                false,
+                io::Error::other(error),
+            ),
             key,
             report,
         )
     })?;
-    if let Err(error) = backup_operation(&backup_source, &workspace_backup_dir, &backup_path) {
-        let _ = connection.execute_batch("ROLLBACK;");
-        return Err(workspace_failure(
-            "WORKSPACE_BACKUP_FAILED",
-            error,
-            key,
-            report,
-        ));
-    }
-    drop(backup_source);
+    let backup = match online_backup_to_path_with_faults(
+        backup_source,
+        workspace.db(),
+        &workspace_backup_dir,
+        &backup_path,
+        &schema_before,
+        backup_faults,
+    ) {
+        Ok(backup) => backup,
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK;");
+            return Err(workspace_backup_failure(error, key, report));
+        }
+    };
     *writes_performed = true;
-    report.backup_bytes = fs::metadata(&backup_path)
-        .ok()
-        .map(|metadata| metadata.len());
-    report.backup_path = Some(display_path(&backup_path));
+    report.backup_bytes = Some(backup.bytes);
+    report.backup_path = Some(display_path(&backup.final_path));
 
     if let Err(error) = connection.execute_batch("COMMIT;") {
         return Err(workspace_failure(
@@ -586,15 +619,7 @@ fn open_read_only_database(workspace: &WorkspacePaths) -> rusqlite::Result<Conne
 fn create_prepare_backup_run(paths: &AopmemPaths) -> io::Result<PrepareBackupRun> {
     let backups = paths.home().join(BACKUPS_DIRECTORY);
     storage::ensure_owned_direct_directory(paths.home(), &backups)?;
-    let mut random = [0_u8; 16];
-    getrandom::fill(&mut random).map_err(|_| io::Error::other("random backup id failed"))?;
-    let mut id = String::with_capacity(32);
-    for byte in random {
-        use std::fmt::Write as _;
-        write!(id, "{byte:02x}").map_err(io::Error::other)?;
-    }
-    let root = backups.join(format!("{BACKUP_RUN_PREFIX}{id}"));
-    storage::ensure_owned_direct_directory(&backups, &root)?;
+    let root = create_unique_backup_run_root(&backups, BACKUP_RUN_PREFIX)?;
     let workspaces = root.join("workspaces");
     storage::ensure_owned_direct_directory(&root, &workspaces)?;
     AnchoredDir::open_workspace(&root, None)?.sync()?;
@@ -630,6 +655,23 @@ fn workspace_failure(
         code,
         message: error.to_string(),
         workspace_key: Some(key.to_string()),
+        backup_details: None,
+    };
+    report.status = WorkspacePrepareStatus::Failed;
+    report.error = Some(failure.clone());
+    failure
+}
+
+fn workspace_backup_failure(
+    error: BackupError,
+    key: &str,
+    report: &mut WorkspacePrepareReport,
+) -> UpgradePrepareFailure {
+    let failure = UpgradePrepareFailure {
+        code: "WORKSPACE_BACKUP_FAILED",
+        message: error.to_string(),
+        workspace_key: Some(key.to_string()),
+        backup_details: Some(Box::new(error.details(key, false))),
     };
     report.status = WorkspacePrepareStatus::Failed;
     report.error = Some(failure.clone());
@@ -645,6 +687,7 @@ fn root_failure_execution(
         code,
         message,
         workspace_key: None,
+        backup_details: None,
     };
     UpgradePrepareExecution {
         report: UpgradePrepareReport {
@@ -795,8 +838,16 @@ mod tests {
         .collect()
     }
 
-    fn fail_backup(_source: &Connection, _directory: &Path, _path: &Path) -> io::Result<()> {
-        Err(io::Error::other("injected backup failure"))
+    struct FailBackup;
+
+    impl BackupFaultInjector for FailBackup {
+        fn check(&self, phase: BackupPhase) -> io::Result<()> {
+            if phase == BackupPhase::SqliteOnlineBackup {
+                Err(io::Error::other("injected backup failure"))
+            } else {
+                Ok(())
+            }
+        }
     }
 
     #[test]
@@ -1107,7 +1158,7 @@ mod tests {
         fs::write(&wal, []).expect("empty WAL should create");
         let schema_before = schema_markers(workspace.db());
 
-        let execution = prepare_all_workspaces_with_backup(fail_backup)
+        let execution = prepare_all_workspaces_with_backup(&FailBackup)
             .expect("prepare should report backup failure");
 
         let failure = execution.failure.expect("failure should exist");

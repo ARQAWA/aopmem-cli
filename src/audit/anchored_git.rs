@@ -679,12 +679,15 @@ fn write_new_file(directory: &AnchoredDir, name: &str, bytes: &[u8]) -> io::Resu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::{Path, PathBuf};
-    use std::process::Command;
+    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
+    #[cfg(unix)]
+    use std::path::Path;
+    #[cfg(unix)]
+    use std::process::Command;
 
     fn temp_workspace(name: &str) -> (PathBuf, PathBuf) {
         let nonce = SystemTime::now()
@@ -700,6 +703,7 @@ mod tests {
         (workspace, audit)
     }
 
+    #[cfg(unix)]
     fn assert_git_fsck(audit: &Path) {
         let output = Command::new("git")
             .current_dir(audit)

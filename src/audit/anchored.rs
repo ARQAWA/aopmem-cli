@@ -206,6 +206,10 @@ impl AnchoredDir {
         self.open_regular_with_os(name, FileOpenMode::CreateNew)
     }
 
+    pub(crate) fn open_regular_for_update_os(&self, name: &OsStr) -> io::Result<File> {
+        self.open_regular_with_os(name, FileOpenMode::ReadWriteExisting)
+    }
+
     fn open_regular_with(&self, name: &str, mode: FileOpenMode) -> io::Result<File> {
         self.open_regular_with_os(OsStr::new(name), mode)
     }

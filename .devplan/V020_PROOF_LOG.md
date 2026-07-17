@@ -2160,3 +2160,71 @@ Release evidence:
 - `shasum -a 256 -c`: PASS for both assets.
 - Final independent audit: open P1=0, P2=0, P3=0.
 - Candidate is ready for prerelease and repeat native Windows dogfood.
+
+## Stage 37 — v0.2.0-rc4 Windows backup remediation
+
+Trigger:
+
+- native Windows rc3 apply returned `WORKSPACE_BACKUP_FAILED`,
+  `Access is denied. (os error 5)`;
+- SQLite had produced a 184,320-byte file;
+- no migration or binary publication started.
+
+Code-level root cause:
+
+- rc3 called `File::open(destination_path)?.sync_all()?`;
+- this passed a read-only Windows handle to `FlushFileBuffers`;
+- Windows can return `ERROR_ACCESS_DENIED=5` for that handle.
+
+Accepted remediation:
+
+- unique temporary backup in the final directory;
+- explicit SQLite backup, destination, and source handle closure;
+- temporary read-only schema/quick/table validation;
+- writable anchored file flush;
+- existing anchored Windows no-replace publish;
+- final read-only validation and metadata proof;
+- pending migration marker only after final backup success;
+- typed 11-phase diagnostics with retained evidence;
+- fresh create-new rc4 run root; failed rc3 root retained;
+- installer one-apply contract preserved.
+
+Command proof:
+
+- `cargo fmt --check`: PASS.
+- `cargo clippy --all-targets -- -D warnings`: PASS.
+- `cargo build --locked`: PASS.
+- `cargo test --locked`: 616/616 PASS.
+- `cargo test --tests --locked`: 616/616 PASS.
+- `scripts/dev_verify.sh`: PASS.
+- focused upgrade filter: 38/38 PASS.
+- installer audit: 11/11 PASS.
+- `git diff --check`: PASS.
+
+Real macOS proof:
+
+- root: `/tmp/aopmem-rc4-real-proof.LmFqjz`;
+- two workspaces in stable order;
+- clean, zero-WAL, and committed-WAL preparation: PASS;
+- plan no-write: PASS;
+- one apply, both schemas `001 -> 003`: PASS;
+- both published backups read-only reopen with schema `001`: PASS;
+- logical rows, tools, MCP profiles, and artifacts: PASS;
+- audit-state preservation: focused upgrade tests PASS;
+- adapter, doctor, verify, recall, observe status/report/export: PASS;
+- failed rc3 sentinel root retained: PASS.
+
+Release evidence:
+
+- version: `v0.2.0-rc4`;
+- macOS arm64:
+  `4812ca6c798cd2460b4b9da468e5f99f433a68907dc40eba257b88d197886e4e`;
+- Windows x64:
+  `e4442fd06622a6b94f997e23b67a55753f1d841f6570ef20ac72b99083a6cc1c`;
+- `SHA256SUMS`:
+  `bd456530a2e716575cc97d7306c155f39e583dc36d9ea387b7769ae89bcf4da8`;
+- Windows unchanged-source rebuild: identical hash;
+- Windows test target `cargo xwin test --no-run`: PASS;
+- PE32+ x86-64 and static runtime boundary: PASS;
+- open P1=0, P2=0;
+- native Windows rc4 runtime retry: PENDING.

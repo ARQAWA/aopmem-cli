@@ -73,7 +73,7 @@ write_new_stub() {
     printf '%s\n' 'fi'
     printf '%s\n' 'case "$*" in'
     printf '%s\n' '  "--version")'
-    printf '%s\n' '    printf "%s\n" "aopmem 0.2.0-rc3"'
+    printf '%s\n' '    printf "%s\n" "aopmem 0.2.0-rc4"'
     printf '%s\n' '    ;;'
     printf '%s\n' '  "upgrade prepare --all-workspaces --json")'
     printf '%s\n' '    if [ "${AOPMEM_STUB_PREPARE_FAIL:-0}" = "1" ]; then'
@@ -91,7 +91,7 @@ write_new_stub() {
     printf '%s\n' '    ;;'
     printf '%s\n' '  "upgrade apply --all-workspaces --json --approved +++")'
     printf '%s\n' '    if [ "${AOPMEM_STUB_APPLY_FAIL:-0}" = "1" ]; then'
-    printf '%s\n' '      printf "%s\n" '\''{"ok":false,"data":{"success":false,"binary_replaced":false,"stopped_workspace":"fixture-workspace","backup_root":"/fixture/upgrade-backup"},"errors":[{"code":"FIXTURE_APPLY_FAILED","message":"fixture apply failure"}]}'\'''
+    printf '%s\n' '      printf "%s\n" '\''{"ok":false,"data":{"success":false,"binary_replaced":false,"stopped_workspace":"fixture-workspace","backup_root":"/fixture/upgrade-backup"},"errors":[{"code":"WORKSPACE_BACKUP_FAILED","message":"fixture backup failure","details":{"workspace_key":"fixture-workspace","backup_phase":"flush_temporary_file","source_path":"/fixture/source/memory.db","temporary_path":"/fixture/upgrade-backup/memory.db.partial","final_path":"/fixture/upgrade-backup/memory.db","raw_os_error":5,"io_kind":"permission_denied","partial_file_exists":true,"partial_file_size":184320,"partial_file_validated":true,"migration_started":false,"fix_hint":"preserve the validated partial backup and fix write access"}}]}'\'''
     printf '%s\n' '      exit 1'
     printf '%s\n' '    fi'
     printf '%s\n' '    printf "%s\n" '\''{"ok":true,"data":{"success":true,"binary_replaced":false}}'\'''
@@ -251,6 +251,8 @@ run_static_audit() {
   assert_contains "$WINDOWS_INSTALLER" 'adapter", "seed", "--json"'
   assert_contains "$WINDOWS_INSTALLER" 'failure JSON report'
   assert_contains "$MAC_INSTALLER" 'emit_upgrade_report'
+  assert_contains "$MAC_INSTALLER" 'backup_phase'
+  assert_contains "$WINDOWS_INSTALLER" 'backup_phase'
 
   assert_not_contains "$WINDOWS_INSTALLER" '&&'
   assert_not_contains "$WINDOWS_INSTALLER" '\?\?'
@@ -490,7 +492,7 @@ test_path_rejections() {
 
   setup_case recovery-destination-symlink
   install_old_binary
-  recovery_path="$AOPMEM_HOME_PATH/bin/aopmem-v0.2.0-rc3-recovery-424242"
+  recovery_path="$AOPMEM_HOME_PATH/bin/aopmem-v0.2.0-rc4-recovery-424242"
   ln -s "$CASE_ROOT/outside-recovery-target" "$recovery_path"
   expect_failure AOPMEM_INSTALL_TEST_RUN_ID=424242
   [ -L "$recovery_path" ] || fail "installer removed pre-existing recovery symlink"
@@ -563,7 +565,13 @@ test_post_apply_failures_preserve_recovery() {
   assert_contains "$STDERR_PATH" 'do not run the v0.1 binary'
   assert_contains "$STDERR_PATH" 'recovery binary preserved at'
   assert_contains "$STDERR_PATH" 'workspace=fixture-workspace'
-  assert_contains "$STDERR_PATH" 'code=FIXTURE_APPLY_FAILED'
+  assert_contains "$STDERR_PATH" 'code=WORKSPACE_BACKUP_FAILED'
+  assert_contains "$STDERR_PATH" 'backup_phase=flush_temporary_file'
+  assert_contains "$STDERR_PATH" 'raw_os_error=5'
+  assert_contains "$STDERR_PATH" \
+    'partial_backup=/fixture/upgrade-backup/memory.db.partial'
+  assert_contains "$STDERR_PATH" 'partial_validated=true'
+  assert_contains "$STDERR_PATH" 'migration_started=false'
   assert_contains "$STDERR_PATH" '"stopped_workspace":"fixture-workspace"'
   assert_temp_clean "$TEMP_PARENT"
 

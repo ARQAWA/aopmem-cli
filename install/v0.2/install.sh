@@ -3,7 +3,7 @@
 set -eu
 umask 077
 
-PRODUCT_VERSION="0.2.0-rc3"
+PRODUCT_VERSION="0.2.0-rc4"
 OLD_RELEASE_LABEL="0.1.0-rc3"
 OLD_BINARY_VERSION="0.1.0"
 OLD_BINARY_SHA256="d238071299d557cfdeabfce75a52b2bcd2f62635802ef34da5ba11767155c607"
@@ -147,6 +147,15 @@ set_upgrade_report_failure() {
   report_message=$(json_field_or_empty "$report_path" "errors.0.message")
   report_workspace=$(json_field_or_empty "$report_path" "data.stopped_workspace")
   report_backup=$(json_field_or_empty "$report_path" "data.backup_root")
+  report_phase=$(json_field_or_empty "$report_path" "errors.0.details.backup_phase")
+  report_os_error=$(json_field_or_empty "$report_path" "errors.0.details.raw_os_error")
+  report_partial=$(json_field_or_empty "$report_path" "errors.0.details.temporary_path")
+  report_partial_validated=$(
+    json_field_or_empty "$report_path" "errors.0.details.partial_file_validated"
+  )
+  report_migration_started=$(
+    json_field_or_empty "$report_path" "errors.0.details.migration_started"
+  )
   if [ -n "$report_backup" ] && [ "$report_backup" != "null" ]; then
     UPGRADE_BACKUP_ROOT=$report_backup
   fi
@@ -159,6 +168,23 @@ set_upgrade_report_failure() {
   fi
   if [ -n "$report_message" ] && [ "$report_message" != "null" ]; then
     FAILURE_MESSAGE="$FAILURE_MESSAGE message=$report_message"
+  fi
+  if [ -n "$report_phase" ] && [ "$report_phase" != "null" ]; then
+    FAILURE_MESSAGE="$FAILURE_MESSAGE backup_phase=$report_phase"
+  fi
+  if [ -n "$report_os_error" ] && [ "$report_os_error" != "null" ]; then
+    FAILURE_MESSAGE="$FAILURE_MESSAGE raw_os_error=$report_os_error"
+  fi
+  if [ -n "$report_partial" ] && [ "$report_partial" != "null" ]; then
+    FAILURE_MESSAGE="$FAILURE_MESSAGE partial_backup=$report_partial"
+  fi
+  if [ -n "$report_partial_validated" ] &&
+    [ "$report_partial_validated" != "null" ]; then
+    FAILURE_MESSAGE="$FAILURE_MESSAGE partial_validated=$report_partial_validated"
+  fi
+  if [ -n "$report_migration_started" ] &&
+    [ "$report_migration_started" != "null" ]; then
+    FAILURE_MESSAGE="$FAILURE_MESSAGE migration_started=$report_migration_started"
   fi
 }
 

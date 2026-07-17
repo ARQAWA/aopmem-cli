@@ -3779,6 +3779,7 @@ mod tests {
     use std::env;
     use std::ffi::OsString;
     use std::fs::OpenOptions;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -3859,10 +3860,17 @@ mod tests {
 
     fn write_executable(path: &Path, contents: &str) {
         fs::write(path, contents).expect("tool script should be written");
+        mark_executable(path);
+    }
+
+    fn mark_executable(path: &Path) {
         let mut permissions = fs::metadata(path)
             .expect("tool script metadata should be readable")
             .permissions();
+        #[cfg(unix)]
         permissions.set_mode(0o755);
+        #[cfg(windows)]
+        permissions.set_readonly(false);
         fs::set_permissions(path, permissions).expect("tool script should be executable");
     }
 
@@ -4024,6 +4032,7 @@ mod tests {
         )
     }
 
+    #[cfg(unix)]
     fn process_exists(pid: i32) -> bool {
         unsafe extern "C" {
             fn kill(pid: i32, signal: i32) -> i32;
@@ -4034,6 +4043,17 @@ mod tests {
             return true;
         }
         io::Error::last_os_error().raw_os_error() != Some(3)
+    }
+
+    #[cfg(windows)]
+    fn process_exists(pid: i32) -> bool {
+        let filter = format!("PID eq {pid}");
+        let output = Command::new("tasklist")
+            .args(["/FI", &filter, "/FO", "CSV", "/NH"])
+            .output()
+            .expect("tasklist should inspect the descendant process");
+        output.status.success()
+            && String::from_utf8_lossy(&output.stdout).contains(&format!("\"{pid}\""))
     }
 
     fn assert_process_stops(pid: i32) {
@@ -4905,12 +4925,7 @@ mod tests {
             "#!/bin/sh\nprintf '{\"argv\": [\"%s\", \"%s\"]}\\n' \"$1\" \"$2\"\n",
         )
         .expect("tool script should be written");
-        let mut permissions = fs::metadata(&executable_path)
-            .expect("tool script metadata should be readable")
-            .permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&executable_path, permissions)
-            .expect("tool script should be executable");
+        mark_executable(&executable_path);
 
         let ran = run_tool(
             &workspace_paths,
@@ -4960,12 +4975,7 @@ mod tests {
             tool_dir(&workspace_paths, "run-drift-tool").join("bin/run-drift-tool");
         fs::write(&executable_path, "#!/bin/sh\nexit 0\n")
             .expect("drift tool script should be written");
-        let mut permissions = fs::metadata(&executable_path)
-            .expect("drift tool metadata should be readable")
-            .permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&executable_path, permissions)
-            .expect("drift tool should be executable");
+        mark_executable(&executable_path);
         let mut canonical = read_tool_json(&workspace_paths, "run-drift-tool")
             .expect("canonical tool manifest should be readable");
         canonical.runtime.output_mode = ToolOutputMode::Artifact;
@@ -5023,12 +5033,7 @@ mod tests {
             tool_dir(&workspace_paths, "run-blocked-tool").join("bin/run-blocked-tool");
         fs::write(&executable_path, "#!/bin/sh\nexit 0\n")
             .expect("blocked tool script should still be created");
-        let mut permissions = fs::metadata(&executable_path)
-            .expect("blocked tool script metadata should be readable")
-            .permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&executable_path, permissions)
-            .expect("blocked tool script should be executable");
+        mark_executable(&executable_path);
 
         let error = run_tool(&workspace_paths, &connection, "run-blocked-tool", &[], None)
             .expect_err("tool run should block unsafe tool");
@@ -5133,12 +5138,7 @@ mod tests {
             tool_dir(&workspace_paths, "external-read-tool").join("bin/external-read-tool");
         fs::write(&executable_path, "#!/bin/sh\necho external-read\n")
             .expect("external read script should be created");
-        let mut permissions = fs::metadata(&executable_path)
-            .expect("external read script metadata should be readable")
-            .permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&executable_path, permissions)
-            .expect("external read script should be executable");
+        mark_executable(&executable_path);
 
         let record = run_tool(
             &workspace_paths,
@@ -5236,12 +5236,7 @@ mod tests {
             tool_dir(&workspace_paths, "run-approved-tool").join("bin/run-approved-tool");
         fs::write(&executable_path, "#!/bin/sh\necho approved-run\n")
             .expect("approved tool script should be created");
-        let mut permissions = fs::metadata(&executable_path)
-            .expect("approved tool script metadata should be readable")
-            .permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&executable_path, permissions)
-            .expect("approved tool script should be executable");
+        mark_executable(&executable_path);
 
         let record = run_tool(
             &workspace_paths,

@@ -40,6 +40,9 @@
 | D-034 | Installer order is process gate, binary/full-home backups, verified staged binary, prepare, no intervening DB read, read-only plan, one apply, atomic publish, then health checks. | accepted; 11/11 installer audit and real macOS traces PASS |
 | D-035 | A SQLite-backed v0.1 binary with unknown hash produces `NONCANONICAL_V010_BINARY` warning. Hash mismatch alone does not block compatible workspaces; corrupt/unsupported/newer schema and unsafe paths still block. | accepted; installer compatibility fixture PASS |
 | D-036 | Native Windows retry is required after rc3 release proof. macOS-hosted PE/static checks never count as native Windows runtime proof. | accepted; native Windows proof PENDING |
+| D-037 | rc4 backup completion requires explicit SQLite handle closure, temporary read-only validation, writable file flush, anchored no-replace publish, and final read-only validation before migration. Every failure keeps `WORKSPACE_BACKUP_FAILED` with phase and retained-evidence details. | accepted; cross-platform fault map and two-workspace proof PASS |
+| D-038 | The failed rc3 backup root is retained as evidence and never reused. Every rc4 prepare/apply run root uses create-new semantics and a fresh random id. | accepted; collision-safe helper and retained-root regression PASS |
+| D-039 | Native Windows runtime remains `PENDING` after macOS-hosted rc4 proof. The current operator request separately authorizes commit, push, tag, and GitHub prerelease; it does not authorize real workspace installation or backup deletion. | accepted |
 
 ## Change rule
 

@@ -19,6 +19,9 @@ pub use apply::{
     apply_all_workspaces, UpgradeApplyError, UpgradeApplyExecution, UpgradeApplyFailure,
     UpgradeApplyReport,
 };
+#[cfg(test)]
+pub(crate) use backup::BackupPhase;
+pub(crate) use backup::WorkspaceBackupFailureDetails;
 pub use prepare::{
     prepare_all_workspaces, UpgradePrepareError, UpgradePrepareExecution, UpgradePrepareFailure,
     UpgradePrepareReport,

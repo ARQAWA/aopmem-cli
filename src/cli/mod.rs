@@ -1613,6 +1613,20 @@ fn run_upgrade_prepare(
         }
         Some(failure) => {
             if json_output {
+                let fix_hint = failure
+                    .backup_details
+                    .as_ref()
+                    .map_or_else(
+                        || {
+                            "keep every backup, close active AOPMem processes, then rerun `aopmem upgrade prepare --all-workspaces --json`"
+                                .to_string()
+                        },
+                        |details| details.fix_hint.clone(),
+                    );
+                let details = failure
+                    .backup_details
+                    .clone()
+                    .map(|details| OutputErrorDetails::WorkspaceBackup(*details));
                 println!(
                     "{}",
                     serialize_envelope(&OutputEnvelope {
@@ -1623,8 +1637,8 @@ fn run_upgrade_prepare(
                         errors: vec![OutputError {
                             code: failure.code,
                             message: failure.message,
-                            fix_hint: "keep every backup, close active AOPMem processes, then rerun `aopmem upgrade prepare --all-workspaces --json`".to_string(),
-                            details: None,
+                            fix_hint,
+                            details,
                         }],
                         meta: OutputMeta::default(),
                     })
@@ -1718,6 +1732,20 @@ fn run_upgrade_apply(
         }
         Some(failure) => {
             if json_output {
+                let fix_hint = failure
+                    .backup_details
+                    .as_ref()
+                    .map_or_else(
+                        || {
+                            "keep every backup, fix the exact reported workspace error, then rerun upgrade plan before apply"
+                                .to_string()
+                        },
+                        |details| details.fix_hint.clone(),
+                    );
+                let details = failure
+                    .backup_details
+                    .clone()
+                    .map(|details| OutputErrorDetails::WorkspaceBackup(*details));
                 println!(
                     "{}",
                     serialize_envelope(&OutputEnvelope {
@@ -1728,8 +1756,8 @@ fn run_upgrade_apply(
                         errors: vec![OutputError {
                             code: failure.code,
                             message: failure.message,
-                            fix_hint: "keep every backup, fix the exact reported workspace error, then rerun upgrade plan before apply".to_string(),
-                            details: None,
+                            fix_hint,
+                            details,
                         }],
                         meta: OutputMeta::default(),
                     })
@@ -7370,6 +7398,7 @@ struct OutputError {
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
 enum OutputErrorDetails {
+    WorkspaceBackup(upgrade::WorkspaceBackupFailureDetails),
     MandatoryContextOverflow(MandatoryContextOverflowDetails),
     RecallFailure(RecallFailureDetails),
     ToolRunLimit(ToolRunLimitDetails),
@@ -8771,7 +8800,7 @@ mod tests {
         assert_eq!(envelope["data"], serde_json::json!({}));
         assert_eq!(envelope["warnings"], serde_json::json!([]));
         assert_eq!(envelope["errors"], serde_json::json!([]));
-        assert_eq!(envelope["meta"]["version"], "0.2.0-rc3");
+        assert_eq!(envelope["meta"]["version"], "0.2.0-rc4");
     }
 
     #[test]
@@ -8793,7 +8822,7 @@ mod tests {
             envelope["errors"][0]["message"],
             "command is not implemented yet: node_create"
         );
-        assert_eq!(envelope["meta"]["version"], "0.2.0-rc3");
+        assert_eq!(envelope["meta"]["version"], "0.2.0-rc4");
     }
 
     #[test]
@@ -8822,6 +8851,50 @@ mod tests {
         assert_eq!(envelope["errors"][0]["details"]["stderr_truncated"], false);
         assert!(envelope["errors"][0].get("stdout").is_none());
         assert!(envelope["errors"][0].get("stderr").is_none());
+    }
+
+    #[test]
+    fn workspace_backup_failure_json_keeps_exact_phase_and_os_evidence() {
+        let details = upgrade::WorkspaceBackupFailureDetails {
+            workspace_key: "alpha".to_string(),
+            backup_phase: upgrade::BackupPhase::FlushTemporaryFile,
+            source_path: Some("/source/memory.db".to_string()),
+            temporary_path: Some("/backup/memory.db.partial".to_string()),
+            final_path: Some("/backup/memory.db".to_string()),
+            raw_os_error: Some(5),
+            io_kind: "permission_denied".to_string(),
+            partial_file_exists: true,
+            partial_file_size: Some(184_320),
+            partial_file_validated: true,
+            migration_started: false,
+            fix_hint: "preserve the validated partial backup and fix write access".to_string(),
+        };
+        let serialized = serialize_envelope(&OutputEnvelope {
+            ok: false,
+            command: "upgrade_apply",
+            data: Some(serde_json::json!({"stopped_workspace": "alpha"})),
+            warnings: Vec::new(),
+            errors: vec![OutputError {
+                code: "WORKSPACE_BACKUP_FAILED",
+                message: "workspace backup failed".to_string(),
+                fix_hint: details.fix_hint.clone(),
+                details: Some(OutputErrorDetails::WorkspaceBackup(details)),
+            }],
+            meta: OutputMeta::default(),
+        });
+        let envelope: Value =
+            serde_json::from_str(&serialized).expect("backup failure envelope should parse");
+        let failure = &envelope["errors"][0];
+
+        assert_eq!(failure["code"], "WORKSPACE_BACKUP_FAILED");
+        assert_eq!(failure["details"]["workspace_key"], "alpha");
+        assert_eq!(failure["details"]["backup_phase"], "flush_temporary_file");
+        assert_eq!(failure["details"]["raw_os_error"], 5);
+        assert_eq!(failure["details"]["io_kind"], "permission_denied");
+        assert_eq!(failure["details"]["partial_file_exists"], true);
+        assert_eq!(failure["details"]["partial_file_size"], 184_320);
+        assert_eq!(failure["details"]["partial_file_validated"], true);
+        assert_eq!(failure["details"]["migration_started"], false);
     }
 
     #[test]
@@ -8929,7 +9002,7 @@ mod tests {
             envelope["errors"][0]["fix_hint"],
             "run `aopmem --help` to see supported commands"
         );
-        assert_eq!(envelope["meta"]["version"], "0.2.0-rc3");
+        assert_eq!(envelope["meta"]["version"], "0.2.0-rc4");
     }
 
     #[test]

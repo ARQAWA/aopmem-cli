@@ -1,6 +1,6 @@
 # Upgrade from AOPMem v0.1.0-rc3
 
-This document defines the supported upgrade to `v0.2.0-rc3`.
+This document defines the supported upgrade to `v0.2.0-rc4`.
 It covers existing SQLite-backed AOPMem v0.1 workspaces only.
 The old file MVP is not supported.
 
@@ -10,7 +10,7 @@ The old file MVP is not supported.
 |---|---|
 | Source | SQLite-backed `aopmem 0.1.0` |
 | Canonical source release | `v0.1.0-rc3` |
-| Target | `v0.2.0-rc3` |
+| Target | `v0.2.0-rc4` |
 | Scope | all user-level AOPMem workspaces |
 | macOS | Apple Silicon |
 | Windows | Windows 11 x64, PowerShell 5.1 |
@@ -30,7 +30,7 @@ SQLite read activity can leave `aopmem.sqlite-wal` or
 these files. Treating every sidecar as unsafe without a supported preparation
 command creates an upgrade deadlock.
 
-`v0.2.0-rc3` adds:
+`v0.2.0-rc4` includes:
 
 ```text
 aopmem upgrade prepare --all-workspaces --json
@@ -46,7 +46,7 @@ Use this fixed sequence:
 1. Close AOPMem UI and other AOPMem processes.
 2. Record installed binary version/hash and workspace directory names.
 3. Create a durable full backup of the current AOPMem home.
-4. Download and verify the `v0.2.0-rc3` binary and `SHA256SUMS`.
+4. Download and verify the `v0.2.0-rc4` binary and `SHA256SUMS`.
 5. Run the staged binary:
 
    ```text
@@ -128,7 +128,7 @@ The update keeps three independent recovery layers:
 Do not delete backups during RC dogfood.
 
 If preparation fails, no migration has started. Fix the reported cause and
-rerun preparation with the staged `v0.2.0-rc3` binary.
+rerun preparation with the staged `v0.2.0-rc4` binary.
 
 If plan fails, do not run apply.
 
@@ -181,7 +181,7 @@ aopmem observe report --json
 
 Expected:
 
-- installed version is `aopmem 0.2.0-rc3`;
+- installed version is `aopmem 0.2.0-rc4`;
 - adapter is in sync;
 - doctor reports healthy;
 - verify reports clean;
@@ -195,9 +195,9 @@ Expected:
 Repository implementation, fixture results, release assets, hashes, and test
 counts are recorded in:
 
-- `.devplan/V020_RC3_WAL_REMEDIATION_REPORT.md`;
-- `.devplan/V020_RC3_GLOBAL_AUDIT_REPORT.md`;
-- `.devplan/RELEASE_CANDIDATE_v0.2.0-rc3.md`.
+- `.devplan/V020_RC4_WINDOWS_BACKUP_REMEDIATION.md`;
+- `.devplan/V020_RC4_GLOBAL_AUDIT_REPORT.md`;
+- `.devplan/RELEASE_CANDIDATE_v0.2.0-rc4.md`.
 
 Native Windows retry remains required after macOS-hosted proof. macOS cannot
 prove native Windows PowerShell or executable runtime behavior.

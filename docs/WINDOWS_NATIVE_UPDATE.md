@@ -1,6 +1,6 @@
 # Windows native update
 
-This path updates SQLite-backed AOPMem v0.1 to `v0.2.0-rc3` on Windows 11
+This path updates SQLite-backed AOPMem v0.1 to `v0.2.0-rc4` on Windows 11
 x64 through native Windows PowerShell 5.1.
 
 ## Boundaries
@@ -43,7 +43,7 @@ Verify the copied binary hash, workspace directories, and database files.
 ## Required update sequence
 
 Run all upgrade commands through the downloaded and verified
-`v0.2.0-rc3` binary:
+`v0.2.0-rc4` binary:
 
 ```text
 aopmem upgrade prepare --all-workspaces --json
@@ -120,6 +120,19 @@ After apply starts:
 - keep JSON stdout/stderr and stopped workspace/error;
 - resume only through a separately reviewed recovery action.
 
+If apply returns `WORKSPACE_BACKUP_FAILED`, require structured evidence:
+
+- `workspace_key` and exact `backup_phase`;
+- `raw_os_error` and normalized `io_kind`;
+- temporary and final backup paths;
+- partial file existence, size, and validation state;
+- `migration_started=false`.
+
+Keep the partial file and every older backup root. Do not retry apply
+automatically. A populated partial file is evidence only; it is accepted as a
+backup only after writable flush, atomic publish, final read-only reopen, and
+schema/integrity validation.
+
 Tooling or PowerShell wrapper errors before mutation are not automatically
 product failures. Fix the helper once or use another documented transport.
 Do not hide real product errors behind wrapper exception handling.
@@ -142,7 +155,7 @@ command, then repeat status, doctor, and verify.
 
 Require:
 
-- installed `aopmem 0.2.0-rc3` and release SHA-256;
+- installed `aopmem 0.2.0-rc4` and release SHA-256;
 - unchanged workspace keys;
 - all old workspace directories present;
 - adapter in sync;
@@ -161,5 +174,5 @@ macOS-hosted checks can prove Rust tests, fixtures, installer structure, PE
 type, imports, and release hash. They cannot prove native Windows PowerShell
 or executable runtime behavior.
 
-Native Windows retry for `v0.2.0-rc3` remains `PENDING` until executed on
+Native Windows retry for `v0.2.0-rc4` remains `PENDING` until executed on
 Windows 11 x64 with PowerShell 5.1 against backed-up dogfood workspaces.
