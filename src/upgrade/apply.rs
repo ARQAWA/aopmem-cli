@@ -1,20 +1,21 @@
 use std::ffi::OsStr;
-use std::fs::{self, File};
+use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::thread;
-use std::time::{Duration, Instant};
+#[cfg(test)]
+use std::time::Duration;
+use std::time::Instant;
 
-use rusqlite::backup::{Backup, StepResult};
 use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 use thiserror::Error;
 
 use super::{
-    enumerate_workspace_entries, installed_binary_name, nearest_existing_directory,
-    path_with_suffix, plan_all_workspaces_with_probe, regular_file_size, validate_existing_root,
-    validate_optional_managed_directory, DiskSpacePlan, DiskSpaceProbe, SystemDiskSpaceProbe,
-    WorkspaceSchemaPlan, DATABASE_FILE_NAME, DATABASE_SIDECAR_SUFFIXES,
+    backup::online_backup_to_path, enumerate_workspace_entries, installed_binary_name,
+    nearest_existing_directory, path_with_suffix, plan_all_workspaces_with_probe,
+    regular_file_size, validate_existing_root, validate_optional_managed_directory, DiskSpacePlan,
+    DiskSpaceProbe, SystemDiskSpaceProbe, WorkspaceSchemaPlan, DATABASE_FILE_NAME,
+    DATABASE_SIDECAR_SUFFIXES,
 };
 use crate::adapter;
 use crate::audit::{self, AnchoredDir, PendingSnapshotMarker};
@@ -28,12 +29,9 @@ use crate::storage::{self, AopmemPaths, WorkspacePaths};
 use crate::verify;
 
 const SOURCE_VERSION: &str = "0.1.0-rc3";
-const TARGET_VERSION: &str = "0.2.0-rc2";
+const TARGET_VERSION: &str = "0.2.0-rc3";
 const BACKUPS_DIRECTORY: &str = "backups";
-const BACKUP_RUN_PREFIX: &str = "upgrade-0.2.0-rc2-";
-const BACKUP_PAGE_BATCH: i32 = 256;
-const BACKUP_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
-const BACKUP_BUSY_PAUSE: Duration = Duration::from_millis(10);
+const BACKUP_RUN_PREFIX: &str = "upgrade-0.2.0-rc3-";
 const COMMAND_ID: &str = "upgrade_apply";
 
 const OWNED_GLOBAL_ASSETS: &[OwnedGlobalAsset] = &[
@@ -1779,74 +1777,6 @@ fn open_read_only_operational_database(paths: &WorkspacePaths) -> rusqlite::Resu
     )?;
     connection.execute_batch("PRAGMA busy_timeout = 5000; PRAGMA query_only = ON;")?;
     Ok(connection)
-}
-
-fn online_backup_to_path(
-    source: &Connection,
-    destination_dir: &Path,
-    destination_path: &Path,
-) -> io::Result<()> {
-    // rusqlite's small `backup` feature is used instead of byte-copying the
-    // live database. It is SQLite's WAL-safe Online Backup API and needs no
-    // new runtime process or platform dependency.
-    let destination_root = AnchoredDir::open_workspace(destination_dir, None)?;
-    let destination_name = destination_path
-        .file_name()
-        .ok_or_else(|| io::Error::other("database backup has no file name"))?;
-    let empty = destination_root.create_new_regular_os(destination_name)?;
-    empty.sync_all()?;
-    drop(empty);
-    destination_root.sync()?;
-    let canonical_destination = destination_path.canonicalize()?;
-
-    let mut destination = Connection::open_with_flags(
-        canonical_destination,
-        OpenFlags::SQLITE_OPEN_READ_WRITE
-            | OpenFlags::SQLITE_OPEN_CREATE
-            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-    )
-    .map_err(sqlite_io)?;
-    destination
-        .execute_batch("PRAGMA synchronous = FULL; PRAGMA journal_mode = DELETE;")
-        .map_err(sqlite_io)?;
-    run_bounded_backup(source, &mut destination)?;
-    let check: String = destination
-        .query_row("PRAGMA quick_check(1);", [], |row| row.get(0))
-        .map_err(sqlite_io)?;
-    if check != "ok" {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("backup quick_check failed: {check}"),
-        ));
-    }
-    drop(destination);
-    File::open(destination_path)?.sync_all()?;
-    destination_root.sync()
-}
-
-fn run_bounded_backup(source: &Connection, destination: &mut Connection) -> io::Result<()> {
-    let backup = Backup::new(source, destination).map_err(sqlite_io)?;
-    let started = Instant::now();
-    loop {
-        match backup.step(BACKUP_PAGE_BATCH).map_err(sqlite_io)? {
-            StepResult::Done => return Ok(()),
-            StepResult::More => {}
-            StepResult::Busy | StepResult::Locked => {
-                if started.elapsed() >= BACKUP_BUSY_TIMEOUT {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "SQLite Online Backup remained busy for 30 seconds",
-                    ));
-                }
-                thread::sleep(BACKUP_BUSY_PAUSE);
-            }
-            _ => {
-                return Err(io::Error::other(
-                    "SQLite Online Backup returned an unknown state",
-                ));
-            }
-        }
-    }
 }
 
 #[allow(clippy::too_many_arguments)]

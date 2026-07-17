@@ -34,6 +34,12 @@
 | D-028 | Stage 34 timings cover the exact final source tree, Cargo.lock, and release profile. Its release candidate binary is reproducible but not byte-identical to the explicit-target/minimum-macOS-11 flat asset, so no asset-specific speed claim is made. | accepted; source digest and candidate hash reproduced in Stage 35; final asset has separate real install/update/health proof |
 | D-029 | Fresh install completes `init`, then creates the managed adapter block with `adapter seed`, and accepts health only when doctor reports `healthy=true` and verify reports `clean=true`. Update asks no onboarding questions and leaves adapter sync to `upgrade apply`. | accepted; Stage 35 real fresh proof and 11-group installer audit PASS |
 | D-030 | Windows RC readiness is based on the native PowerShell 5.1 static contract plus a cargo-xwin PE x64 build with no dynamic MSVC/UCRT imports. Native execution remains Windows dogfood work and is not claimed as a macOS-hosted runtime proof. | accepted; no unsupported cross-host runtime claim |
+| D-031 | `upgrade plan` remains strictly read-only. Sidecar remediation belongs to explicit `upgrade prepare --all-workspaces --json`, never plan. | accepted; plan no-write and post-prepare ready proof PASS |
+| D-032 | `upgrade prepare` creates a durable per-workspace SQLite backup before `PRAGMA wal_checkpoint(TRUNCATE)`, fails closed on busy/incomplete checkpoint, and removes only verified empty direct-child WAL/SHM files after closing SQLite. | accepted; zero-byte and committed-WAL fixtures PASS |
+| D-033 | Preparation is idempotent, applies no migration, changes no schema version or logical memory, and uses existing locks, path guards, and backup primitives. | accepted; focused preservation/negative tests PASS |
+| D-034 | Installer order is process gate, binary/full-home backups, verified staged binary, prepare, no intervening DB read, read-only plan, one apply, atomic publish, then health checks. | accepted; 11/11 installer audit and real macOS traces PASS |
+| D-035 | A SQLite-backed v0.1 binary with unknown hash produces `NONCANONICAL_V010_BINARY` warning. Hash mismatch alone does not block compatible workspaces; corrupt/unsupported/newer schema and unsafe paths still block. | accepted; installer compatibility fixture PASS |
+| D-036 | Native Windows retry is required after rc3 release proof. macOS-hosted PE/static checks never count as native Windows runtime proof. | accepted; native Windows proof PENDING |
 
 ## Change rule
 

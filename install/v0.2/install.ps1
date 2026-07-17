@@ -8,7 +8,7 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = "Stop"
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
-$script:ProductVersion = "0.2.0-rc2"
+$script:ProductVersion = "0.2.0-rc3"
 $script:OldReleaseLabel = "0.1.0-rc3"
 $script:OldBinaryVersion = "0.1.0"
 $script:OldBinarySha256 = "01010aeffc20aead5f353353674621b367e6ad590769e4b5915b8d02d62f6d7a"
@@ -24,6 +24,8 @@ $script:InstallStageOwned = $false
 $script:RecoveryBinary = $null
 $script:RecoveryBinaryOwned = $false
 $script:BackupPath = $null
+$script:FullBackupRoot = $null
+$script:FullBackupHome = $null
 $script:UpgradeBackupRoot = $null
 $script:BackupReady = $false
 $script:ApplyAttempted = $false
@@ -396,6 +398,89 @@ function Backup-OldBinary {
     Write-TestTrace -EventName "backup.created"
 }
 
+function Assert-NoActiveAopmemProcesses {
+    if ($script:TestMode) {
+        Write-TestTrace -EventName "process.gate.clear"
+        return
+    }
+    $active = @(Get-Process -Name "aopmem" -ErrorAction SilentlyContinue)
+    if ($active.Count -gt 0) {
+        $details = [string]::Join(
+            ", ",
+            [string[]]@($active | ForEach-Object { "PID=$($_.Id)" }))
+        Throw-InstallError (
+            "AOPMEM_PROCESS_RUNNING: close all AOPMem processes before update: $details")
+    }
+    Write-TestTrace -EventName "process.gate.clear"
+}
+
+function Backup-AopmemHome {
+    $stamp = [DateTime]::UtcNow.ToString("yyyyMMddTHHmmssZ")
+    if ($script:TestMode) {
+        $backupParent = Join-Path (
+            Split-Path -Parent $script:AopmemHome) "AOPMemBackups"
+    }
+    else {
+        if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+            Throw-InstallError "LOCALAPPDATA is missing"
+        }
+        $backupParent = Join-Path $env:LOCALAPPDATA "AOPMemBackups"
+    }
+    Assert-SafeDirectory -LiteralPath $backupParent -Label "durable backup parent"
+    if ($null -eq (Get-ExistingPathItem -LiteralPath $backupParent)) {
+        [IO.Directory]::CreateDirectory($backupParent) | Out-Null
+    }
+    Assert-SafeDirectory -LiteralPath $backupParent -Label "durable backup parent"
+    $script:FullBackupRoot = Join-Path $backupParent (
+        "pre-v{0}-{1}-{2}" -f
+            $script:ProductVersion,
+            $stamp,
+            [Diagnostics.Process]::GetCurrentProcess().Id)
+    Assert-NewDestination `
+        -LiteralPath $script:FullBackupRoot `
+        -Label "durable backup root"
+    [IO.Directory]::CreateDirectory($script:FullBackupRoot) | Out-Null
+    $script:FullBackupHome = Join-Path $script:FullBackupRoot "aopmem-home"
+    $robocopyArguments = @(
+        $script:AopmemHome,
+        $script:FullBackupHome,
+        "/E", "/XJ", "/R:1", "/W:1", "/NFL", "/NDL", "/NP")
+    & "$env:SystemRoot\System32\robocopy.exe" @robocopyArguments | Out-Null
+    $robocopyExit = $LASTEXITCODE
+    if ($robocopyExit -ge 8) {
+        Throw-InstallError "durable AOPMem home backup failed: robocopy exit=$robocopyExit"
+    }
+    $backupBinary = Join-Path $script:FullBackupHome "bin\aopmem.exe"
+    Assert-SafeRegularFile -LiteralPath $backupBinary -Label "durable backup binary"
+    if ((Get-Sha256 -LiteralPath $backupBinary) -cne
+        $script:OriginalBinaryHash) {
+        Throw-InstallError "durable AOPMem home backup verification failed"
+    }
+    $workspaceRoot = Join-Path $script:AopmemHome "workspaces"
+    $workspaceRootItem = Get-ExistingPathItem -LiteralPath $workspaceRoot
+    if ($null -ne $workspaceRootItem) {
+        Assert-SafeDirectory -LiteralPath $workspaceRoot -Label "workspace root"
+        foreach ($workspace in @(Get-ChildItem -LiteralPath $workspaceRoot -Directory)) {
+            if (Test-IsReparsePoint -Item $workspace) {
+                Throw-InstallError "workspace must not be a reparse point: $($workspace.FullName)"
+            }
+            $backupWorkspace = Join-Path (
+                Join-Path $script:FullBackupHome "workspaces") $workspace.Name
+            Assert-SafeDirectory `
+                -LiteralPath $backupWorkspace `
+                -Label "durable backup workspace"
+            $sourceDatabase = Join-Path $workspace.FullName "aopmem.sqlite"
+            if ([IO.File]::Exists($sourceDatabase)) {
+                $backupDatabase = Join-Path $backupWorkspace "aopmem.sqlite"
+                Assert-SafeRegularFile `
+                    -LiteralPath $backupDatabase `
+                    -Label "durable backup database"
+            }
+        }
+    }
+    Write-TestTrace -EventName "backup.home.created"
+}
+
 function Test-OldBinaryUnchanged {
     if (-not $script:BackupReady -or
         -not [IO.File]::Exists($script:BackupPath) -or
@@ -464,12 +549,26 @@ function Invoke-UpgradePlan {
     }
 }
 
+function Invoke-UpgradePrepare {
+    Write-TestTrace -EventName "upgrade.prepare"
+    $prepare = Invoke-AopmemJson `
+        -Executable $script:DownloadedBinary `
+        -Arguments @("upgrade", "prepare", "--all-workspaces", "--json") `
+        -Context "upgrade prepare"
+    if (-not [bool]$prepare.ok -or -not [bool]$prepare.data.success) {
+        [Console]::Error.WriteLine("AOPMem upgrade prepare unsuccessful JSON report:")
+        [Console]::Error.WriteLine($script:LastAopmemJsonText)
+        Throw-InstallError "upgrade prepare did not report success"
+    }
+}
+
 function Invoke-UpgradeApply {
     Write-TestTrace -EventName "upgrade.apply"
     $script:ApplyAttempted = $true
     $apply = Invoke-AopmemJson `
         -Executable $script:DownloadedBinary `
-        -Arguments @("upgrade", "apply", "--all-workspaces", "--json") `
+        -Arguments @(
+            "upgrade", "apply", "--all-workspaces", "--json", "--approved", "+++") `
         -Context "upgrade apply"
     if (-not [bool]$apply.ok -or
         -not [bool]$apply.data.success -or
@@ -530,6 +629,14 @@ function Invoke-CurrentWorkspaceHealth {
     if ($script:TestMode -and $script:TestFailAt -eq "doctor") {
         Throw-InstallError "injected doctor failure"
     }
+    Write-TestTrace -EventName "adapter.status"
+    $adapterStatus = Invoke-AopmemJson `
+        -Executable $script:InstalledBinary `
+        -Arguments @("adapter", "status", "--json") `
+        -Context "adapter status"
+    if (-not [bool]$adapterStatus.ok) {
+        Throw-InstallError "adapter status did not report success"
+    }
     Write-TestTrace -EventName "doctor"
     $doctor = Invoke-AopmemJson `
         -Executable $script:InstalledBinary `
@@ -545,6 +652,39 @@ function Invoke-CurrentWorkspaceHealth {
         -Context "verify"
     if (-not [bool]$verify.ok -or -not [bool]$verify.data.clean) {
         Throw-InstallError "verify did not report clean state"
+    }
+    Write-TestTrace -EventName "recall"
+    $recall = Invoke-AopmemJson `
+        -Executable $script:InstalledBinary `
+        -Arguments @("recall", "--json") `
+        -Context "recall"
+    Write-TestTrace -EventName "observe.status"
+    $observeStatus = Invoke-AopmemJson `
+        -Executable $script:InstalledBinary `
+        -Arguments @("observe", "status", "--json") `
+        -Context "observe status"
+    Write-TestTrace -EventName "observe.report"
+    $observeReport = Invoke-AopmemJson `
+        -Executable $script:InstalledBinary `
+        -Arguments @("observe", "report", "--json") `
+        -Context "observe report"
+    foreach ($result in @($recall, $observeStatus, $observeReport)) {
+        if (-not [bool]$result.ok) {
+            Throw-InstallError "post-update workspace check did not report success"
+        }
+    }
+    $workspaceKey = [string](
+        Get-OptionalJsonProperty -Object $doctor.meta -Name "workspace_key")
+    if ([string]::IsNullOrWhiteSpace($workspaceKey)) {
+        Throw-InstallError "doctor did not report current workspace key"
+    }
+    foreach ($result in @(
+            $adapterStatus, $verify, $recall, $observeStatus, $observeReport)) {
+        $resultWorkspaceKey = [string](
+            Get-OptionalJsonProperty -Object $result.meta -Name "workspace_key")
+        if ($resultWorkspaceKey -cne $workspaceKey) {
+            Throw-InstallError "post-update workspace key changed during checks"
+        }
     }
 }
 
@@ -616,6 +756,39 @@ try {
     $script:InstalledBinary = Join-Path $script:InstallDir "aopmem.exe"
     Initialize-InstallDirectories
 
+    $existingItem = Get-ExistingPathItem -LiteralPath $script:InstalledBinary
+    if ($null -ne $existingItem) {
+        if ($existingItem.PSIsContainer -or (Test-IsReparsePoint -Item $existingItem)) {
+            Throw-InstallError "installed binary path is not a regular file: $script:InstalledBinary"
+        }
+        $installedVersion = Get-AopmemVersion -Executable $script:InstalledBinary
+        if ($installedVersion -cne "aopmem $script:OldBinaryVersion") {
+            Throw-InstallError "existing version is unsupported: $installedVersion"
+        }
+        $expectedOldHash = $script:OldBinarySha256
+        if ($script:TestMode) {
+            $expectedOldHash = $env:AOPMEM_INSTALL_TEST_OLD_BINARY_SHA256
+        }
+        $installedOldHash = Get-Sha256 -LiteralPath $script:InstalledBinary
+        if ([string]::IsNullOrWhiteSpace($expectedOldHash) -or
+            $installedOldHash -cne $expectedOldHash.ToLowerInvariant()) {
+            [Console]::Error.WriteLine(
+                "WARNING NONCANONICAL_V010_BINARY: version is compatible; " +
+                "workspace compatibility will be decided by upgrade prepare and plan")
+            Write-TestTrace -EventName "warning.NONCANONICAL_V010_BINARY"
+        }
+        $script:Mode = "update"
+        Assert-NoActiveAopmemProcesses
+        Backup-OldBinary
+        Backup-AopmemHome
+        if ($script:TestMode -and $script:TestFailAt -eq "after_backup") {
+            Throw-InstallError "injected failure after old binary backup"
+        }
+    }
+    else {
+        $script:Mode = "fresh"
+    }
+
     Assert-SafeDirectory -LiteralPath $tempParent -Label "temporary parent"
     if ($null -eq (Get-ExistingPathItem -LiteralPath $tempParent)) {
         Throw-InstallError "temporary parent does not exist: $tempParent"
@@ -629,6 +802,7 @@ try {
 
     $script:DownloadedBinary = Join-Path $script:TempRoot $script:AssetName
     $downloadedSums = Join-Path $script:TempRoot $script:ChecksumName
+    Write-TestTrace -EventName "asset.download.started"
     Copy-ReleaseAsset -Name $script:AssetName -Destination $script:DownloadedBinary
     Copy-ReleaseAsset -Name $script:ChecksumName -Destination $downloadedSums
 
@@ -647,43 +821,21 @@ try {
     }
     Write-TestTrace -EventName "binary.version.verified"
 
-    $existingItem = Get-ExistingPathItem -LiteralPath $script:InstalledBinary
-    if ($null -ne $existingItem) {
-        if ($existingItem.PSIsContainer -or (Test-IsReparsePoint -Item $existingItem)) {
-            Throw-InstallError "installed binary path is not a regular file: $script:InstalledBinary"
-        }
-        $installedVersion = Get-AopmemVersion -Executable $script:InstalledBinary
-        if ($installedVersion -cne "aopmem $script:OldBinaryVersion") {
-            Throw-InstallError "existing version is unsupported: $installedVersion"
-        }
-        $expectedOldHash = $script:OldBinarySha256
-        if ($script:TestMode) {
-            $expectedOldHash = $env:AOPMEM_INSTALL_TEST_OLD_BINARY_SHA256
-        }
-        $installedOldHash = Get-Sha256 -LiteralPath $script:InstalledBinary
-        if ([string]::IsNullOrWhiteSpace($expectedOldHash) -or
-            $installedOldHash -cne $expectedOldHash.ToLowerInvariant()) {
-            Throw-InstallError (
-                "existing binary is not the supported v{0} release asset" -f
-                    $script:OldReleaseLabel)
-        }
-        $script:Mode = "update"
-        Backup-OldBinary
+    if ($script:Mode -eq "update") {
         Prepare-PublishFiles
-        if ($script:TestMode -and $script:TestFailAt -eq "after_backup") {
-            Throw-InstallError "injected failure after old binary backup"
-        }
+        Invoke-UpgradePrepare
         Invoke-UpgradePlan
         Invoke-UpgradeApply
         Publish-VerifiedBinary
+        Invoke-CurrentWorkspaceHealth
         [Console]::Out.WriteLine(
-            "AOPMem {0} updated. doctor=ok verify=ok binary_backup={1} upgrade_backup={2}" -f
+            "AOPMem {0} updated. doctor=ok verify=ok recall=ok observability=ok full_backup={1} binary_backup={2} upgrade_backup={3}" -f
                 $script:ProductVersion,
+                $script:FullBackupRoot,
                 $script:BackupPath,
                 $script:UpgradeBackupRoot)
     }
     else {
-        $script:Mode = "fresh"
         Prepare-PublishFiles
         Publish-VerifiedBinary
         Write-TestTrace -EventName "init"
@@ -694,7 +846,7 @@ try {
         Invoke-FreshAdapterSeed
         Invoke-CurrentWorkspaceHealth
         [Console]::Out.WriteLine(
-            "AOPMem {0} installed. doctor=ok verify=ok" -f
+            "AOPMem {0} installed. doctor=ok verify=ok recall=ok observability=ok" -f
                 $script:ProductVersion)
     }
     $script:InstallSucceeded = $true
@@ -726,8 +878,9 @@ catch {
                 Throw-InstallError "old binary changed unexpectedly"
             }
             $errorLine = (
-                "AOPMem install failed: {0}; old binary was left unchanged; backup preserved at {1}" -f
+                "AOPMem install failed: {0}; old binary was left unchanged; full backup preserved at {1}; binary backup preserved at {2}" -f
                 $failure,
+                $script:FullBackupRoot,
                 $script:BackupPath)
             [Console]::Error.WriteLine($errorLine)
         }
@@ -736,10 +889,11 @@ catch {
             $errorLine = (
                 (
                     "AOPMem install failed: {0}; old binary integrity check failed: {1}; " +
-                    "backup preserved at {2}"
+                    "full backup preserved at {2}; binary backup preserved at {3}"
                 ) -f
                     $failure,
                     $integrityFailure,
+                    $script:FullBackupRoot,
                     $script:BackupPath)
             [Console]::Error.WriteLine($errorLine)
         }

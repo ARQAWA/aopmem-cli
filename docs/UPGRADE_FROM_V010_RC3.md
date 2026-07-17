@@ -1,274 +1,203 @@
 # Upgrade from AOPMem v0.1.0-rc3
 
-This release upgrades an existing user-level AOPMem v0.1.0-rc3 install.
-It does not migrate the old file MVP or any other product.
+This document defines the supported upgrade to `v0.2.0-rc3`.
+It covers existing SQLite-backed AOPMem v0.1 workspaces only.
+The old file MVP is not supported.
 
 ## Supported path
 
-The only supported source and target are:
-
 | Item | Value |
 |---|---|
-| Source | `0.1.0-rc3` |
-| Target | `0.2.0-rc2` |
-| Scope | all existing AOPMem workspaces |
+| Source | SQLite-backed `aopmem 0.1.0` |
+| Canonical source release | `v0.1.0-rc3` |
+| Target | `v0.2.0-rc3` |
+| Scope | all user-level AOPMem workspaces |
 | macOS | Apple Silicon |
 | Windows | Windows 11 x64, PowerShell 5.1 |
 
-The tagged v0.1.0-rc3 binaries report `aopmem 0.1.0`.
-The installer separates that binary semver from the release label and also
-requires the exact tagged release-asset SHA-256.
+The canonical `v0.1.0-rc3` assets report `aopmem 0.1.0`.
+A different v0.1 binary hash produces `NONCANONICAL_V010_BINARY` warning.
+It does not by itself block upgrade. Workspace schema, integrity, paths,
+available disk space, and successful preparation determine compatibility.
 
-| Tagged source asset | SHA-256 |
-|---|---|
-| macOS arm64 | `d238071299d557cfdeabfce75a52b2bcd2f62635802ef34da5ba11767155c607` |
-| Windows x64 | `01010aeffc20aead5f353353674621b367e6ad590769e4b5915b8d02d62f6d7a` |
+Unknown, corrupt, unsupported, or newer schemas still block upgrade.
 
-The installer uses no administrator rights, source build, WSL, Node.js,
-daemon, cloud service, or Codex CLI.
+## Why `upgrade prepare` exists
 
-## Data preserved
+SQLite read activity can leave `aopmem.sqlite-wal` or
+`aopmem.sqlite-shm`, including a zero-byte WAL after all processes exit.
+`upgrade plan` must remain read-only and therefore cannot checkpoint or remove
+these files. Treating every sidecar as unsafe without a supported preparation
+command creates an upgrade deadlock.
 
-Upgrade keeps:
+`v0.2.0-rc3` adds:
 
-- nodes, links, aliases, tags, sources, and events;
-- tool contracts and MCP profiles;
-- statuses, confidence, and trust;
-- audit history and artifacts;
-- global skills and templates;
-- the managed adapter block;
-- every old binary and migration backup.
+```text
+aopmem upgrade prepare --all-workspaces --json
+```
 
-The new observability database is created separately from operational
-memory. It is not placed in `memory.sql`.
+Preparation performs supported local SQLite maintenance. Users must not run
+manual SQL and must not delete WAL, SHM, or journal files manually.
 
 ## Safe update order
 
-The installer performs this fixed sequence:
+Use this fixed sequence:
 
-1. Detect the exact old binary version.
-2. Download the selected flat binary and `SHA256SUMS`.
-3. Verify one exact checksum line, the binary hash, and exact new version.
-4. Copy and verify a durable old binary backup.
-5. Create verified v0.2 stage and recovery files beside the installed binary.
-6. Run the temporary v0.2 binary with:
+1. Close AOPMem UI and other AOPMem processes.
+2. Record installed binary version/hash and workspace directory names.
+3. Create a durable full backup of the current AOPMem home.
+4. Download and verify the `v0.2.0-rc3` binary and `SHA256SUMS`.
+5. Run the staged binary:
+
+   ```text
+   aopmem upgrade prepare --all-workspaces --json
+   ```
+
+6. Require successful preparation for every workspace.
+7. Without running another AOPMem DB read, run:
 
    ```text
    aopmem upgrade plan --all-workspaces --json
    ```
 
-7. Require a read-only plan with `ready=true`.
-8. Run the temporary v0.2 binary with:
+8. Require `ok=true`, `ready=true`, and `writes_performed=false`.
+9. Run once:
 
    ```text
-   aopmem upgrade apply --all-workspaces --json
+   aopmem upgrade apply --all-workspaces --json --approved "+++"
    ```
 
-9. Require `success=true` and `binary_replaced=false`.
-10. Atomically publish the staged binary in the same directory.
-11. Verify the installed hash and exact version.
+10. Require successful apply and retained migration backups.
+11. Atomically publish the staged binary.
+12. Run adapter, doctor, verify, recall, and observability checks.
 
-`upgrade apply` owns database backups, migrations, observability creation,
-global asset refresh, adapter sync, doctor, and verify. The installer does
-not repeat update health checks after publication.
+Do not run `recall`, `doctor`, `verify`, UI, or another database reader between
+`prepare` and `plan`. Such reads may recreate SQLite coordination sidecars.
 
-This order avoids an unsafe rollback. Once apply starts, a workspace may
-contain committed v0.2 schema state. A v0.1 binary must not be restored over
-that state.
+## Preparation contract
 
-## Backups
+For each workspace, in stable order, `upgrade prepare`:
 
-There are two backup layers:
+- validates workspace, database, and sidecar paths;
+- rejects unsafe symlinks and reparse points;
+- acquires the existing workspace mutation lock;
+- creates a durable per-workspace SQLite backup before checkpoint;
+- uses the canonical AOPMem SQLite connection path;
+- runs `PRAGMA wal_checkpoint(TRUNCATE)`;
+- requires a non-busy, complete checkpoint;
+- closes the SQLite connection before sidecar cleanup;
+- removes only verified empty direct-child WAL/SHM sidecars;
+- never deletes a non-empty sidecar blindly;
+- verifies integrity and schema after checkpoint;
+- does not apply migrations or change schema version;
+- does not change logical memory data.
 
-- Installer binary backup:
-  `~/.aopmem/bin/aopmem.backup-v0.1.0-rc3-*`
-- Upgrade run backup:
-  `~/.aopmem/backups/upgrade-0.2.0-rc2-*`
+The command is idempotent. A clean workspace returns success. Repeating a
+successful preparation remains safe.
 
-Windows uses the same directories under `%USERPROFILE%\.aopmem` and adds
-`.exe` to the binary filename.
+An active or busy database fails closed. Backups remain available.
 
-An upgrade run backup contains the old binary, workspace databases, adapter
-state, and owned global assets when those inputs exist. The JSON apply report
-returns the exact `backup_root`.
+## Plan remains no-write
+
+`upgrade plan` remains strict inspection:
+
+- `writes_performed=false`;
+- no checkpoint;
+- no sidecar deletion;
+- no migration;
+- no observability write;
+- no adapter change.
+
+If a blocking sidecar remains, plan returns `ready=false`. Its fix hint points
+to:
+
+```text
+aopmem upgrade prepare --all-workspaces --json
+```
+
+Do not weaken plan by ignoring a WAL or SHM file.
+
+## Backup layers
+
+The update keeps three independent recovery layers:
+
+1. Installer durable full backup before `prepare`.
+2. Per-workspace SQLite Online Backup before checkpoint.
+3. Existing migration backups created by `upgrade apply`.
 
 Do not delete backups during RC dogfood.
 
-## Failure behavior
+If preparation fails, no migration has started. Fix the reported cause and
+rerun preparation with the staged `v0.2.0-rc3` binary.
 
-Before `upgrade apply` starts, the installer never replaces the installed
-binary. On a plan or early failure, both platforms verify the original type
-and hash. The macOS fixture also proves the inode remains unchanged.
-The installer keeps the binary backup.
+If plan fails, do not run apply.
 
-After `upgrade apply` starts:
+If apply starts, never rerun apply blindly and never restore v0.1 over a
+possibly migrated workspace. Preserve the staged/recovery v0.2 binary,
+backups, JSON output, and exact stopped workspace/error.
 
-- keep every backup;
-- keep every workspace;
-- keep the verified v0.2 recovery binary;
-- do not run or restore v0.1;
-- stop on the exact reported workspace and error;
-- fix that error, then rerun plan before apply.
+## Data preserved
 
-The recovery binary path is printed in the error. It is a regular verified
-file beside the installed binary. This is intentional: a later workspace
-failure may occur after an earlier workspace committed a migration.
+Upgrade preserves:
 
-The installer always removes download temp files. It never deletes the
-recovery binary on an apply or publish failure.
+- nodes, links, aliases, tags, sources, and events;
+- statuses, confidence, and trust;
+- tool contracts, generated tool files, and artifacts;
+- MCP profiles;
+- adapter state;
+- audit history;
+- global skills and templates;
+- existing workspaces and all upgrade backups.
 
-## Onboarding behavior
+Preparation itself preserves schema version and logical rows.
 
-Update asks no semantic questions and never runs `aopmem init`.
-Existing memory is reused.
+## Noncanonical v0.1 binary
 
-Only a fresh install runs normal `aopmem init` and its existing five
-semantic questions. It then seeds the managed adapter block and requires
-`doctor` to report `healthy=true` and `verify` to report `clean=true`.
+For a SQLite-backed v0.1 installation with an unknown binary hash:
 
-## Manual read-only preflight
+- record the exact version and SHA-256;
+- report `NONCANONICAL_V010_BINARY`;
+- require durable full backup;
+- do not substitute a canonical hash;
+- use staged `upgrade prepare` and `upgrade plan` as workspace compatibility
+  checks;
+- continue only when preparation succeeds and plan reports `ready=true`.
 
-Use the downloaded, verified v0.2 binary. Do not use an unverified file.
-
-```text
-aopmem upgrade plan --all-workspaces --json
-```
-
-The plan must report:
-
-- outer `ok=true`;
-- `ready=true`;
-- `writes_performed=false`;
-- sufficient disk space;
-- no unsupported schema, unsafe path, or pending snapshot.
-
-The installer already runs this command. Manual use is for diagnosis.
-Adapter drift is checked later by `upgrade apply` preflight.
+The warning does not allow unsupported schemas, corrupt databases, unsafe
+paths, active writers, or insufficient disk space.
 
 ## Verification
 
-The repository proof is:
+After publication, run in the target repository:
 
-```sh
-scripts/audit_v020_installers.sh
+```text
+aopmem adapter status --file AGENTS.md --json
+aopmem doctor --json
+aopmem verify --json
+aopmem recall --json
+aopmem observe status --json
+aopmem observe report --json
 ```
 
-It uses isolated temporary homes and local stub assets. It performs no
-network request and does not touch the real AOPMem home.
+Expected:
 
-The proof covers checksum mismatch and duplication, wrong version, unsafe
-paths, plan failure, apply failure, publish failure, backup failure,
-fresh health failure, temp cleanup, backup retention, recovery retention,
-and zero onboarding during update.
+- installed version is `aopmem 0.2.0-rc3`;
+- adapter is in sync;
+- doctor reports healthy;
+- verify reports clean;
+- recall and observability succeed;
+- workspace keys remain unchanged;
+- no repository-local `.aopmem` is created;
+- all previous workspaces remain present.
 
-This audit uses stub executables. It is not the final real migration proof.
+## Proof status
 
-## Stage 35 real macOS proof
+Repository implementation, fixture results, release assets, hashes, and test
+counts are recorded in:
 
-After the final v0.2 binary freezes, run both flows with that real binary.
-Use only temporary homes and repositories.
+- `.devplan/V020_RC3_WAL_REMEDIATION_REPORT.md`;
+- `.devplan/V020_RC3_GLOBAL_AUDIT_REPORT.md`;
+- `.devplan/RELEASE_CANDIDATE_v0.2.0-rc3.md`.
 
-Set the final flat binary path:
-
-```sh
-V020_BINARY="/absolute/path/to/aopmem-darwin-arm64"
-test -x "$V020_BINARY"
-test "$("$V020_BINARY" --version)" = "aopmem 0.2.0-rc2"
-```
-
-Create local release assets:
-
-```sh
-PROOF_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/aopmem-v020-real-proof.XXXXXX")
-mkdir "$PROOF_ROOT/assets" "$PROOF_ROOT/temp"
-cp "$V020_BINARY" "$PROOF_ROOT/assets/aopmem-darwin-arm64"
-V020_SHA=$(shasum -a 256 \
-  "$PROOF_ROOT/assets/aopmem-darwin-arm64" | awk '{ print $1 }')
-printf '%s  %s\n' "$V020_SHA" "aopmem-darwin-arm64" \
-  > "$PROOF_ROOT/assets/SHA256SUMS"
-```
-
-Fresh proof:
-
-```sh
-mkdir "$PROOF_ROOT/fresh-repo" "$PROOF_ROOT/fresh-home"
-git -C "$PROOF_ROOT/fresh-repo" init -q
-printf '%s\n' \
-  no \
-  no \
-  "fresh proof project" \
-  "user owns product; agent follows stored process" \
-  "temporary proof repo only" \
-| (
-  cd "$PROOF_ROOT/fresh-repo"
-  AOPMEM_INSTALL_TEST_MODE=1 \
-  AOPMEM_INSTALL_TEST_OS=Darwin \
-  AOPMEM_INSTALL_TEST_ARCH=arm64 \
-  AOPMEM_INSTALL_TEST_ASSET_DIR="$PROOF_ROOT/assets" \
-  AOPMEM_INSTALL_TEST_TEMP_ROOT="$PROOF_ROOT/temp" \
-  AOPMEM_HOME="$PROOF_ROOT/fresh-home" \
-  sh "/absolute/repo/install/v0.2/install.sh"
-)
-```
-
-Peeled v0.1.0-rc3 update proof:
-
-```sh
-mkdir "$PROOF_ROOT/update-repo" "$PROOF_ROOT/update-home"
-mkdir -p "$PROOF_ROOT/update-home/bin"
-git -C "$PROOF_ROOT/update-repo" init -q
-git -C "/absolute/repo" \
-  show "v0.1.0-rc3:dist/aopmem-darwin-arm64/aopmem" \
-  > "$PROOF_ROOT/update-home/bin/aopmem"
-chmod 755 "$PROOF_ROOT/update-home/bin/aopmem"
-OLD_SHA=$(shasum -a 256 \
-  "$PROOF_ROOT/update-home/bin/aopmem" | awk '{ print $1 }')
-test "$OLD_SHA" = \
-  "d238071299d557cfdeabfce75a52b2bcd2f62635802ef34da5ba11767155c607"
-printf '%s\n' \
-  no \
-  no \
-  "peeled v0.1 proof project" \
-  "user owns product; agent preserves learned process" \
-  "temporary peeled fixture only" \
-| (
-  cd "$PROOF_ROOT/update-repo"
-  AOPMEM_HOME="$PROOF_ROOT/update-home" \
-    "$PROOF_ROOT/update-home/bin/aopmem" init
-)
-(
-  cd "$PROOF_ROOT/update-repo"
-  AOPMEM_INSTALL_TEST_MODE=1 \
-  AOPMEM_INSTALL_TEST_OS=Darwin \
-  AOPMEM_INSTALL_TEST_ARCH=arm64 \
-  AOPMEM_INSTALL_TEST_ASSET_DIR="$PROOF_ROOT/assets" \
-  AOPMEM_INSTALL_TEST_TEMP_ROOT="$PROOF_ROOT/temp" \
-  AOPMEM_INSTALL_TEST_OLD_BINARY_SHA256="$OLD_SHA" \
-  AOPMEM_INSTALL_TEST_TRACE="$PROOF_ROOT/update-installer.trace" \
-  AOPMEM_HOME="$PROOF_ROOT/update-home" \
-  sh "/absolute/repo/install/v0.2/install.sh"
-)
-```
-
-Then run:
-
-```sh
-test "$("$PROOF_ROOT/update-home/bin/aopmem" --version)" = \
-  "aopmem 0.2.0-rc2"
-! grep -Eq '^init$' "$PROOF_ROOT/update-installer.trace"
-(
-  cd "$PROOF_ROOT/update-repo"
-  AOPMEM_HOME="$PROOF_ROOT/update-home" \
-    "$PROOF_ROOT/update-home/bin/aopmem" doctor --json
-  AOPMEM_HOME="$PROOF_ROOT/update-home" \
-    "$PROOF_ROOT/update-home/bin/aopmem" verify --json
-)
-find "$PROOF_ROOT/update-home/backups" -type f -print
-```
-
-For the fresh fixture, also require `adapter status --json` to report
-`in_sync`, `doctor --json` to report `healthy=true`, and `verify --json` to
-report `clean=true`.
-
-Keep the command output as Stage 35 proof. Delete `PROOF_ROOT` only after
-the proof is copied into the release proof log.
+Native Windows retry remains required after macOS-hosted proof. macOS cannot
+prove native Windows PowerShell or executable runtime behavior.

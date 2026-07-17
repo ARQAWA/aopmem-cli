@@ -12,10 +12,16 @@ use crate::schema;
 use crate::storage::{self, AopmemPaths, WorkspacePaths};
 
 mod apply;
+mod backup;
+mod prepare;
 
 pub use apply::{
     apply_all_workspaces, UpgradeApplyError, UpgradeApplyExecution, UpgradeApplyFailure,
     UpgradeApplyReport,
+};
+pub use prepare::{
+    prepare_all_workspaces, UpgradePrepareError, UpgradePrepareExecution, UpgradePrepareFailure,
+    UpgradePrepareReport,
 };
 
 const PLAN_SCOPE: &str = "all_workspaces";
@@ -85,6 +91,8 @@ pub struct MigrationPlanItem {
 pub struct WorkspacePlanError {
     pub code: &'static str,
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fix_hint: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -341,13 +349,18 @@ fn reject_database_sidecars(database_path: &Path) -> Result<(), WorkspacePlanErr
         let sidecar = path_with_suffix(database_path, suffix);
         match fs::symlink_metadata(&sidecar) {
             Ok(_) => {
-                return Err(workspace_error(
+                let mut error = workspace_error(
                     "UNSAFE_DATABASE_SIDECAR",
                     format!(
-                        "database sidecar is present; close all AOPMem processes and checkpoint it before upgrade planning: {}",
+                        "database sidecar is present; prepare it before upgrade planning: {}",
                         sidecar.file_name().unwrap_or_default().to_string_lossy()
                     ),
-                ));
+                );
+                error.fix_hint = Some(
+                    "run `aopmem upgrade prepare --all-workspaces --json` while AOPMem processes are closed"
+                        .to_string(),
+                );
+                return Err(error);
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => {
@@ -506,6 +519,7 @@ fn workspace_error(code: &'static str, message: impl Into<String>) -> WorkspaceP
     WorkspacePlanError {
         code,
         message: message.into(),
+        fix_hint: None,
     }
 }
 
@@ -1007,6 +1021,15 @@ mod tests {
                 .expect("error should exist")
                 .code,
             "UNSAFE_DATABASE_SIDECAR"
+        );
+        assert_eq!(
+            report.workspaces[0]
+                .error
+                .as_ref()
+                .and_then(|error| error.fix_hint.as_deref()),
+            Some(
+                "run `aopmem upgrade prepare --all-workspaces --json` while AOPMem processes are closed"
+            )
         );
         assert_eq!(tree_fingerprint(&home), before);
 

@@ -1,10 +1,11 @@
-# AOPMem v0.2.0-rc2 install prompt
+# AOPMem v0.2.0-rc3 install prompt
 
-Use this prompt to install AOPMem v0.2.0-rc2 for the current project.
-It supports a fresh install and an update from v0.1.0-rc3 only.
+Use this prompt to install AOPMem v0.2.0-rc3 for the current project.
+It supports a fresh install and an update from compatible AOPMem v0.1.0
+SQLite workspaces.
 
 ````text
-You are installing AOPMem v0.2.0-rc2 for the user's current project.
+You are installing AOPMem v0.2.0-rc3 for the user's current project.
 
 Complete the whole safe flow without pausing between normal steps.
 Do not run Codex CLI during installation.
@@ -50,7 +51,7 @@ Integrity rules:
 - Reject a missing, duplicate, malformed, or differently named line.
 - Verify SHA-256 before chmod or any binary execution.
 - Verify the downloaded binary reports exactly:
-  aopmem 0.2.0-rc2
+  aopmem 0.2.0-rc3
 - Never execute an unverified file.
 
 Path rules:
@@ -66,8 +67,10 @@ Path rules:
 Select the flow silently:
 
 1. No installed binary means fresh install.
-2. The v0.1.0-rc3 release binary reports `aopmem 0.1.0`.
-   Require that exact output and the known tagged release-asset SHA-256.
+2. A compatible v0.1 binary reports exactly `aopmem 0.1.0`.
+   Recognize the known v0.1.0-rc3 release SHA-256. For another SHA-256,
+   emit `NONCANONICAL_V010_BINARY`, require the durable full backup, and let
+   staged `upgrade prepare` plus `upgrade plan` decide workspace compatibility.
 3. Any other installed version is unsupported. Stop without changing it.
 
 For macOS, use the supplied install/v0.2/install.sh.
@@ -111,25 +114,39 @@ Do not add, remove, reorder, or paraphrase these questions.
 Update flow:
 
 1. Ask zero onboarding questions.
-2. Create and verify a durable backup of the old binary.
-3. Prepare verified v0.2 stage and recovery binaries in the install
+2. Require all AOPMem UI and CLI processes to be closed. Do not terminate an
+   unknown process automatically.
+3. Create and verify a durable full backup of AOPMem home plus the old binary.
+4. Prepare verified v0.2 stage and recovery binaries in the install
    directory.
-4. Run the downloaded temporary v0.2 binary:
+5. Run the downloaded temporary v0.2 binary:
+   aopmem upgrade prepare --all-workspaces --json
+6. Require exit code 0, ok=true, and success=true. Preparation may checkpoint
+   SQLite and create its own per-workspace backups. On failure, do not run plan,
+   apply, or publish.
+7. Immediately run the same temporary v0.2 binary:
    aopmem upgrade plan --all-workspaces --json
-5. Require ok=true, ready=true, and writes_performed=false.
-6. Then run the same temporary v0.2 binary:
-   aopmem upgrade apply --all-workspaces --json
-7. Require exit code 0, ok=true, success=true, and
+8. Run no AOPMem DB-read command between prepare and plan. Require ok=true,
+   ready=true, and writes_performed=false.
+9. Then run the same temporary v0.2 binary:
+   aopmem upgrade apply --all-workspaces --json --approved "+++"
+10. Require exit code 0, ok=true, success=true, and
    binary_replaced=false.
-8. Treat doctor and verify as part of successful upgrade apply.
-9. Only after successful apply, replace the installed binary atomically.
-10. Verify the installed SHA-256 and exact version.
-11. Print one short final status and the durable binary backup path.
+11. Only after successful apply, replace the installed binary atomically.
+12. Verify the installed SHA-256 and exact version.
+13. Run `aopmem adapter status --json`, `doctor --json`, `verify --json`,
+   `recall --json`, `observe status --json`, and `observe report --json` with
+   the installed binary. Require ok=true, doctor healthy=true, verify
+   clean=true, and one stable non-empty current workspace key across reports.
+   Do not sync the adapter automatically; report a real status failure.
+14. Print one short final status and all durable backup paths.
 
 Failure rules:
 
 - Before upgrade apply starts, the installed v0.1 binary must stay
   byte-for-byte unchanged. Keep its backup.
+- Before upgrade prepare starts, create the durable full backup. Preparation
+  failure must block plan, apply, and publish.
 - After upgrade apply starts, some v0.2 data may already be committed.
 - Never restore or republish v0.1 after that point.
 - On any apply or later publish failure, keep the verified same-directory
@@ -146,7 +163,10 @@ Success report:
 - fresh or updated;
 - doctor=ok;
 - verify=ok;
+- recall=ok;
+- observability=ok;
 - binary backup path for update.
+- durable full-backup path for update.
 - upgrade-run backup path for update.
 
 Do not push, tag, create a release, or install into any workspace other than

@@ -1371,6 +1371,7 @@ enum ObserveCommand {
 #[derive(Debug, Subcommand)]
 #[command(rename_all = "kebab-case")]
 enum UpgradeCommand {
+    Prepare(UpgradePlanArgs),
     Plan(UpgradePlanArgs),
     Apply(UpgradePlanArgs),
 }
@@ -1456,6 +1457,7 @@ fn run_command_with_context(
     }
     if let Command::Upgrade { command } = command {
         return match command {
+            UpgradeCommand::Prepare(args) => run_upgrade_prepare(command_id, args, json),
             UpgradeCommand::Plan(args) => run_upgrade_plan(command_id, args, json),
             UpgradeCommand::Apply(args) => run_upgrade_apply(command_id, args, json),
         };
@@ -1571,8 +1573,70 @@ fn run_command_with_context(
             command: FeedbackCommand::Record(args),
         } => run_feedback_record(command_id, args, json, &mut observation),
         Command::Observe { .. } => unreachable!("observe commands return before collector state"),
-        Command::Upgrade { .. } => unreachable!("upgrade plan returns before collector state"),
+        Command::Upgrade { .. } => unreachable!("upgrade commands return before collector state"),
         Command::Ui(_) => unreachable!("UI returns before collector state"),
+    }
+}
+
+fn run_upgrade_prepare(
+    command_id: &'static str,
+    args: &UpgradePlanArgs,
+    json_output: bool,
+) -> ExitCode {
+    if !args.all_workspaces {
+        return print_error(command_id, &CliError::invalid_args(), json_output);
+    }
+    let execution = match upgrade::prepare_all_workspaces() {
+        Ok(execution) => execution,
+        Err(error) => {
+            return print_error(command_id, &CliError::upgrade_prepare(error), json_output);
+        }
+    };
+    let data = serde_json::to_value(&execution.report)
+        .expect("upgrade prepare report serialization should not fail");
+    match execution.failure {
+        None => {
+            if json_output {
+                println!("{}", success_envelope(command_id, data));
+            } else {
+                println!(
+                    "upgrade prepare: success workspaces={} writes_performed={} backup_root={}",
+                    execution.report.workspace_count,
+                    execution.report.writes_performed,
+                    execution.report.backup_root.as_deref().unwrap_or("none"),
+                );
+                for workspace in &execution.report.workspaces {
+                    println!("{}: {:?}", workspace.workspace_key, workspace.status);
+                }
+            }
+            ExitCode::from(EXIT_SUCCESS)
+        }
+        Some(failure) => {
+            if json_output {
+                println!(
+                    "{}",
+                    serialize_envelope(&OutputEnvelope {
+                        ok: false,
+                        command: command_id,
+                        data: Some(data),
+                        warnings: Vec::new(),
+                        errors: vec![OutputError {
+                            code: failure.code,
+                            message: failure.message,
+                            fix_hint: "keep every backup, close active AOPMem processes, then rerun `aopmem upgrade prepare --all-workspaces --json`".to_string(),
+                            details: None,
+                        }],
+                        meta: OutputMeta::default(),
+                    })
+                );
+            } else {
+                eprintln!("{}: {}", failure.code, failure.message);
+                if let Some(workspace_key) = failure.workspace_key {
+                    eprintln!("workspace: {workspace_key}");
+                }
+            }
+            ExitCode::from(EXIT_GENERIC_ERROR)
+        }
     }
 }
 
@@ -6508,6 +6572,7 @@ fn command_id(command: &Command) -> &'static str {
             ObserveCommand::Export(_) => "observe_export",
         },
         Command::Upgrade { command } => match command {
+            UpgradeCommand::Prepare(_) => "upgrade_prepare",
             UpgradeCommand::Plan(_) => "upgrade_plan",
             UpgradeCommand::Apply(_) => "upgrade_apply",
         },
@@ -6549,6 +6614,15 @@ impl CliError {
             code: "UPGRADE_PLAN_FAILED",
             message: error.to_string(),
             fix_hint: "preserve all files, fix the reported local path or disk error, then rerun `aopmem upgrade plan --all-workspaces --json`".to_string(),
+        }
+    }
+
+    fn upgrade_prepare(error: upgrade::UpgradePrepareError) -> Self {
+        Self {
+            exit_code: EXIT_IO_ERROR,
+            code: "UPGRADE_PREPARE_FAILED",
+            message: error.to_string(),
+            fix_hint: "preserve all files and rerun `aopmem upgrade prepare --all-workspaces --json` after fixing the reported local error".to_string(),
         }
     }
 
@@ -8697,7 +8771,7 @@ mod tests {
         assert_eq!(envelope["data"], serde_json::json!({}));
         assert_eq!(envelope["warnings"], serde_json::json!([]));
         assert_eq!(envelope["errors"], serde_json::json!([]));
-        assert_eq!(envelope["meta"]["version"], "0.2.0-rc2");
+        assert_eq!(envelope["meta"]["version"], "0.2.0-rc3");
     }
 
     #[test]
@@ -8719,7 +8793,7 @@ mod tests {
             envelope["errors"][0]["message"],
             "command is not implemented yet: node_create"
         );
-        assert_eq!(envelope["meta"]["version"], "0.2.0-rc2");
+        assert_eq!(envelope["meta"]["version"], "0.2.0-rc3");
     }
 
     #[test]
@@ -8855,7 +8929,7 @@ mod tests {
             envelope["errors"][0]["fix_hint"],
             "run `aopmem --help` to see supported commands"
         );
-        assert_eq!(envelope["meta"]["version"], "0.2.0-rc2");
+        assert_eq!(envelope["meta"]["version"], "0.2.0-rc3");
     }
 
     #[test]
@@ -15590,6 +15664,20 @@ mod tests {
 
     #[test]
     fn upgrade_plan_cli_requires_all_workspaces_and_keeps_missing_home_absent() {
+        let prepare =
+            Cli::try_parse_from(["aopmem", "upgrade", "prepare", "--all-workspaces", "--json"])
+                .expect("upgrade prepare should parse");
+        assert!(prepare.json);
+        assert_eq!(command_id(&prepare.command), "upgrade_prepare");
+        assert!(matches!(
+            prepare.command,
+            Command::Upgrade {
+                command: UpgradeCommand::Prepare(UpgradePlanArgs {
+                    all_workspaces: true
+                })
+            }
+        ));
+        assert!(Cli::try_parse_from(["aopmem", "upgrade", "prepare", "--json"]).is_err());
         let parsed =
             Cli::try_parse_from(["aopmem", "upgrade", "plan", "--all-workspaces", "--json"])
                 .expect("upgrade plan should parse");

@@ -2072,3 +2072,91 @@ Handoff:
   deleted and the repeat scan passed.
 - Final independent verdict: OPEN P1=0, P2=0, P3=0. The candidate is ready
   for macOS and Windows dogfood. Stop conditions remain in force.
+
+## Stage 36 — v0.2.0-rc3 WAL upgrade remediation
+
+Trigger:
+
+- Native Windows dogfood reached the authoritative `upgrade plan` with exit
+  `0`, `ok=true`, `writes_performed=false`, and `ready=false`.
+- Workspace `p-sit-warranty-5708363a` was blocked by
+  `UNSAFE_DATABASE_SIDECAR` for a zero-byte `aopmem.sqlite-wal`.
+- No apply, migration, or binary publication started. Existing workspaces and
+  durable full backup remained intact.
+
+Accepted remediation:
+
+- Add explicit `upgrade prepare --all-workspaces --json`.
+- Create per-workspace backup before SQLite checkpoint.
+- Use `PRAGMA wal_checkpoint(TRUNCATE)` through canonical storage.
+- Fail closed on busy/incomplete checkpoint and unsafe paths.
+- Remove only verified empty direct-child WAL/SHM after connection close.
+- Preserve schema version and logical memory.
+- Keep `upgrade plan` strictly read-only.
+- Change installer order to `backup -> prepare -> plan -> apply -> publish`.
+- Allow noncanonical SQLite-backed v0.1 binary through warning plus
+  authoritative workspace compatibility checks.
+
+Proof status:
+
+| Proof | Status |
+|---|---|
+| No-sidecar idempotence | PASS |
+| Zero-byte WAL + SHM | PASS |
+| Committed non-empty WAL | PASS; committed row preserved |
+| Active/busy database | PASS |
+| Busy/incomplete checkpoint | PASS |
+| Backup-before-checkpoint | PASS |
+| Backup failure prevents checkpoint | PASS |
+| Symlink/reparse fail-closed | PASS |
+| Multi-workspace stable order | PASS |
+| Schema unchanged | PASS |
+| Logical rows/tools/MCP/artifacts preserved | PASS |
+| Plan no-write after prepare | PASS |
+| Installer prepare-before-plan/no intervening DB read | PASS |
+| Noncanonical v0.1 warning/compatibility | PASS |
+| macOS isolated fresh install | PASS |
+| macOS isolated zero-WAL update | PASS |
+| macOS isolated committed-WAL update | PASS |
+| Windows PE/static installer audit | PASS |
+| Native Windows retry | PENDING dogfood after release |
+
+Command proof:
+
+- `cargo fmt --check`: PASS.
+- `cargo clippy --all-targets -- -D warnings`: PASS.
+- `cargo build --locked`: PASS.
+- `cargo test --locked`: 609/609 PASS.
+- `cargo test --tests --locked`: 609/609 PASS.
+- `scripts/dev_verify.sh`: PASS with 609 tests.
+- Focused prepare tests: 9/9 PASS.
+- Upgrade tests: 32/32 PASS; independent broad `upgrade` filter: 33/33 PASS.
+- `scripts/audit_v020_installers.sh`: 11/11 PASS.
+- Installer shell syntax and `git diff --check`: PASS.
+- Release-scope version drift scan: clean.
+
+Real proof:
+
+- Root:
+  `/var/folders/cf/2mk2lmy9087c_lw961rpfvz00000gn/T/aopmem-rc3-real-proof.tPGZ5n`.
+- Fresh macOS install: PASS.
+- Real v0.1 zero-byte WAL update: PASS.
+- Real v0.1 committed-WAL update: PASS; committed rule remains available
+  through recall after migration.
+- Both update traces prove:
+  `process gate -> binary/full-home backups -> asset download -> stage ->
+  prepare -> plan -> apply -> publish -> health`.
+- No doctor, verify, recall, or observe event appears between prepare and plan.
+
+Release evidence:
+
+- Version: `v0.2.0-rc3`.
+- macOS arm64 SHA-256:
+  `8bc4d3a7ae38253c1a6e4c653292cf954fb2c8eee916c69a03c6dc5e2484261c`.
+- Windows x64 SHA-256:
+  `ed59be73d99efd2c1a4fe99e50b85e8b6ce8e8a73b7ff0c96b5327e1c2d39477`.
+- `SHA256SUMS` SHA-256:
+  `e871a6dcd53909e80b0cd7e1ab794e300fd4faeb961e3bbb83a770c4a8fcb871`.
+- `shasum -a 256 -c`: PASS for both assets.
+- Final independent audit: open P1=0, P2=0, P3=0.
+- Candidate is ready for prerelease and repeat native Windows dogfood.

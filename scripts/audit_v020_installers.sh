@@ -73,7 +73,14 @@ write_new_stub() {
     printf '%s\n' 'fi'
     printf '%s\n' 'case "$*" in'
     printf '%s\n' '  "--version")'
-    printf '%s\n' '    printf "%s\n" "aopmem 0.2.0-rc2"'
+    printf '%s\n' '    printf "%s\n" "aopmem 0.2.0-rc3"'
+    printf '%s\n' '    ;;'
+    printf '%s\n' '  "upgrade prepare --all-workspaces --json")'
+    printf '%s\n' '    if [ "${AOPMEM_STUB_PREPARE_FAIL:-0}" = "1" ]; then'
+    printf '%s\n' '      printf "%s\n" '\''{"ok":false,"data":{"success":false,"stopped_workspace":"fixture-workspace","backup_root":"/fixture/prepare-backup"},"errors":[{"code":"FIXTURE_PREPARE_FAILED","message":"fixture prepare failure"}]}'\'''
+    printf '%s\n' '      exit 1'
+    printf '%s\n' '    fi'
+    printf '%s\n' '    printf "%s\n" '\''{"ok":true,"data":{"success":true,"writes_performed":true}}'\'''
     printf '%s\n' '    ;;'
     printf '%s\n' '  "upgrade plan --all-workspaces --json")'
     printf '%s\n' '    if [ "${AOPMEM_STUB_PLAN_NOT_READY:-0}" = "1" ]; then'
@@ -82,12 +89,15 @@ write_new_stub() {
     printf '%s\n' '      printf "%s\n" '\''{"ok":true,"data":{"ready":true,"writes_performed":false}}'\'''
     printf '%s\n' '    fi'
     printf '%s\n' '    ;;'
-    printf '%s\n' '  "upgrade apply --all-workspaces --json")'
+    printf '%s\n' '  "upgrade apply --all-workspaces --json --approved +++")'
     printf '%s\n' '    if [ "${AOPMEM_STUB_APPLY_FAIL:-0}" = "1" ]; then'
     printf '%s\n' '      printf "%s\n" '\''{"ok":false,"data":{"success":false,"binary_replaced":false,"stopped_workspace":"fixture-workspace","backup_root":"/fixture/upgrade-backup"},"errors":[{"code":"FIXTURE_APPLY_FAILED","message":"fixture apply failure"}]}'\'''
     printf '%s\n' '      exit 1'
     printf '%s\n' '    fi'
     printf '%s\n' '    printf "%s\n" '\''{"ok":true,"data":{"success":true,"binary_replaced":false}}'\'''
+    printf '%s\n' '    ;;'
+    printf '%s\n' '  "adapter status --json")'
+    printf '%s\n' '    printf "%s\n" '\''{"ok":true,"data":{"managed_block":"in_sync"},"meta":{"workspace_key":"fixture-workspace"}}'\'''
     printf '%s\n' '    ;;'
     printf '%s\n' '  "init")'
     printf '%s\n' '    ;;'
@@ -100,13 +110,22 @@ write_new_stub() {
     printf '%s\n' '    ;;'
     printf '%s\n' '  "doctor --json")'
     printf '%s\n' '    if [ "${AOPMEM_STUB_DOCTOR_UNHEALTHY:-0}" = "1" ]; then'
-    printf '%s\n' '      printf "%s\n" '\''{"ok":true,"data":{"healthy":false}}'\'''
+    printf '%s\n' '      printf "%s\n" '\''{"ok":true,"data":{"healthy":false},"meta":{"workspace_key":"fixture-workspace"}}'\'''
     printf '%s\n' '    else'
-    printf '%s\n' '      printf "%s\n" '\''{"ok":true,"data":{"healthy":true}}'\'''
+    printf '%s\n' '      printf "%s\n" '\''{"ok":true,"data":{"healthy":true},"meta":{"workspace_key":"fixture-workspace"}}'\'''
     printf '%s\n' '    fi'
     printf '%s\n' '    ;;'
     printf '%s\n' '  "verify --json")'
-    printf '%s\n' '    printf "%s\n" '\''{"ok":true,"data":{"clean":true}}'\'''
+    printf '%s\n' '    printf "%s\n" '\''{"ok":true,"data":{"clean":true},"meta":{"workspace_key":"fixture-workspace"}}'\'''
+    printf '%s\n' '    ;;'
+    printf '%s\n' '  "recall --json")'
+    printf '%s\n' '    printf "%s\n" '\''{"ok":true,"data":{},"meta":{"workspace_key":"fixture-workspace"}}'\'''
+    printf '%s\n' '    ;;'
+    printf '%s\n' '  "observe status --json")'
+    printf '%s\n' '    printf "%s\n" '\''{"ok":true,"data":{},"meta":{"workspace_key":"fixture-workspace"}}'\'''
+    printf '%s\n' '    ;;'
+    printf '%s\n' '  "observe report --json")'
+    printf '%s\n' '    printf "%s\n" '\''{"ok":true,"data":{},"meta":{"workspace_key":"fixture-workspace"}}'\'''
     printf '%s\n' '    ;;'
     printf '%s\n' '  *)'
     printf '%s\n' '    printf "%s\n" "unexpected stub command: $*" >&2'
@@ -203,7 +222,8 @@ run_static_audit() {
   assert_contains "$MAC_INSTALLER" '--tlsv1\.2'
   assert_contains "$MAC_INSTALLER" 'shasum -a 256'
   assert_contains "$MAC_INSTALLER" 'upgrade plan --all-workspaces --json'
-  assert_contains "$MAC_INSTALLER" 'upgrade apply --all-workspaces --json'
+  assert_contains "$MAC_INSTALLER" 'upgrade prepare --all-workspaces --json'
+  assert_contains "$MAC_INSTALLER" 'upgrade apply --all-workspaces --json --approved "\+\+\+"'
   assert_contains "$MAC_INSTALLER" 'adapter seed --json'
   assert_contains "$MAC_INSTALLER" 'AOPMem home must not be a symbolic link'
   assert_contains "$MAC_INSTALLER" 'recovery binary path already exists'
@@ -226,7 +246,8 @@ run_static_audit() {
   assert_contains "$WINDOWS_INSTALLER" 'File.*Replace'
   assert_contains "$WINDOWS_INSTALLER" 'IsReparsePoint'
   assert_contains "$WINDOWS_INSTALLER" 'upgrade", "plan", "--all-workspaces", "--json"'
-  assert_contains "$WINDOWS_INSTALLER" 'upgrade", "apply", "--all-workspaces", "--json"'
+  assert_contains "$WINDOWS_INSTALLER" 'upgrade", "prepare", "--all-workspaces", "--json"'
+  assert_contains "$WINDOWS_INSTALLER" '"upgrade", "apply", "--all-workspaces", "--json", "--approved", "\+\+\+"'
   assert_contains "$WINDOWS_INSTALLER" 'adapter", "seed", "--json"'
   assert_contains "$WINDOWS_INSTALLER" 'failure JSON report'
   assert_contains "$MAC_INSTALLER" 'emit_upgrade_report'
@@ -271,7 +292,12 @@ test_fresh_success() {
   assert_contains "$TRACE_PATH" '^adapter\.seed$'
   assert_contains "$TRACE_PATH" '^doctor$'
   assert_contains "$TRACE_PATH" '^verify$'
+  assert_contains "$TRACE_PATH" '^adapter\.status$'
+  assert_contains "$TRACE_PATH" '^recall$'
+  assert_contains "$TRACE_PATH" '^observe\.status$'
+  assert_contains "$TRACE_PATH" '^observe\.report$'
   assert_not_contains "$TRACE_PATH" '^upgrade\.plan$'
+  assert_trace_order "$TRACE_PATH" "asset.download.started" "sha256.verified"
   assert_trace_order "$TRACE_PATH" "sha256.verified" "binary.version.verified"
   assert_trace_order "$TRACE_PATH" "binary.version.verified" "replacement.published"
   assert_trace_order "$TRACE_PATH" "init" "adapter.seed"
@@ -305,15 +331,35 @@ test_update_success() {
   install_old_binary
   expect_success
   assert_contains "$TRACE_PATH" '^upgrade\.plan$'
+  assert_contains "$TRACE_PATH" '^upgrade\.prepare$'
   assert_contains "$TRACE_PATH" '^upgrade\.apply$'
   assert_contains "$TRACE_PATH" '^upgrade\.apply\.health\.ok$'
   assert_not_contains "$TRACE_PATH" '^init$'
-  assert_not_contains "$TRACE_PATH" '^doctor$'
-  assert_not_contains "$TRACE_PATH" '^verify$'
+  assert_contains "$TRACE_PATH" '^doctor$'
+  assert_contains "$TRACE_PATH" '^verify$'
+  assert_trace_order "$TRACE_PATH" "process.gate.clear" "backup.created"
+  assert_trace_order "$TRACE_PATH" "backup.created" "backup.home.created"
+  assert_trace_order "$TRACE_PATH" "backup.home.created" "asset.download.started"
+  assert_trace_order "$TRACE_PATH" "asset.download.started" "sha256.verified"
+  assert_trace_order "$TRACE_PATH" "sha256.verified" "replacement.staged"
+  assert_trace_order "$TRACE_PATH" "replacement.staged" "upgrade.prepare"
+  assert_trace_order "$TRACE_PATH" "upgrade.prepare" "upgrade.plan"
   assert_trace_order "$TRACE_PATH" "upgrade.plan" "upgrade.apply"
   assert_trace_order "$TRACE_PATH" "upgrade.apply.health.ok" "replacement.published"
+  assert_trace_order "$TRACE_PATH" "replacement.published" "doctor"
+  assert_trace_order "$TRACE_PATH" "replacement.published" "adapter.status"
+  assert_trace_order "$TRACE_PATH" "adapter.status" "doctor"
+  assert_trace_order "$TRACE_PATH" "verify" "recall"
+  assert_trace_order "$TRACE_PATH" "recall" "observe.status"
+  assert_trace_order "$TRACE_PATH" "observe.status" "observe.report"
   backup=$(find "$AOPMEM_HOME_PATH/bin" -name 'aopmem.backup-v0.1.0-rc3-*' -print -quit)
   assert_file "$backup"
+  full_backup=$(find "$CASE_ROOT/AOPMemBackups" -path '*/aopmem-home/bin/aopmem' -print -quit)
+  assert_file "$full_backup"
+  assert_equal \
+    "$(shasum -a 256 "$full_backup" | awk '{ print $1 }')" \
+    "$(shasum -a 256 "$backup" | awk '{ print $1 }')" \
+    "durable full-backup binary hash"
   expected=$(shasum -a 256 "$ASSET_DIR/aopmem-darwin-arm64" | awk '{ print $1 }')
   actual=$(shasum -a 256 "$AOPMEM_HOME_PATH/bin/aopmem" | awk '{ print $1 }')
   assert_equal "$actual" "$expected" "published update hash"
@@ -336,11 +382,13 @@ test_tagged_source_acceptance_and_hash_binding() {
   assert_contains "$TRACE_PATH" '^upgrade\.apply$'
   assert_not_contains "$TRACE_PATH" '^init$'
 
-  setup_case wrong-old-hash
+  setup_case noncanonical-old-hash
   install_old_binary
-  expect_failure \
+  expect_success \
     AOPMEM_INSTALL_TEST_OLD_BINARY_SHA256=ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
-  assert_contains "$STDERR_PATH" 'not the supported v0.1.0-rc3 release asset'
+  assert_contains "$STDERR_PATH" 'NONCANONICAL_V010_BINARY'
+  assert_contains "$TRACE_PATH" '^warning\.NONCANONICAL_V010_BINARY$'
+  assert_contains "$TRACE_PATH" '^upgrade\.prepare$'
   pass
 }
 
@@ -442,7 +490,7 @@ test_path_rejections() {
 
   setup_case recovery-destination-symlink
   install_old_binary
-  recovery_path="$AOPMEM_HOME_PATH/bin/aopmem-v0.2.0-rc2-recovery-424242"
+  recovery_path="$AOPMEM_HOME_PATH/bin/aopmem-v0.2.0-rc3-recovery-424242"
   ln -s "$CASE_ROOT/outside-recovery-target" "$recovery_path"
   expect_failure AOPMEM_INSTALL_TEST_RUN_ID=424242
   [ -L "$recovery_path" ] || fail "installer removed pre-existing recovery symlink"
@@ -451,6 +499,21 @@ test_path_rejections() {
 }
 
 test_pre_apply_failures_leave_binary_unchanged() {
+  setup_case prepare-failure
+  install_old_binary
+  old_hash=$(shasum -a 256 "$AOPMEM_HOME_PATH/bin/aopmem" | awk '{ print $1 }')
+  expect_failure AOPMEM_STUB_PREPARE_FAIL=1
+  new_hash=$(shasum -a 256 "$AOPMEM_HOME_PATH/bin/aopmem" | awk '{ print $1 }')
+  assert_equal "$new_hash" "$old_hash" "prepare failure bytes"
+  assert_contains "$TRACE_PATH" '^upgrade\.prepare$'
+  assert_not_contains "$TRACE_PATH" '^upgrade\.plan$'
+  assert_not_contains "$TRACE_PATH" '^upgrade\.apply$'
+  assert_contains "$TRACE_PATH" '^rollback\.unchanged$'
+  assert_contains "$STDERR_PATH" 'code=FIXTURE_PREPARE_FAILED'
+  full_backup=$(find "$CASE_ROOT/AOPMemBackups" -path '*/aopmem-home/bin/aopmem' -print -quit)
+  assert_file "$full_backup"
+  assert_temp_clean "$TEMP_PARENT"
+
   setup_case plan-failure
   install_old_binary
   old_inode=$(ls -di "$AOPMEM_HOME_PATH/bin/aopmem" | awk '{ print $1 }')
