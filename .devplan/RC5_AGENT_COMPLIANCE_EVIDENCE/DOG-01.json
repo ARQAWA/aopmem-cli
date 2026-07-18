@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "scenario_id": "DOG-01",
+  "scenario_kind": "simple_discussion",
+  "parent_agent": "/root/dog25c_01",
+  "keeper_agent": "/root/dog25c_01/memory_keeper_v2",
+  "task": {
+    "task_id": "97708fc8-8746-46e6-b951-07693ce64921",
+    "bundle_id": "325eb52b-1470-4d36-b0b3-245eb84ee402",
+    "workspace_key": "repo-fa31dced",
+    "mandatory_context_complete": true,
+    "retrieval_complete": true,
+    "budget_exhausted": false,
+    "applied_gate_ids": [2, 3, 10],
+    "applied_rule_ids": [11],
+    "selected_workflow_ids": [12],
+    "selected_tool_ids": [],
+    "apply_status": "applied",
+    "completion_result": "success"
+  },
+  "actions": [
+    {"seq": 1, "actor": "parent", "action": "instruction_read", "status": "ok"},
+    {"seq": 2, "actor": "parent", "action": "native_keeper_started", "status": "ok"},
+    {"seq": 3, "actor": "keeper", "action": "task_started", "status": "ok"},
+    {"seq": 4, "actor": "keeper", "action": "context_applied", "status": "ok"},
+    {"seq": 5, "actor": "parent", "action": "receipt_received", "status": "ok"},
+    {"seq": 6, "actor": "parent", "action": "substantive_action", "status": "ok"},
+    {"seq": 7, "actor": "parent", "action": "task_completed", "status": "ok"}
+  ],
+  "checks": {
+    "start_before_substantive_action": true,
+    "apply_before_substantive_action": true,
+    "mandatory_gate_applied": true,
+    "relevant_workflow_or_tool_selected": true,
+    "project_file_read_after_receipt": null,
+    "user_reminders_required": 0,
+    "duplicate_tools_created": 0,
+    "blanket_secret_refusals": 0,
+    "external_writes": 0
+  },
+  "final_answer_summary": "Explained that simple solutions reduce errors and are easier to build, verify, and change."
+}

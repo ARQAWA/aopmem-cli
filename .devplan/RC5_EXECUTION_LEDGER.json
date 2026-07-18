@@ -1,0 +1,414 @@
+{
+  "schema_version": 1,
+  "goal": "AOPMem v0.2.0-rc5",
+  "target_version": "0.2.0-rc5",
+  "status": "COMPLETE_LOCAL_RELEASE_READY",
+  "baseline": {
+    "branch": "main",
+    "upstream": "origin/main",
+    "commit": "0af9b22c2e4a8217cbf6b1de558eb2181ce79a84",
+    "tag": "v0.2.0-rc4",
+    "package_version": "0.2.0-rc4",
+    "worktree_classification": "CLEAN"
+  },
+  "current_stage": "COMPLETE_LOCAL_RELEASE_READY",
+  "last_completed_stage": "STAGE_030",
+  "verified_through_stage": "STAGE_030",
+  "next_cumulative_audit": "NONE",
+  "decisions_frozen": true,
+  "open_product_decisions": 0,
+  "open_blockers": 0,
+  "stages": [
+    {
+      "id": "STAGE_001",
+      "title": "Field findings, baseline, current worktree classification",
+      "status": "VERIFIED",
+      "artifacts": [
+        ".devplan/RC5_FIELD_FINDINGS.md",
+        ".devplan/RC5_HANDOFFS/STAGE_001.md"
+      ]
+    },
+    {
+      "id": "STAGE_002",
+      "title": "Frozen RC5 decision log and requirements matrix",
+      "status": "VERIFIED",
+      "artifacts": [
+        ".devplan/RC5_FINAL_DECISION_LOG.md",
+        ".devplan/RC5_REQUIREMENTS_MATRIX.md",
+        ".devplan/RC5_HANDOFFS/STAGE_002.md"
+      ]
+    },
+    {
+      "id": "STAGE_003",
+      "title": "Managed Block V2 specification",
+      "status": "VERIFIED",
+      "artifacts": [
+        ".devplan/RC5_MANAGED_BLOCK_V2_SPEC.md",
+        ".devplan/RC5_HANDOFFS/STAGE_003.md"
+      ]
+    },
+    {
+      "id": "STAGE_004",
+      "title": "Task lifecycle and observability schema v2",
+      "status": "VERIFIED",
+      "artifacts": [
+        "src/task/mod.rs",
+        "src/observability/task_state.rs",
+        "docs/TASK_START_PROTOCOL.md",
+        ".devplan/RC5_HANDOFFS/STAGE_004.md"
+      ]
+    },
+    {
+      "id": "STAGE_005",
+      "title": "task start internal complete retrieval",
+      "status": "VERIFIED",
+      "artifacts": [
+        "src/cli/mod.rs",
+        "src/storage/mod.rs",
+        "src/task/mod.rs",
+        "src/observability/mod.rs",
+        "src/observability/task_state.rs",
+        "docs/TASK_START_PROTOCOL.md",
+        ".devplan/RC5_HANDOFFS/STAGE_005.md"
+      ]
+    },
+    {
+      "id": "STAGE_006",
+      "title": "task apply and task complete",
+      "status": "VERIFIED",
+      "artifacts": [
+        "src/cli/mod.rs",
+        "src/task/mod.rs",
+        "src/observability/task_state.rs",
+        "docs/TASK_START_PROTOCOL.md",
+        ".devplan/RC5_HANDOFFS/STAGE_006.md"
+      ]
+    },
+    {
+      "id": "STAGE_007",
+      "title": "Memory Keeper V2 skill",
+      "status": "VERIFIED",
+      "artifacts": [
+        "templates/skills/memory-keeper/SKILL.md",
+        "docs/MEMORY_KEEPER_V2.md",
+        "src/adapter/mod.rs",
+        ".devplan/RC5_HANDOFFS/STAGE_007.md"
+      ]
+    },
+    {
+      "id": "STAGE_008",
+      "title": "Managed block implementation and adapters",
+      "status": "VERIFIED",
+      "artifacts": [
+        "templates/managed-block/AGENTS.managed-block.md",
+        "src/adapter/mod.rs",
+        "src/cli/mod.rs",
+        ".devplan/RC5_HANDOFFS/STAGE_008.md"
+      ]
+    },
+    {
+      "id": "STAGE_009",
+      "title": "Secret contract implementation",
+      "status": "VERIFIED",
+      "artifacts": [
+        "src/cli/mod.rs",
+        "templates/skills/memory-keeper/SKILL.md",
+        "docs/MEMORY_KEEPER_V2.md",
+        "docs/SECRET_HANDLING.md",
+        ".devplan/RC5_HANDOFFS/STAGE_009.md"
+      ]
+    },
+    {
+      "id": "STAGE_010",
+      "title": "Secret redaction and explicit persistence tests",
+      "status": "VERIFIED",
+      "artifacts": [
+        "src/redaction.rs",
+        "src/audit/mod.rs",
+        "src/observability/mod.rs",
+        "src/observability/task_state.rs",
+        "src/observability/report.rs",
+        "src/observability/export.rs",
+        "src/observability/ui.rs",
+        "src/ui/data.rs",
+        "src/ui/http.rs",
+        "src/upgrade/backup.rs",
+        "src/cli/mod.rs",
+        "docs/SECRET_HANDLING.md",
+        ".devplan/RC5_HANDOFFS/STAGE_010.md"
+      ]
+    },
+    {
+      "id": "STAGE_011",
+      "title": "Tool aliases schema and storage API",
+      "status": "VERIFIED",
+      "artifacts": [
+        "src/schema/mod.rs",
+        "src/tools/mod.rs",
+        "src/storage/mod.rs",
+        "src/verify/mod.rs",
+        "src/observability/export.rs",
+        "docs/TOOL_ALIASES_AND_DEDUPLICATION.md",
+        ".devplan/RC5_HANDOFFS/STAGE_011.md"
+      ]
+    },
+    {
+      "id": "STAGE_012",
+      "title": "Tool fingerprint and dedupe plan",
+      "status": "VERIFIED",
+      "artifacts": [
+        "Cargo.toml",
+        "Cargo.lock",
+        "src/audit/anchored.rs",
+        "src/tools/mod.rs",
+        "src/storage/mod.rs",
+        "src/cli/mod.rs",
+        "docs/TOOL_ALIASES_AND_DEDUPLICATION.md",
+        ".devplan/RC5_TOOL_DEDUPE_REPORT.md",
+        ".devplan/RC5_HANDOFFS/STAGE_012.md"
+      ]
+    },
+    {
+      "id": "STAGE_013",
+      "title": "Alias-aware tool list get run validate",
+      "status": "VERIFIED",
+      "artifacts": [
+        "src/tools/mod.rs",
+        "src/cli/mod.rs",
+        "docs/TOOL_ALIASES_AND_DEDUPLICATION.md",
+        ".devplan/RC5_HANDOFFS/STAGE_013.md"
+      ]
+    },
+    {
+      "id": "STAGE_014",
+      "title": "Exact-only duplicate canonicalization",
+      "status": "VERIFIED",
+      "artifacts": [
+        "src/tools/mod.rs",
+        "src/cli/mod.rs",
+        ".devplan/RC5_HANDOFFS/STAGE_014.md"
+      ]
+    },
+    {
+      "id": "STAGE_015",
+      "title": "Confluence fixture and managed-block tool rules",
+      "status": "VERIFIED",
+      "artifacts": [
+        "fixtures/stage_015/confluence_tools",
+        "src/tools/mod.rs",
+        "src/cli/mod.rs",
+        "src/adapter/mod.rs",
+        "docs/TOOL_ALIASES_AND_DEDUPLICATION.md",
+        ".devplan/RC5_TOOL_DEDUPE_REPORT.md",
+        ".devplan/RC5_HANDOFFS/STAGE_015.md"
+      ]
+    },
+    {
+      "id": "STAGE_016",
+      "title": "Windows publish root-cause audit",
+      "status": "VERIFIED",
+      "artifacts": [
+        ".devplan/RC5_WINDOWS_PUBLISH_ROOT_CAUSE.md",
+        ".devplan/RC5_WINDOWS_PUBLISH_REPORT.md",
+        ".devplan/RC5_HANDOFFS/STAGE_016.md"
+      ]
+    },
+    {
+      "id": "STAGE_017",
+      "title": "Unified Windows Atomic Publish V2",
+      "status": "VERIFIED",
+      "artifacts": [
+        ".devplan/RC5_WINDOWS_PUBLISH_REPORT.md",
+        ".devplan/RC5_HANDOFFS/STAGE_017.md"
+      ]
+    },
+    {
+      "id": "STAGE_018",
+      "title": "Platform self-check",
+      "status": "VERIFIED",
+      "artifacts": [
+        "src/platform_check.rs",
+        "tests/platform_check_cli.rs",
+        "docs/PLATFORM_CHECK.md",
+        ".devplan/RC5_WINDOWS_PUBLISH_REPORT.md",
+        ".devplan/RC5_HANDOFFS/STAGE_018.md"
+      ]
+    },
+    {
+      "id": "STAGE_019",
+      "title": "Audit repair",
+      "status": "VERIFIED",
+      "artifacts": [
+        "src/audit_repair.rs",
+        "docs/AUDIT_REPAIR.md",
+        "docs/WINDOWS_AUDIT_REPAIR.md",
+        ".devplan/RC5_HANDOFFS/STAGE_019.md"
+      ]
+    },
+    {
+      "id": "STAGE_020",
+      "title": "Debug capsule and audit snapshot integration",
+      "status": "VERIFIED",
+      "artifacts": [
+        "src/windows_path.rs",
+        "src/observability/export.rs",
+        "docs/DEBUG_CAPSULE.md",
+        ".devplan/RC5_WINDOWS_PUBLISH_REPORT.md",
+        ".devplan/RC5_HANDOFFS/STAGE_020.md"
+      ]
+    },
+    {
+      "id": "STAGE_021",
+      "title": "Upgrade support v0.1 and rc1-rc4 to rc5",
+      "status": "VERIFIED",
+      "artifacts": [
+        "src/upgrade/recovery.rs",
+        "src/upgrade/apply.rs",
+        "docs/UPGRADE_TO_RC5.md",
+        ".devplan/RC5_HANDOFFS/STAGE_021.md"
+      ]
+    },
+    {
+      "id": "STAGE_022",
+      "title": "Install prompt, install.ps1, install.sh",
+      "status": "VERIFIED",
+      "artifacts": [
+        "install/v0.2/install.sh",
+        "install/v0.2/install.ps1",
+        "install/v0.2/install_prompt.md",
+        "scripts/audit_v020_installers.sh",
+        ".devplan/RC5_HANDOFFS/STAGE_022.md"
+      ]
+    },
+    {
+      "id": "STAGE_023",
+      "title": "Effectiveness report and minimal UI additions",
+      "status": "VERIFIED",
+      "artifacts": [
+        "src/observability/report.rs",
+        "src/ui/data.rs",
+        "src/ui/http.rs",
+        "src/ui/assets.rs",
+        "src/ui/assets/app.js",
+        "docs/LOCAL_OBSERVABILITY.md",
+        "docs/DESKTOP_UI.md",
+        ".devplan/RC5_HANDOFFS/STAGE_023.md"
+      ]
+    },
+    {
+      "id": "STAGE_024",
+      "title": "macOS isolated fresh update two-workspace proof",
+      "status": "VERIFIED",
+      "artifacts": [
+        "scripts/prove_rc5_macos.sh",
+        ".devplan/RC5_MACOS_PROOF_REPORT.md",
+        ".devplan/RC5_HANDOFFS/STAGE_024.md"
+      ]
+    },
+    {
+      "id": "STAGE_025",
+      "title": "10 clean-agent compliance dogfood scenarios",
+      "status": "VERIFIED",
+      "artifacts": [
+        ".devplan/RC5_AGENT_COMPLIANCE_REPORT.md",
+        ".devplan/RC5_AGENT_COMPLIANCE_EVIDENCE",
+        ".devplan/RC5_HANDOFFS/STAGE_025.md"
+      ]
+    },
+    {
+      "id": "STAGE_026",
+      "title": "Focused RC5 performance proof",
+      "status": "VERIFIED",
+      "artifacts": [
+        "scripts/benchmark_rc5_stage26.py",
+        ".devplan/benchmarks/rc5_stage26",
+        ".devplan/RC5_PERFORMANCE_REPORT.md",
+        ".devplan/RC5_HANDOFFS/STAGE_026.md"
+      ]
+    },
+    {
+      "id": "STAGE_027",
+      "title": "Full negative security regression suite",
+      "status": "VERIFIED",
+      "artifacts": [
+        ".devplan/RC5_REGRESSION_REPORT.md",
+        ".devplan/RC5_HANDOFFS/STAGE_027.md"
+      ]
+    },
+    {
+      "id": "STAGE_028",
+      "title": "Release assets docs checksums",
+      "status": "VERIFIED",
+      "artifacts": [
+        "dist/aopmem-darwin-arm64",
+        "dist/aopmem-windows-x86_64.exe",
+        "dist/SHA256SUMS",
+        "docs/WINDOWS_NATIVE_UPDATE.md",
+        "docs/WINDOWS_NATIVE_POWERSHELL_SMOKE.md",
+        ".devplan/RELEASE_CANDIDATE_v0.2.0-rc5.md",
+        ".devplan/RC5_HANDOFFS/STAGE_028.md"
+      ]
+    },
+    {
+      "id": "STAGE_029",
+      "title": "Independent global audit and 15 requirement sweeps",
+      "status": "VERIFIED",
+      "artifacts": [
+        ".devplan/RC5_GLOBAL_AUDIT_REPORT.md",
+        ".devplan/RC5_HANDOFFS/STAGE_029.md"
+      ]
+    },
+    {
+      "id": "STAGE_030",
+      "title": "RC report final matrix stop-condition proof",
+      "status": "VERIFIED",
+      "artifacts": [
+        ".devplan/RELEASE_CANDIDATE_v0.2.0-rc5.md",
+        ".devplan/RC5_REQUIREMENTS_MATRIX.md",
+        ".devplan/RC5_HANDOFFS/STAGE_030.md"
+      ]
+    }
+  ],
+  "cumulative_audits": [
+    {
+      "through_stage": "STAGE_005",
+      "status": "PASS",
+      "artifact": ".devplan/RC5_HANDOFFS/AUDIT_001_005.md"
+    },
+    {
+      "through_stage": "STAGE_010",
+      "status": "PASS",
+      "artifact": ".devplan/RC5_HANDOFFS/AUDIT_006_010.md"
+    },
+    {
+      "through_stage": "STAGE_015",
+      "status": "PASS",
+      "artifact": ".devplan/RC5_HANDOFFS/AUDIT_011_015.md"
+    },
+    {
+      "through_stage": "STAGE_020",
+      "status": "PASS",
+      "artifact": ".devplan/RC5_HANDOFFS/AUDIT_016_020.md"
+    },
+    {
+      "through_stage": "STAGE_025",
+      "status": "PASS",
+      "artifact": ".devplan/RC5_HANDOFFS/AUDIT_021_025.md"
+    },
+    {
+      "through_stage": "STAGE_030",
+      "status": "PASS",
+      "artifact": ".devplan/RC5_HANDOFFS/AUDIT_026_030.md"
+    }
+  ],
+  "stop_constraints": {
+    "push": true,
+    "tag": true,
+    "github_release": true,
+    "real_windows_install": false,
+    "delete_backups": false,
+    "change_published_tags": false
+  },
+  "created_at": "2026-07-17T21:54:30+03:00",
+  "updated_at": "2026-07-18T18:30:00+03:00"
+}

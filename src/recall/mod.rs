@@ -626,7 +626,7 @@ pub fn bind_recall_revision_to_workspace(
     Ok(stable_fingerprint(&input))
 }
 
-fn normalized_query_fingerprint(query: &str) -> String {
+pub(crate) fn normalized_query_fingerprint(query: &str) -> String {
     stable_fingerprint(normalize_recall_query(query).as_bytes())
 }
 
@@ -910,6 +910,9 @@ pub struct TaskRecallContext {
     pub section: RecallSection,
     pub used_bytes: usize,
     pub more_results: bool,
+    /// True only when at least one selected complete node did not fit the
+    /// canonical JSON byte budget. Storage row limits are reported separately.
+    pub byte_budget_exhausted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -1061,9 +1064,11 @@ pub fn build_task_recall_context(
             },
             used_bytes: complete_used_bytes,
             more_results: false,
+            byte_budget_exhausted: false,
         });
     }
 
+    let selected_count = selected_nodes.len();
     let mut used_bytes = empty_task_section_byte_len(false)?;
     let mut packed_nodes = Vec::with_capacity(selected_nodes.len());
     for selected in selected_nodes {
@@ -1082,6 +1087,7 @@ pub fn build_task_recall_context(
         packed_nodes.push(selected);
     }
 
+    let byte_budget_exhausted = selected_count > packed_nodes.len();
     Ok(TaskRecallContext {
         section: RecallSection {
             complete: false,
@@ -1089,6 +1095,7 @@ pub fn build_task_recall_context(
         },
         used_bytes,
         more_results: true,
+        byte_budget_exhausted,
     })
 }
 

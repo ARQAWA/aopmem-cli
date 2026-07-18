@@ -8,7 +8,7 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = "Stop"
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
-$script:ProductVersion = "0.2.0-rc4"
+$script:ProductVersion = "0.2.0-rc5"
 $script:OldReleaseLabel = "0.1.0-rc3"
 $script:OldBinaryVersion = "0.1.0"
 $script:OldBinarySha256 = "01010aeffc20aead5f353353674621b367e6ad590769e4b5915b8d02d62f6d7a"
@@ -37,6 +37,8 @@ $script:InstallDir = $null
 $script:AopmemHome = $null
 $script:VerifiedBinaryHash = $null
 $script:LastAopmemJsonText = $null
+$script:ActiveAdapter = $env:AOPMEM_ACTIVE_ADAPTER
+$script:ActiveInstructionFile = $env:AOPMEM_ACTIVE_INSTRUCTION_FILE
 
 function Write-TestTrace {
     param([Parameter(Mandatory = $true)][string]$EventName)
@@ -439,23 +441,21 @@ function Assert-NoActiveAopmemProcesses {
 
 function Backup-AopmemHome {
     $stamp = [DateTime]::UtcNow.ToString("yyyyMMddTHHmmssZ")
-    if ($script:TestMode) {
-        $backupParent = Join-Path (
-            Split-Path -Parent $script:AopmemHome) "AOPMemBackups"
-    }
-    else {
-        if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
-            Throw-InstallError "LOCALAPPDATA is missing"
-        }
-        $backupParent = Join-Path $env:LOCALAPPDATA "AOPMemBackups"
-    }
+    # Adoption accepts an RC5-named direct sibling only.  This producer is
+    # intentionally before download so an old binary need not know RC5 CLI.
+    $backupParent = Split-Path -Parent $script:AopmemHome
     Assert-SafeDirectory -LiteralPath $backupParent -Label "durable backup parent"
     if ($null -eq (Get-ExistingPathItem -LiteralPath $backupParent)) {
         [IO.Directory]::CreateDirectory($backupParent) | Out-Null
     }
     Assert-SafeDirectory -LiteralPath $backupParent -Label "durable backup parent"
+    $reservedHomeManifest = Join-Path $script:AopmemHome "MANIFEST.sha256"
+    if ($null -ne (Get-ExistingPathItem -LiteralPath $reservedHomeManifest)) {
+        Throw-InstallError (
+            "AOPMem home root uses reserved backup manifest name: MANIFEST.sha256")
+    }
     $script:FullBackupRoot = Join-Path $backupParent (
-        "pre-v{0}-{1}-{2}" -f
+        "aopmem-home-backup-v{0}-{1}-{2}" -f
             $script:ProductVersion,
             $stamp,
             [Diagnostics.Process]::GetCurrentProcess().Id)
@@ -463,16 +463,69 @@ function Backup-AopmemHome {
         -LiteralPath $script:FullBackupRoot `
         -Label "durable backup root"
     [IO.Directory]::CreateDirectory($script:FullBackupRoot) | Out-Null
-    $script:FullBackupHome = Join-Path $script:FullBackupRoot "aopmem-home"
-    $robocopyArguments = @(
-        $script:AopmemHome,
-        $script:FullBackupHome,
-        "/E", "/XJ", "/R:1", "/W:1", "/NFL", "/NDL", "/NP")
-    & "$env:SystemRoot\System32\robocopy.exe" @robocopyArguments | Out-Null
-    $robocopyExit = $LASTEXITCODE
-    if ($robocopyExit -ge 8) {
-        Throw-InstallError "durable AOPMem home backup failed: robocopy exit=$robocopyExit"
+    $script:FullBackupHome = $script:FullBackupRoot
+    # Reject every reparse/non-regular source before copying. The bounds match
+    # the RC5 recovery adopter.
+    $script:SourcePreflightEntries = 0
+    function Assert-SourceTreeNoFollow {
+        param([string]$Directory, [int]$Depth)
+        if ($Depth -gt 128) {
+            Throw-InstallError "AOPMem home exceeds maximum backup directory depth"
+        }
+        $names = [string[]]@([IO.Directory]::GetFileSystemEntries($Directory))
+        [Array]::Sort($names, [StringComparer]::Ordinal)
+        if ($names.Count -gt 10000) {
+            Throw-InstallError "durable backup exceeds maximum directory entry count"
+        }
+        foreach ($path in $names) {
+            $script:SourcePreflightEntries += 1
+            if ($script:SourcePreflightEntries -gt 100000) {
+                Throw-InstallError "AOPMem home exceeds maximum backup entry count"
+            }
+            $item = Get-Item -LiteralPath $path -Force
+            if (Test-IsReparsePoint -Item $item) {
+                Throw-InstallError "AOPMem home contains a reparse point"
+            }
+            if ($item.PSIsContainer) {
+                Assert-SourceTreeNoFollow -Directory $item.FullName -Depth ($Depth + 1)
+            }
+            elseif (-not $item.PSIsContainer -and -not ($item -is [IO.FileInfo])) {
+                Throw-InstallError "AOPMem home contains a non-regular file"
+            }
+        }
     }
+    Assert-SourceTreeNoFollow -Directory $script:AopmemHome -Depth 0
+    function Copy-HomeTreeDurably {
+        param([string]$SourceDirectory, [string]$DestinationDirectory, [int]$Depth)
+        if ($Depth -gt 128) {
+            Throw-InstallError "AOPMem home exceeds maximum backup directory depth"
+        }
+        $names = [string[]]@([IO.Directory]::GetFileSystemEntries($SourceDirectory))
+        [Array]::Sort($names, [StringComparer]::Ordinal)
+        if ($names.Count -gt 10000) {
+            Throw-InstallError "AOPMem home exceeds maximum backup directory entry count"
+        }
+        foreach ($sourcePath in $names) {
+            $sourceItem = Get-Item -LiteralPath $sourcePath -Force
+            if (Test-IsReparsePoint -Item $sourceItem) {
+                Throw-InstallError "AOPMem home contains a reparse point"
+            }
+            $destinationPath = Join-Path $DestinationDirectory $sourceItem.Name
+            if ($sourceItem.PSIsContainer) {
+                [IO.Directory]::CreateDirectory($destinationPath) | Out-Null
+                Copy-HomeTreeDurably -SourceDirectory $sourceItem.FullName `
+                    -DestinationDirectory $destinationPath -Depth ($Depth + 1)
+            }
+            elseif ($sourceItem -is [IO.FileInfo]) {
+                Copy-DurableFile -Source $sourceItem.FullName -Destination $destinationPath
+            }
+            else {
+                Throw-InstallError "AOPMem home contains a non-regular file"
+            }
+        }
+    }
+    Copy-HomeTreeDurably -SourceDirectory $script:AopmemHome `
+        -DestinationDirectory $script:FullBackupHome -Depth 0
     $backupBinary = Join-Path $script:FullBackupHome "bin\aopmem.exe"
     Assert-SafeRegularFile -LiteralPath $backupBinary -Label "durable backup binary"
     if ((Get-Sha256 -LiteralPath $backupBinary) -cne
@@ -501,7 +554,192 @@ function Backup-AopmemHome {
             }
         }
     }
+    # Match Rust `write_tree_manifest`: ordinal per-directory DFS, files only,
+    # backslash relative paths on Windows, and LF-only UTF-8 without BOM.
+    $manifestText = New-Object System.Text.StringBuilder
+    $script:ManifestEntryCount = 0
+    $script:ManifestUtf8Bytes = 0
+    function Write-BackupManifestTree {
+        param([string]$Directory, [string]$Relative, [int]$Depth)
+        if ($Depth -gt 128) {
+            Throw-InstallError "durable backup exceeds maximum directory depth"
+        }
+        $names = [string[]]@([IO.Directory]::GetFileSystemEntries($Directory))
+        [Array]::Sort($names, [StringComparer]::Ordinal)
+        if ($names.Count -gt 10000) {
+            Throw-InstallError "durable backup exceeds maximum directory entry count"
+        }
+        foreach ($path in $names) {
+            $name = [IO.Path]::GetFileName($path)
+            if ([string]::IsNullOrEmpty($Relative) -and
+                $name -ceq "MANIFEST.sha256") {
+                continue
+            }
+            $script:ManifestEntryCount += 1
+            if ($script:ManifestEntryCount -gt 100000) {
+                Throw-InstallError "durable backup exceeds maximum entry count"
+            }
+            if ($name.Contains("`n") -or $name.Contains("`r")) {
+                Throw-InstallError "backup path is unsafe"
+            }
+            $item = Get-Item -LiteralPath $path -Force
+            if (Test-IsReparsePoint -Item $item) {
+                Throw-InstallError "durable backup must not contain a reparse point"
+            }
+            $childRelative = if ([string]::IsNullOrEmpty($Relative)) {
+                $name
+            } else {
+                $Relative + "\\" + $name
+            }
+            if ($item.PSIsContainer) {
+                Write-BackupManifestTree -Directory $item.FullName `
+                    -Relative $childRelative -Depth ($Depth + 1)
+            }
+            elseif (-not $item.PSIsContainer) {
+                $hash = Get-Sha256 -LiteralPath $item.FullName
+                $record = ("{0} 0 {1}`n{2}`n" -f
+                    $item.Length, $hash, $childRelative)
+                $script:ManifestUtf8Bytes += $script:Utf8NoBom.GetByteCount($record)
+                if ($script:ManifestUtf8Bytes -gt 33554432) {
+                    Throw-InstallError "durable backup manifest exceeds maximum size"
+                }
+                [void]$manifestText.Append($record)
+            }
+            else {
+                Throw-InstallError "durable backup contains a non-regular file"
+            }
+        }
+    }
+    Write-BackupManifestTree -Directory $script:FullBackupRoot -Relative "" -Depth 0
+    if ($script:ManifestUtf8Bytes -gt 33554432) {
+        Throw-InstallError "durable backup manifest is invalid"
+    }
+    $manifestPath = Join-Path $script:FullBackupRoot "MANIFEST.sha256"
+    $manifestStream = $null
+    $manifestWriter = $null
+    try {
+        $manifestStream = [IO.File]::Open(
+            $manifestPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write,
+            [IO.FileShare]::None)
+        $manifestWriter = New-Object IO.StreamWriter($manifestStream, $script:Utf8NoBom, 4096, $true)
+        $manifestWriter.Write($manifestText.ToString())
+        $manifestWriter.Flush()
+        $manifestStream.Flush($true)
+    }
+    finally {
+        if ($null -ne $manifestWriter) { $manifestWriter.Dispose() }
+        if ($null -ne $manifestStream) { $manifestStream.Dispose() }
+    }
+    $script:FullBackupManifestSha256 = Get-Sha256 -LiteralPath $manifestPath
     Write-TestTrace -EventName "backup.home.created"
+}
+
+function Select-ActiveAdapter {
+    if ([string]::IsNullOrWhiteSpace($script:ActiveAdapter) -or
+        [string]::IsNullOrWhiteSpace($script:ActiveInstructionFile)) {
+        Throw-InstallError (
+            "AOPMEM_ACTIVE_ADAPTER and AOPMEM_ACTIVE_INSTRUCTION_FILE are required")
+    }
+    $expectedInstructionFile = $null
+    switch -CaseSensitive ($script:ActiveAdapter) {
+        "codex" { $expectedInstructionFile = "AGENTS.md"; break }
+        "claude" { $expectedInstructionFile = "CLAUDE.md"; break }
+        "cursor" { $expectedInstructionFile = ".cursor/rules/aopmem.mdc"; break }
+        "copilot" { $expectedInstructionFile = ".github/copilot-instructions.md"; break }
+        default { Throw-InstallError "unsupported active adapter: $script:ActiveAdapter" }
+    }
+    if ($script:ActiveInstructionFile -cne $expectedInstructionFile) {
+        Throw-InstallError "active adapter instruction file does not match the selected adapter"
+    }
+    Write-TestTrace -EventName ("adapter.selected.{0}" -f $script:ActiveAdapter)
+}
+
+function Invoke-StagedJson {
+    param(
+        [Parameter(Mandatory = $true)][string]$Context,
+        [Parameter(Mandatory = $true)][string[]]$Arguments
+    )
+    if ($script:TestMode -and $script:TestFailAt -eq "publish" -and
+        $Context -eq "upgrade publish") {
+        Throw-InstallError "injected native upgrade publish failure"
+    }
+    $result = Invoke-AopmemJson -Executable $script:DownloadedBinary `
+        -Arguments $Arguments -Context $Context
+    if (-not [bool]$result.ok) {
+        Throw-InstallError "$Context did not report success"
+    }
+    return $result
+}
+
+function Invoke-UpgradeAdopt {
+    Write-TestTrace -EventName "upgrade.backup.adopt"
+    $null = Invoke-StagedJson -Context "upgrade backup adopt" -Arguments @(
+        "upgrade", "backup", "--adopt", $script:FullBackupRoot,
+        "--manifest-sha256", $script:FullBackupManifestSha256, "--json")
+}
+
+function Invoke-UpgradeStage {
+    Write-TestTrace -EventName "upgrade.stage"
+    $null = Invoke-StagedJson -Context "upgrade stage" -Arguments @(
+        "upgrade", "stage", "--artifact", $script:DownloadedBinary,
+        "--sha256", $script:VerifiedBinaryHash, "--json")
+    $script:RecoveryBinary = Join-Path $script:InstallDir (
+        ".aopmem-v{0}.staged" -f $script:ProductVersion)
+    $script:RecoveryBinaryOwned = $false
+}
+
+function Invoke-StagedPlatformCheck {
+    Write-TestTrace -EventName "platform.check.staged"
+    $null = Invoke-StagedJson -Context "staged platform check" -Arguments @(
+        "platform", "check", "--json")
+}
+
+function Invoke-AuditRepair {
+    param(
+        [Parameter(Mandatory = $true)][string]$Phase,
+        [Parameter(Mandatory = $true)][string]$Executable
+    )
+    Write-TestTrace -EventName ("audit.repair.{0}" -f $Phase)
+    $result = Invoke-AopmemJson -Executable $Executable `
+        -Arguments @("audit", "repair", "--all-workspaces", "--json") `
+        -Context ("audit repair " + $Phase)
+    if (-not [bool]$result.ok) {
+        Throw-InstallError "audit repair $Phase did not report success"
+    }
+}
+
+function Invoke-AdapterSync {
+    Write-TestTrace -EventName "adapter.sync"
+    $result = Invoke-AopmemJson -Executable $script:InstalledBinary `
+        -Arguments @("adapter", "sync", "--file", $script:ActiveInstructionFile, "--json") `
+        -Context "adapter sync"
+    if (-not [bool]$result.ok) {
+        Throw-InstallError "adapter sync did not report success"
+    }
+}
+
+function Invoke-DebugCapsuleExport {
+    $directory = Join-Path $script:AopmemHome "debug-capsules"
+    $existing = Get-ExistingPathItem -LiteralPath $directory
+    if ($null -ne $existing -and
+        ($existing -isnot [IO.DirectoryInfo] -or (Test-IsReparsePoint -Item $existing))) {
+        Throw-InstallError "debug capsule directory must be a real directory"
+    }
+    [IO.Directory]::CreateDirectory($directory) | Out-Null
+    $verified = Get-ExistingPathItem -LiteralPath $directory
+    if ($null -eq $verified -or $verified -isnot [IO.DirectoryInfo] -or
+        (Test-IsReparsePoint -Item $verified)) {
+        Throw-InstallError "debug capsule directory changed during validation"
+    }
+    $output = Join-Path $directory (
+        "upgrade-{0}.zip" -f [Diagnostics.Process]::GetCurrentProcess().Id)
+    Write-TestTrace -EventName "debug.capsule.export"
+    $result = Invoke-AopmemJson -Executable $script:InstalledBinary `
+        -Arguments @("observe", "export", "--output", $output, "--json") `
+        -Context "debug capsule export"
+    if (-not [bool]$result.ok) {
+        Throw-InstallError "debug capsule export did not report success"
+    }
 }
 
 function Test-OldBinaryUnchanged {
@@ -594,18 +832,22 @@ function Invoke-UpgradeApply {
             "upgrade", "apply", "--all-workspaces", "--json", "--approved", "+++") `
         -Context "upgrade apply"
     if (-not [bool]$apply.ok -or
-        -not [bool]$apply.data.success -or
-        [bool]$apply.data.binary_replaced) {
+        $apply.data.journal_phase -cne "applied" -or
+        -not [bool]$apply.data.apply_invoked) {
         [Console]::Error.WriteLine("AOPMem upgrade apply unsuccessful JSON report:")
         [Console]::Error.WriteLine($script:LastAopmemJsonText)
         Throw-InstallError "upgrade apply did not report success"
     }
+    $applyDetails = Get-OptionalJsonProperty -Object $apply.data -Name "apply"
     $script:UpgradeBackupRoot = [string](
-        Get-OptionalJsonProperty -Object $apply.data -Name "backup_root")
+        Get-OptionalJsonProperty -Object $applyDetails -Name "backup_root")
     Write-TestTrace -EventName "upgrade.apply.health.ok"
 }
 
 function Publish-VerifiedBinary {
+    if ($script:Mode -ne "fresh") {
+        Throw-InstallError "installer binary publish is allowed only for a fresh install"
+    }
     if ($script:TestMode -and $script:TestFailAt -eq "publish") {
         Throw-InstallError "injected atomic replacement failure"
     }
@@ -621,16 +863,7 @@ function Publish-VerifiedBinary {
         $script:VerifiedBinaryHash) {
         Throw-InstallError "same-directory publish files changed before atomic replacement"
     }
-    if ($script:Mode -eq "update") {
-        [IO.File]::Replace(
-            $script:InstallStage,
-            $script:InstalledBinary,
-            $null,
-            $true)
-    }
-    else {
-        [IO.File]::Move($script:InstallStage, $script:InstalledBinary)
-    }
+    [IO.File]::Move($script:InstallStage, $script:InstalledBinary)
     $script:InstallStage = $null
     $script:InstallStageOwned = $false
     $script:BinaryPublished = $true
@@ -655,7 +888,7 @@ function Invoke-CurrentWorkspaceHealth {
     Write-TestTrace -EventName "adapter.status"
     $adapterStatus = Invoke-AopmemJson `
         -Executable $script:InstalledBinary `
-        -Arguments @("adapter", "status", "--json") `
+        -Arguments @("adapter", "status", "--file", $script:ActiveInstructionFile, "--json") `
         -Context "adapter status"
     if (-not [bool]$adapterStatus.ok) {
         Throw-InstallError "adapter status did not report success"
@@ -676,11 +909,23 @@ function Invoke-CurrentWorkspaceHealth {
     if (-not [bool]$verify.ok -or -not [bool]$verify.data.clean) {
         Throw-InstallError "verify did not report clean state"
     }
-    Write-TestTrace -EventName "recall"
-    $recall = Invoke-AopmemJson `
-        -Executable $script:InstalledBinary `
-        -Arguments @("recall", "--json") `
-        -Context "recall"
+    Write-TestTrace -EventName "task.start.smoke"
+    $taskStart = "RC5 installer task-start smoke" | & $script:InstalledBinary `
+        task start --query-stdin --json
+    $taskExit = $LASTEXITCODE
+    try {
+        $taskStart = ([string]::Join([Environment]::NewLine, [string[]]$taskStart) |
+            ConvertFrom-Json -ErrorAction Stop)
+    }
+    catch {
+        Throw-InstallError "task-start smoke returned invalid JSON"
+    }
+    if ($taskExit -ne 0 -or -not [bool]$taskStart.ok -or
+        -not [bool]$taskStart.data.mandatory_context_complete -or
+        [string]::IsNullOrWhiteSpace([string]$taskStart.data.bundle_id) -or
+        [string]::IsNullOrWhiteSpace([string]$taskStart.data.memory_revision)) {
+        Throw-InstallError "task-start smoke did not return a complete bound receipt"
+    }
     Write-TestTrace -EventName "observe.status"
     $observeStatus = Invoke-AopmemJson `
         -Executable $script:InstalledBinary `
@@ -691,7 +936,7 @@ function Invoke-CurrentWorkspaceHealth {
         -Executable $script:InstalledBinary `
         -Arguments @("observe", "report", "--json") `
         -Context "observe report"
-    foreach ($result in @($recall, $observeStatus, $observeReport)) {
+    foreach ($result in @($taskStart, $observeStatus, $observeReport)) {
         if (-not [bool]$result.ok) {
             Throw-InstallError "post-update workspace check did not report success"
         }
@@ -702,7 +947,7 @@ function Invoke-CurrentWorkspaceHealth {
         Throw-InstallError "doctor did not report current workspace key"
     }
     foreach ($result in @(
-            $adapterStatus, $verify, $recall, $observeStatus, $observeReport)) {
+            $adapterStatus, $verify, $taskStart, $observeStatus, $observeReport)) {
         $resultWorkspaceKey = [string](
             Get-OptionalJsonProperty -Object $result.meta -Name "workspace_key")
         if ($resultWorkspaceKey -cne $workspaceKey) {
@@ -715,7 +960,7 @@ function Invoke-FreshAdapterSeed {
     Write-TestTrace -EventName "adapter.seed"
     $adapter = Invoke-AopmemJson `
         -Executable $script:InstalledBinary `
-        -Arguments @("adapter", "seed", "--json") `
+        -Arguments @("adapter", "seed", "--file", $script:ActiveInstructionFile, "--json") `
         -Context "fresh managed adapter seed"
     if (-not [bool]$adapter.ok) {
         Throw-InstallError "fresh managed adapter seed did not report success"
@@ -750,6 +995,7 @@ try {
         $windowsVersion.Build -lt 22000) {
         Throw-InstallError "unsupported platform: Windows 11 x64 native PowerShell is required"
     }
+    Select-ActiveAdapter
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     $null = & "$env:SystemRoot\System32\chcp.com" 65001
     if ($LASTEXITCODE -ne 0) {
@@ -785,10 +1031,19 @@ try {
             Throw-InstallError "installed binary path is not a regular file: $script:InstalledBinary"
         }
         $installedVersion = Get-AopmemVersion -Executable $script:InstalledBinary
-        if ($installedVersion -cne "aopmem $script:OldBinaryVersion") {
+        if ($installedVersion -cnotin @(
+                "aopmem 0.1.0",
+                "aopmem 0.2.0-rc1",
+                "aopmem 0.2.0-rc2",
+                "aopmem 0.2.0-rc3",
+                "aopmem 0.2.0-rc4")) {
             Throw-InstallError "existing version is unsupported: $installedVersion"
         }
-        $expectedOldHash = $script:OldBinarySha256
+        $script:OldReleaseLabel = $installedVersion.Substring("aopmem ".Length)
+        $expectedOldHash = $null
+        if ($installedVersion -ceq "aopmem $script:OldBinaryVersion") {
+            $expectedOldHash = $script:OldBinarySha256
+        }
         if ($script:TestMode) {
             $expectedOldHash = $env:AOPMEM_INSTALL_TEST_OLD_BINARY_SHA256
         }
@@ -845,14 +1100,27 @@ try {
     Write-TestTrace -EventName "binary.version.verified"
 
     if ($script:Mode -eq "update") {
-        Prepare-PublishFiles
+        Invoke-UpgradeAdopt
+        Invoke-UpgradeStage
+        Invoke-StagedPlatformCheck
+        Invoke-AuditRepair -Phase "staged" -Executable $script:DownloadedBinary
         Invoke-UpgradePrepare
         Invoke-UpgradePlan
         Invoke-UpgradeApply
-        Publish-VerifiedBinary
+        Write-TestTrace -EventName "upgrade.publish"
+        $publish = Invoke-StagedJson -Context "upgrade publish" -Arguments @(
+            "upgrade", "publish", "--json")
+        if ($publish.data.journal_phase -cne "published" -or
+            -not [bool]$publish.data.binary_published) {
+            Throw-InstallError "upgrade publish did not confirm the published binary"
+        }
+        $script:BinaryPublished = $true
+        Invoke-AdapterSync
+        Invoke-AuditRepair -Phase "post-publish" -Executable $script:InstalledBinary
         Invoke-CurrentWorkspaceHealth
+        Invoke-DebugCapsuleExport
         [Console]::Out.WriteLine(
-            "AOPMem {0} updated. doctor=ok verify=ok recall=ok observability=ok full_backup={1} binary_backup={2} upgrade_backup={3}" -f
+            "AOPMem {0} updated. doctor=ok verify=ok task_start=ok observability=ok full_backup={1} binary_backup={2} upgrade_backup={3}" -f
                 $script:ProductVersion,
                 $script:FullBackupRoot,
                 $script:BackupPath,
@@ -868,8 +1136,9 @@ try {
         }
         Invoke-FreshAdapterSeed
         Invoke-CurrentWorkspaceHealth
+        Invoke-DebugCapsuleExport
         [Console]::Out.WriteLine(
-            "AOPMem {0} installed. doctor=ok verify=ok recall=ok observability=ok" -f
+            "AOPMem {0} installed. doctor=ok verify=ok task_start=ok observability=ok" -f
                 $script:ProductVersion)
     }
     $script:InstallSucceeded = $true

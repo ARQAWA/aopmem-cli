@@ -1,6 +1,8 @@
 use rusqlite::{params, Transaction, TransactionBehavior};
 use serde::Serialize;
+use std::collections::{BTreeMap, BTreeSet};
 
+use crate::redaction::TaggedValueRedactor;
 use crate::storage::{self, WorkspacePaths};
 
 pub(crate) use crate::observability::ui::{ActivityQuery, BundleQuery};
@@ -142,10 +144,10 @@ struct ApiErrorDetail {
 }
 
 #[derive(Debug, Serialize)]
-pub(crate) struct BootstrapResponse<'a> {
+pub(crate) struct BootstrapResponse {
     pub(crate) api_version: &'static str,
-    pub(crate) product_version: &'static str,
-    pub(crate) workspace_key: &'a str,
+    pub(crate) product_version: String,
+    pub(crate) workspace_key: String,
     pub(crate) read_only: bool,
     pub(crate) capabilities: &'static [&'static str],
     pub(crate) observability_available: bool,
@@ -221,9 +223,9 @@ pub(crate) struct McpQuery {
 }
 
 #[derive(Serialize)]
-pub(crate) struct OverviewResponse<'a> {
-    product_version: &'static str,
-    workspace: &'a str,
+pub(crate) struct OverviewResponse {
+    product_version: String,
+    workspace: String,
     read_only: bool,
     observability_available: bool,
     observability: crate::observability::ui::OverviewObservability,
@@ -298,10 +300,34 @@ pub(crate) struct GraphResponse {
 #[derive(Serialize)]
 pub(crate) struct ToolsResponse {
     limit: usize,
-    items: Vec<crate::observability::export::ToolSummaryItem>,
+    items: Vec<UiToolItem>,
     more_results: bool,
     next_cursor: Option<String>,
     complete: bool,
+    duplicate_analysis_complete: bool,
+}
+
+#[derive(Serialize)]
+struct UiToolItem {
+    #[serde(flatten)]
+    summary: crate::observability::export::ToolSummaryItem,
+    canonical_tool_id: String,
+    aliases: Vec<String>,
+    duplicate_classifications: Vec<UiToolDuplicateClassification>,
+    superseded_duplicate: bool,
+    superseded_duplicates: Vec<String>,
+    unresolved_overlaps: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct UiToolDuplicateClassification {
+    other_tool_id: String,
+    classification: crate::tools::ToolDuplicateClass,
+}
+
+struct AliasEvidence {
+    alias: String,
+    source: String,
 }
 
 #[derive(Serialize)]
@@ -313,36 +339,38 @@ pub(crate) struct McpResponse {
     complete: bool,
 }
 
-pub(crate) fn bootstrap(context: &UiDataContext) -> Result<BootstrapResponse<'_>, ApiError> {
+pub(crate) fn bootstrap(context: &UiDataContext) -> Result<BootstrapResponse, ApiError> {
     let observability_available =
         match crate::observability::ui::availability(context.workspace_paths()) {
             Ok(crate::observability::ui::UiObservabilityAvailability::Missing) => false,
             Ok(crate::observability::ui::UiObservabilityAvailability::Present) => true,
             Err(_) => return Err(ApiError::data_unavailable()),
         };
-    Ok(BootstrapResponse {
-        api_version: UI_API_VERSION,
-        product_version: env!("CARGO_PKG_VERSION"),
-        workspace_key: context.workspace_key(),
-        read_only: true,
-        capabilities: UI_CAPABILITIES,
-        observability_available,
+    with_operational_read(context, |_transaction, redactor| {
+        Ok(BootstrapResponse {
+            api_version: UI_API_VERSION,
+            product_version: redact_ui_text(env!("CARGO_PKG_VERSION"), redactor)?,
+            workspace_key: redact_ui_text(context.workspace_key(), redactor)?,
+            read_only: true,
+            capabilities: UI_CAPABILITIES,
+            observability_available,
+        })
     })
 }
 
-pub(crate) fn overview(context: &UiDataContext) -> Result<OverviewResponse<'_>, ApiError> {
+pub(crate) fn overview(context: &UiDataContext) -> Result<OverviewResponse, ApiError> {
     let observability =
         crate::observability::ui::overview(context.workspace_paths(), context.workspace_key())
             .map_err(map_observability_error)?;
     let observability_available = observability.is_available();
-    with_operational_read(context, |transaction| {
+    with_operational_read(context, |transaction, redactor| {
         let memory = crate::observability::export::build_memory_summary_header(transaction)
             .map_err(|_| ApiError::data_unavailable())?;
         let tool_count = scalar_count(transaction, "SELECT COUNT(*) FROM tool_contracts")?;
         let mcp_count = scalar_count(transaction, "SELECT COUNT(*) FROM mcp_profiles")?;
         Ok(OverviewResponse {
-            product_version: env!("CARGO_PKG_VERSION"),
-            workspace: context.workspace_key(),
+            product_version: redact_ui_text(env!("CARGO_PKG_VERSION"), redactor)?,
+            workspace: redact_ui_text(context.workspace_key(), redactor)?,
             read_only: true,
             observability_available,
             observability,
@@ -401,7 +429,9 @@ pub(crate) fn tools(
         query.side_effects.as_deref().unwrap_or("")
     );
     let after_id = decode_numeric_cursor(query.cursor.as_deref(), "tools", &scope)?;
-    with_operational_read(context, |transaction| {
+    with_operational_read(context, |transaction, redactor| {
+        let duplicate_plan =
+            crate::tools::plan_tool_deduplication(context.workspace_paths(), transaction).ok();
         let (sql, parameters) = tools_page_sql(after_id, query, fetch_limit(query.limit)?);
         let mut statement = transaction
             .prepare(&sql)
@@ -409,9 +439,15 @@ pub(crate) fn tools(
         let mut rows = statement
             .query(rusqlite::params_from_iter(parameters))
             .map_err(|_| ApiError::data_unavailable())?;
-        let mut items = Vec::new();
+        let mut raw_items = Vec::new();
         while let Some(row) = rows.next().map_err(|_| ApiError::data_unavailable())? {
-            let summary = crate::observability::export::tool_summary_from_row(row)
+            let raw_tool_id = row
+                .get::<_, String>(0)
+                .map_err(|_| ApiError::data_unavailable())?;
+            let raw_status = row
+                .get::<_, String>(2)
+                .map_err(|_| ApiError::data_unavailable())?;
+            let summary = crate::observability::export::tool_summary_from_row(row, redactor)
                 .map_err(|_| ApiError::data_unavailable())?;
             let cursor_id = row
                 .get::<_, i64>(6)
@@ -419,24 +455,276 @@ pub(crate) fn tools(
             if cursor_id <= 0 {
                 return Err(ApiError::data_unavailable());
             }
-            items.push((cursor_id, summary));
+            raw_items.push((cursor_id, raw_tool_id, raw_status, summary));
         }
-        let more_results = items.len() > query.limit;
-        items.truncate(query.limit);
+        let more_results = raw_items.len() > query.limit;
+        raw_items.truncate(query.limit);
         let next_cursor = if more_results {
-            let id = items.last().ok_or_else(ApiError::data_unavailable)?.0;
+            let id = raw_items.last().ok_or_else(ApiError::data_unavailable)?.0;
             Some(encode_numeric_cursor("tools", &scope, id)?)
         } else {
             None
         };
+        let raw_ids = raw_items
+            .iter()
+            .map(|(_, tool_id, _, _)| tool_id.clone())
+            .collect::<Vec<_>>();
+        let aliases_by_canonical = load_aliases_for_canonical_ids(transaction, &raw_ids)?;
+        let exact_alias_ids = aliases_by_canonical
+            .values()
+            .flatten()
+            .filter(|alias| alias.source == "exact_only_dedupe")
+            .map(|alias| alias.alias.clone())
+            .collect::<Vec<_>>();
+        let verified_superseded =
+            load_tool_ids_with_status(transaction, &exact_alias_ids, "superseded")?;
+        let canonical_by_direct_alias = load_direct_alias_targets(transaction, &raw_ids)?;
+        let mut items = Vec::with_capacity(raw_items.len());
+        for (_, raw_tool_id, raw_status, summary) in raw_items {
+            let canonical_id = canonical_by_direct_alias
+                .get(&raw_tool_id)
+                .cloned()
+                .unwrap_or_else(|| raw_tool_id.clone());
+            let alias_rows = aliases_by_canonical
+                .get(&raw_tool_id)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let aliases = alias_rows
+                .iter()
+                .map(|alias| redact_ui_text(&alias.alias, redactor))
+                .collect::<Result<Vec<_>, _>>()?;
+            let superseded_duplicates = alias_rows
+                .iter()
+                .filter(|alias| {
+                    alias.source == "exact_only_dedupe"
+                        && verified_superseded.contains(&alias.alias)
+                })
+                .map(|alias| redact_ui_text(&alias.alias, redactor))
+                .collect::<Result<Vec<_>, _>>()?;
+            let (duplicate_classifications, unresolved_overlaps) =
+                tool_duplicate_facts(duplicate_plan.as_ref(), &raw_tool_id, redactor)?;
+            items.push(UiToolItem {
+                summary,
+                canonical_tool_id: redact_ui_text(&canonical_id, redactor)?,
+                aliases,
+                duplicate_classifications,
+                superseded_duplicate: raw_status == "superseded"
+                    && canonical_by_direct_alias.contains_key(&raw_tool_id),
+                superseded_duplicates,
+                unresolved_overlaps,
+            });
+        }
         Ok(ToolsResponse {
             limit: query.limit,
-            items: items.into_iter().map(|(_, item)| item).collect(),
+            items,
             more_results,
             next_cursor,
-            complete: !more_results,
+            complete: !more_results && duplicate_plan.is_some(),
+            duplicate_analysis_complete: duplicate_plan.is_some(),
         })
     })
+}
+
+fn load_aliases_for_canonical_ids(
+    transaction: &Transaction<'_>,
+    canonical_ids: &[String],
+) -> Result<BTreeMap<String, Vec<AliasEvidence>>, ApiError> {
+    let mut grouped = canonical_ids
+        .iter()
+        .map(|tool_id| (tool_id.clone(), Vec::new()))
+        .collect::<BTreeMap<_, _>>();
+    if canonical_ids.is_empty() {
+        return Ok(grouped);
+    }
+    if canonical_ids.len() > MAX_PAGE_SIZE {
+        return Err(ApiError::data_unavailable());
+    }
+    let placeholders = (1..=canonical_ids.len())
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let limit_parameter = canonical_ids.len() + 1;
+    let sql = format!(
+        "SELECT alias, canonical_tool_id, source
+         FROM tool_aliases
+         WHERE status = 'active' AND canonical_tool_id IN ({placeholders})
+         ORDER BY canonical_tool_id, alias
+         LIMIT ?{limit_parameter}"
+    );
+    let mut parameters = canonical_ids
+        .iter()
+        .cloned()
+        .map(rusqlite::types::Value::Text)
+        .collect::<Vec<_>>();
+    parameters.push(rusqlite::types::Value::Integer(
+        i64::try_from(crate::tools::MAX_TOOL_ALIAS_PAGE_SIZE + 1)
+            .map_err(|_| ApiError::data_unavailable())?,
+    ));
+    let mut statement = transaction
+        .prepare(&sql)
+        .map_err(|_| ApiError::data_unavailable())?;
+    let rows = statement
+        .query_map(rusqlite::params_from_iter(parameters), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|_| ApiError::data_unavailable())?;
+    let mut count = 0_usize;
+    for row in rows {
+        let (alias, canonical, source) = row.map_err(|_| ApiError::data_unavailable())?;
+        count = count
+            .checked_add(1)
+            .ok_or_else(ApiError::data_unavailable)?;
+        if count > crate::tools::MAX_TOOL_ALIAS_PAGE_SIZE
+            || !valid_tool_identity(&alias)
+            || !valid_tool_identity(&canonical)
+            || source.is_empty()
+            || source.len() > crate::tools::MAX_TOOL_ALIAS_SOURCE_BYTES
+            || source.as_bytes().contains(&0)
+        {
+            return Err(ApiError::data_unavailable());
+        }
+        grouped
+            .get_mut(&canonical)
+            .ok_or_else(ApiError::data_unavailable)?
+            .push(AliasEvidence { alias, source });
+    }
+    Ok(grouped)
+}
+
+fn load_tool_ids_with_status(
+    transaction: &Transaction<'_>,
+    tool_ids: &[String],
+    status: &str,
+) -> Result<BTreeSet<String>, ApiError> {
+    if tool_ids.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    if tool_ids.len() > crate::tools::MAX_TOOL_ALIAS_PAGE_SIZE
+        || !storage::ALLOWED_NODE_STATUSES.contains(&status)
+    {
+        return Err(ApiError::data_unavailable());
+    }
+    let placeholders = (1..=tool_ids.len())
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let status_parameter = tool_ids.len() + 1;
+    let sql = format!(
+        "SELECT tool_id FROM tool_contracts
+         WHERE tool_id IN ({placeholders}) AND status = ?{status_parameter}
+         ORDER BY tool_id"
+    );
+    let mut parameters = tool_ids
+        .iter()
+        .cloned()
+        .map(rusqlite::types::Value::Text)
+        .collect::<Vec<_>>();
+    parameters.push(rusqlite::types::Value::Text(status.to_string()));
+    let mut statement = transaction
+        .prepare(&sql)
+        .map_err(|_| ApiError::data_unavailable())?;
+    let rows = statement
+        .query_map(rusqlite::params_from_iter(parameters), |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(|_| ApiError::data_unavailable())?;
+    let mut result = BTreeSet::new();
+    for row in rows {
+        let tool_id = row.map_err(|_| ApiError::data_unavailable())?;
+        if !valid_tool_identity(&tool_id) || !result.insert(tool_id) {
+            return Err(ApiError::data_unavailable());
+        }
+    }
+    Ok(result)
+}
+
+fn load_direct_alias_targets(
+    transaction: &Transaction<'_>,
+    tool_ids: &[String],
+) -> Result<BTreeMap<String, String>, ApiError> {
+    if tool_ids.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    if tool_ids.len() > MAX_PAGE_SIZE {
+        return Err(ApiError::data_unavailable());
+    }
+    let placeholders = (1..=tool_ids.len())
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT alias, canonical_tool_id
+         FROM tool_aliases
+         WHERE status = 'active' AND alias IN ({placeholders})
+         ORDER BY alias"
+    );
+    let mut statement = transaction
+        .prepare(&sql)
+        .map_err(|_| ApiError::data_unavailable())?;
+    let rows = statement
+        .query_map(rusqlite::params_from_iter(tool_ids), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|_| ApiError::data_unavailable())?;
+    let mut targets = BTreeMap::new();
+    for row in rows {
+        let (alias, canonical) = row.map_err(|_| ApiError::data_unavailable())?;
+        if !valid_tool_identity(&alias)
+            || !valid_tool_identity(&canonical)
+            || targets.insert(alias, canonical).is_some()
+        {
+            return Err(ApiError::data_unavailable());
+        }
+    }
+    Ok(targets)
+}
+
+fn tool_duplicate_facts(
+    plan: Option<&crate::tools::ToolDedupePlan>,
+    tool_id: &str,
+    redactor: &TaggedValueRedactor,
+) -> Result<(Vec<UiToolDuplicateClassification>, Vec<String>), ApiError> {
+    let Some(plan) = plan else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let mut classifications = Vec::new();
+    let mut unresolved = BTreeSet::new();
+    for comparison in &plan.comparisons {
+        let other = if comparison.canonical_tool_id == tool_id {
+            Some(comparison.candidate_tool_id.as_str())
+        } else if comparison.candidate_tool_id == tool_id {
+            Some(comparison.canonical_tool_id.as_str())
+        } else {
+            None
+        };
+        let Some(other) = other else {
+            continue;
+        };
+        let other = redact_ui_text(other, redactor)?;
+        if comparison.class == crate::tools::ToolDuplicateClass::PossibleOverlap {
+            unresolved.insert(other.clone());
+        }
+        classifications.push(UiToolDuplicateClassification {
+            other_tool_id: other,
+            classification: comparison.class,
+        });
+    }
+    classifications.sort_by(|left, right| {
+        left.other_tool_id
+            .cmp(&right.other_tool_id)
+            .then_with(|| left.classification.cmp(&right.classification))
+    });
+    Ok((classifications, unresolved.into_iter().collect()))
+}
+
+fn valid_tool_identity(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= crate::tools::MAX_TOOL_ID_BYTES
+        && !value.as_bytes().contains(&0)
 }
 
 pub(crate) fn mcp(context: &UiDataContext, query: &McpQuery) -> Result<McpResponse, ApiError> {
@@ -465,7 +753,7 @@ pub(crate) fn mcp(context: &UiDataContext, query: &McpQuery) -> Result<McpRespon
     }) {
         return Err(ApiError::invalid_cursor());
     }
-    with_operational_read(context, |transaction| {
+    with_operational_read(context, |transaction, redactor| {
         let (sql, parameters) = mcp_page_sql(after_id.as_deref(), query, fetch_limit(query.limit)?);
         let mut statement = transaction
             .prepare(&sql)
@@ -478,7 +766,7 @@ pub(crate) fn mcp(context: &UiDataContext, query: &McpQuery) -> Result<McpRespon
             let cursor_id = row
                 .get::<_, String>(0)
                 .map_err(|_| ApiError::data_unavailable())?;
-            let summary = crate::observability::export::mcp_summary_from_row(row)
+            let summary = crate::observability::export::mcp_summary_from_row(row, redactor)
                 .map_err(|_| ApiError::data_unavailable())?;
             items.push((cursor_id, summary));
         }
@@ -505,8 +793,8 @@ pub(crate) fn memory(
     query: &MemoryQuery,
 ) -> Result<MemoryResponse, ApiError> {
     validate_memory_query(query, MAX_PAGE_SIZE)?;
-    with_operational_read(context, |transaction| {
-        let page = load_memory_page(transaction, query, "memory")?;
+    with_operational_read(context, |transaction, redactor| {
+        let page = load_memory_page(transaction, query, "memory", redactor)?;
         Ok(MemoryResponse {
             limit: query.limit,
             items: page.items,
@@ -522,11 +810,12 @@ pub(crate) fn node(context: &UiDataContext, node_id: i64) -> Result<NodeResponse
     if node_id <= 0 {
         return Err(ApiError::bad_request());
     }
-    with_operational_read(context, |transaction| {
-        let node = storage::get_node(transaction, node_id)
+    with_operational_read(context, |transaction, redactor| {
+        let mut node = storage::get_node(transaction, node_id)
             .map_err(|_| ApiError::data_unavailable())?
             .ok_or_else(ApiError::node_not_found)?;
         validate_full_node(&node)?;
+        redact_node(&mut node, redactor)?;
         Ok(NodeResponse { node })
     })
 }
@@ -545,7 +834,7 @@ pub(crate) fn node_links(
         query.direction.as_str()
     );
     let after_id = decode_numeric_cursor(query.cursor.as_deref(), "node-links", &scope)?;
-    with_operational_read(context, |transaction| {
+    with_operational_read(context, |transaction, redactor| {
         if storage::get_node(transaction, query.node_id)
             .map_err(|_| ApiError::data_unavailable())?
             .is_none()
@@ -598,6 +887,9 @@ pub(crate) fn node_links(
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|_| ApiError::data_unavailable())?;
         validate_links(items.iter().map(|item| &item.link))?;
+        for item in &mut items {
+            redact_link(&mut item.link, redactor)?;
+        }
         let more_results = items.len() > query.limit;
         items.truncate(query.limit);
         let next_cursor = if more_results {
@@ -636,7 +928,7 @@ pub(crate) fn graph(
     if query.center.is_some_and(|center| center <= 0) {
         return Err(ApiError::bad_request());
     }
-    with_operational_read(context, |transaction| {
+    with_operational_read(context, |transaction, redactor| {
         // Read once before cursor decoding so read and not-found errors keep precedence.
         let stored_center_node = query
             .center
@@ -647,11 +939,13 @@ pub(crate) fn graph(
             })
             .transpose()?;
         let page = match query.center {
-            Some(center) => load_center_graph_page(transaction, query, center)?,
-            None => load_memory_page(transaction, &memory_query, "graph")?,
+            Some(center) => load_center_graph_page(transaction, query, center, redactor)?,
+            None => load_memory_page(transaction, &memory_query, "graph", redactor)?,
         };
         // Keep semantic validation after page loading, matching the existing error order.
-        let center_node = stored_center_node.map(memory_list_item_from_node);
+        let center_node = stored_center_node
+            .map(|node| memory_list_item_from_node(node, redactor))
+            .transpose()?;
         if let Some(center_node) = center_node.as_ref() {
             validate_memory_items(std::slice::from_ref(center_node))?;
         }
@@ -661,7 +955,7 @@ pub(crate) fn graph(
                 node_ids.push(center);
             }
         }
-        let (edges, edges_more_results) = load_graph_edges(transaction, &node_ids)?;
+        let (edges, edges_more_results) = load_graph_edges(transaction, &node_ids, redactor)?;
         Ok(GraphResponse {
             center: query.center,
             center_node,
@@ -689,6 +983,7 @@ fn load_memory_page(
     transaction: &Transaction<'_>,
     query: &MemoryQuery,
     cursor_kind: &str,
+    redactor: &TaggedValueRedactor,
 ) -> Result<MemoryPage, ApiError> {
     let scope = memory_scope(query);
     let after_id = decode_numeric_cursor(query.cursor.as_deref(), cursor_kind, &scope)?;
@@ -710,6 +1005,9 @@ fn load_memory_page(
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(|_| ApiError::data_unavailable())?;
     validate_memory_items(&items)?;
+    for item in &mut items {
+        redact_memory_item(item, redactor)?;
+    }
     let more_results = items.len() > query.limit;
     items.truncate(query.limit);
     let next_cursor = if more_results {
@@ -834,6 +1132,7 @@ fn load_center_graph_page(
     transaction: &Transaction<'_>,
     query: &GraphQuery,
     center: i64,
+    redactor: &TaggedValueRedactor,
 ) -> Result<MemoryPage, ApiError> {
     let page_limit = query.limit.min(MAX_GRAPH_NODES.saturating_sub(1));
     let scope = format!(
@@ -879,6 +1178,9 @@ fn load_center_graph_page(
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(|_| ApiError::data_unavailable())?;
     validate_memory_items(&items)?;
+    for item in &mut items {
+        redact_memory_item(item, redactor)?;
+    }
     let more_results = items.len() > page_limit;
     items.truncate(page_limit);
     let next_cursor = if more_results {
@@ -948,8 +1250,11 @@ fn row_to_memory_list_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryLi
     })
 }
 
-fn memory_list_item_from_node(node: storage::Node) -> MemoryListItem {
-    MemoryListItem {
+fn memory_list_item_from_node(
+    node: storage::Node,
+    redactor: &TaggedValueRedactor,
+) -> Result<MemoryListItem, ApiError> {
+    let mut item = MemoryListItem {
         id: node.id,
         node_type: node.node_type,
         status: node.status,
@@ -960,12 +1265,15 @@ fn memory_list_item_from_node(node: storage::Node) -> MemoryListItem {
         trust_level: node.trust_level,
         created_at: node.created_at,
         updated_at: node.updated_at,
-    }
+    };
+    redact_memory_item(&mut item, redactor)?;
+    Ok(item)
 }
 
 fn load_graph_edges(
     transaction: &Transaction<'_>,
     node_ids: &[i64],
+    redactor: &TaggedValueRedactor,
 ) -> Result<(Vec<storage::Link>, bool), ApiError> {
     if node_ids.is_empty() {
         return Ok((Vec::new(), false));
@@ -1007,6 +1315,9 @@ fn load_graph_edges(
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(|_| ApiError::data_unavailable())?;
     validate_links(edges.iter())?;
+    for edge in &mut edges {
+        redact_link(edge, redactor)?;
+    }
     let more_results = edges.len() > MAX_GRAPH_EDGES;
     edges.truncate(MAX_GRAPH_EDGES);
     Ok((edges, more_results))
@@ -1023,18 +1334,70 @@ fn map_observability_error(error: crate::observability::ui::UiReadError) -> ApiE
 
 fn with_operational_read<T>(
     context: &UiDataContext,
-    operation: impl FnOnce(&Transaction<'_>) -> Result<T, ApiError>,
+    operation: impl FnOnce(&Transaction<'_>, &TaggedValueRedactor) -> Result<T, ApiError>,
 ) -> Result<T, ApiError> {
     let mut connection = storage::open_workspace_db_read_only(context.workspace_paths())
         .map_err(|_| ApiError::data_unavailable())?;
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Deferred)
         .map_err(|_| ApiError::data_unavailable())?;
-    let result = operation(&transaction)?;
+    let redactor =
+        TaggedValueRedactor::load(&transaction).map_err(|_| ApiError::data_unavailable())?;
+    let result = operation(&transaction, &redactor)?;
     transaction
         .commit()
         .map_err(|_| ApiError::data_unavailable())?;
     Ok(result)
+}
+
+fn redact_ui_text(value: &str, redactor: &TaggedValueRedactor) -> Result<String, ApiError> {
+    redactor
+        .redact_str(value)
+        .map_err(|_| ApiError::data_unavailable())
+}
+
+fn redact_optional_ui_text(
+    value: &mut Option<String>,
+    redactor: &TaggedValueRedactor,
+) -> Result<(), ApiError> {
+    if let Some(text) = value.as_mut() {
+        *text = redact_ui_text(text, redactor)?;
+    }
+    Ok(())
+}
+
+fn redact_memory_item(
+    item: &mut MemoryListItem,
+    redactor: &TaggedValueRedactor,
+) -> Result<(), ApiError> {
+    item.node_type = redact_ui_text(&item.node_type, redactor)?;
+    item.status = redact_ui_text(&item.status, redactor)?;
+    item.title = redact_ui_text(&item.title, redactor)?;
+    redact_optional_ui_text(&mut item.summary, redactor)?;
+    redact_optional_ui_text(&mut item.source_ref, redactor)?;
+    redact_optional_ui_text(&mut item.trust_level, redactor)?;
+    item.created_at = redact_ui_text(&item.created_at, redactor)?;
+    item.updated_at = redact_ui_text(&item.updated_at, redactor)?;
+    Ok(())
+}
+
+fn redact_node(node: &mut storage::Node, redactor: &TaggedValueRedactor) -> Result<(), ApiError> {
+    node.node_type = redact_ui_text(&node.node_type, redactor)?;
+    node.status = redact_ui_text(&node.status, redactor)?;
+    node.title = redact_ui_text(&node.title, redactor)?;
+    redact_optional_ui_text(&mut node.summary, redactor)?;
+    redact_optional_ui_text(&mut node.body, redactor)?;
+    redact_optional_ui_text(&mut node.source_ref, redactor)?;
+    redact_optional_ui_text(&mut node.trust_level, redactor)?;
+    node.created_at = redact_ui_text(&node.created_at, redactor)?;
+    node.updated_at = redact_ui_text(&node.updated_at, redactor)?;
+    Ok(())
+}
+
+fn redact_link(link: &mut storage::Link, redactor: &TaggedValueRedactor) -> Result<(), ApiError> {
+    link.link_type = redact_ui_text(&link.link_type, redactor)?;
+    link.created_at = redact_ui_text(&link.created_at, redactor)?;
+    Ok(())
 }
 
 fn scalar_count(transaction: &Transaction<'_>, sql: &str) -> Result<u64, ApiError> {
@@ -1365,5 +1728,49 @@ mod tests {
                 "MCP query must use {expected_index}, got: {plan}"
             );
         }
+    }
+
+    #[test]
+    fn tool_duplicate_facts_expose_factual_classes_and_unresolved_overlaps() {
+        let plan = crate::tools::ToolDedupePlan {
+            writes_performed: false,
+            scanned_tools: 3,
+            shortlisted_tools: 3,
+            shortlisted_pairs: 2,
+            hashed_files: 0,
+            comparisons: vec![
+                crate::tools::ToolDuplicateComparison {
+                    canonical_tool_id: "alpha".to_string(),
+                    candidate_tool_id: "beta".to_string(),
+                    class: crate::tools::ToolDuplicateClass::ExactDuplicate,
+                    exact_only_eligible: true,
+                    reasons: vec!["contract_identity".to_string()],
+                },
+                crate::tools::ToolDuplicateComparison {
+                    canonical_tool_id: "alpha".to_string(),
+                    candidate_tool_id: "gamma".to_string(),
+                    class: crate::tools::ToolDuplicateClass::PossibleOverlap,
+                    exact_only_eligible: false,
+                    reasons: vec!["shared_capability".to_string()],
+                },
+            ],
+        };
+
+        let (classifications, unresolved) =
+            tool_duplicate_facts(Some(&plan), "alpha", &TaggedValueRedactor::default())
+                .expect("bounded duplicate facts should render");
+
+        assert_eq!(classifications.len(), 2);
+        assert_eq!(
+            classifications[0].classification,
+            crate::tools::ToolDuplicateClass::ExactDuplicate
+        );
+        assert_eq!(classifications[0].other_tool_id, "beta");
+        assert_eq!(
+            classifications[1].classification,
+            crate::tools::ToolDuplicateClass::PossibleOverlap
+        );
+        assert_eq!(classifications[1].other_tool_id, "gamma");
+        assert_eq!(unresolved, vec!["gamma"]);
     }
 }

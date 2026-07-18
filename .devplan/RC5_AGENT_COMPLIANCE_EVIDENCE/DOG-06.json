@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "scenario_id": "DOG-06",
+  "scenario_kind": "smtp_api_discussion",
+  "parent_agent": "codex-exec:019f7535-9653-75f1-aea5-fcf54177e72d",
+  "keeper_agent": "codex-exec:019f7535-e818-72c2-be80-7204a0f0bf70",
+  "completion_agent": "codex-exec:019f7537-2a1e-7c40-8608-4eee6ffa8897",
+  "task": {
+    "task_id": "5a12c4a6-4630-4b1e-9212-ea89dd4ca130",
+    "bundle_id": "e5dec5b8-70f7-45aa-9b46-4af81f1d3ae1",
+    "workspace_key": "repo-fa31dced",
+    "mandatory_context_complete": true,
+    "retrieval_complete": true,
+    "budget_exhausted": false,
+    "applied_gate_ids": [2, 3, 10],
+    "applied_rule_ids": [11],
+    "selected_workflow_ids": [14],
+    "selected_tool_ids": [],
+    "apply_status": "applied",
+    "completion_result": "success"
+  },
+  "actions": [
+    {"seq": 1, "actor": "parent", "action": "instruction_read", "status": "ok"},
+    {"seq": 2, "actor": "parent", "action": "native_keeper_started", "status": "ok"},
+    {"seq": 3, "actor": "keeper", "action": "task_started", "status": "ok"},
+    {"seq": 4, "actor": "keeper", "action": "context_applied", "status": "ok"},
+    {"seq": 5, "actor": "parent", "action": "receipt_received", "status": "ok"},
+    {"seq": 6, "actor": "parent", "action": "smtp_api_discussion", "status": "ok"},
+    {"seq": 7, "actor": "parent", "action": "external_write_skipped", "status": "ok"},
+    {"seq": 8, "actor": "native_lifecycle_closer", "action": "task_completed", "status": "ok"}
+  ],
+  "checks": {
+    "start_before_substantive_action": true,
+    "apply_before_substantive_action": true,
+    "mandatory_gate_applied": true,
+    "relevant_workflow_or_tool_selected": true,
+    "project_file_read_after_receipt": null,
+    "user_reminders_required": 0,
+    "duplicate_tools_created": 0,
+    "blanket_secret_refusals": 0,
+    "external_calls": 0,
+    "external_writes": 0
+  },
+  "final_answer_summary": "Proposed a dry-run, allowlisted sandbox SMTP API design and performed no send or external write."
+}

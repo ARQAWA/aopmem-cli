@@ -1,0 +1,36 @@
+{
+  "harness": "src/tools/mod.rs::tests::stage_026_alias_resolution_benchmark",
+  "method_scope": "in-process; do not compare with CLI wall-clock rows",
+  "results": [
+    {
+      "active_tools": 16,
+      "corpus": "small",
+      "median_ns": 56167,
+      "method": "in-process resolve_tool_id duration; median; nearest-rank p95",
+      "p95_nearest_rank_ns": 62417,
+      "resolved_via_alias": true,
+      "samples": 15,
+      "warmups": 3
+    },
+    {
+      "active_tools": 64,
+      "corpus": "medium",
+      "median_ns": 56500,
+      "method": "in-process resolve_tool_id duration; median; nearest-rank p95",
+      "p95_nearest_rank_ns": 60208,
+      "resolved_via_alias": true,
+      "samples": 15,
+      "warmups": 3
+    },
+    {
+      "active_tools": 256,
+      "corpus": "large",
+      "median_ns": 56625,
+      "method": "in-process resolve_tool_id duration; median; nearest-rank p95",
+      "p95_nearest_rank_ns": 58958,
+      "resolved_via_alias": true,
+      "samples": 15,
+      "warmups": 3
+    }
+  ]
+}

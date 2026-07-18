@@ -5,6 +5,7 @@ use serde::Serialize;
 
 use crate::observability::report::ReportTimestamp;
 use crate::observability::{open_reader, EventOutcome, EventType, ObservabilityOpenError};
+use crate::redaction::{TaggedValueRedactor, TEST_SECRET_REDACTION_MARKER};
 use crate::storage::WorkspacePaths;
 
 const MAX_PAGE_SIZE: usize = 500;
@@ -144,6 +145,8 @@ pub(crate) fn activity(
     query: &ActivityQuery,
 ) -> Result<ActivityResponse, UiReadError> {
     validate_activity_query(query)?;
+    let redactor = TaggedValueRedactor::load_workspace(workspace_paths)
+        .map_err(|_| UiReadError::Unavailable)?;
     let scope = activity_scope(query);
     let cursor = decode_activity_cursor(query.cursor.as_deref(), &scope)?;
     let Some(reader) = optional_reader(workspace_paths)? else {
@@ -160,7 +163,14 @@ pub(crate) fn activity(
         .connection
         .unchecked_transaction()
         .map_err(|_| UiReadError::Unavailable)?;
-    let response = activity_in_transaction(&transaction, workspace_key, query, &scope, cursor)?;
+    let response = activity_in_transaction(
+        &transaction,
+        workspace_key,
+        query,
+        &scope,
+        cursor,
+        &redactor,
+    )?;
     transaction.commit().map_err(|_| UiReadError::Unavailable)?;
     Ok(response)
 }
@@ -174,6 +184,8 @@ pub(crate) fn bundle(
         return Err(UiReadError::InvalidRequest);
     }
     super::validate_uuid_v4(&query.bundle_id).map_err(|_| UiReadError::InvalidRequest)?;
+    let redactor = TaggedValueRedactor::load_workspace(workspace_paths)
+        .map_err(|_| UiReadError::Unavailable)?;
     let scope = format!("bundle={}", query.bundle_id);
     let after_node_id = decode_numeric_cursor(query.cursor.as_deref(), "bundle", &scope)?;
     let Some(reader) = optional_reader(workspace_paths)? else {
@@ -183,7 +195,7 @@ pub(crate) fn bundle(
         .connection
         .unchecked_transaction()
         .map_err(|_| UiReadError::Unavailable)?;
-    let bundle = load_bundle_summary(&transaction, workspace_key, &query.bundle_id)?
+    let bundle = load_bundle_summary(&transaction, workspace_key, &query.bundle_id, &redactor)?
         .ok_or(UiReadError::NotFound)?;
     let mut statement = transaction
         .prepare(
@@ -213,7 +225,7 @@ pub(crate) fn bundle(
         .map_err(|_| UiReadError::Unavailable)?;
     drop(statement);
     validate_bundle_nodes(&nodes)?;
-    redact_bundle_nodes(&mut nodes);
+    redact_bundle_nodes(&mut nodes, &redactor)?;
     let more_results = nodes.len() > query.limit;
     nodes.truncate(query.limit);
     let next_cursor = if more_results {
@@ -237,11 +249,14 @@ pub(crate) fn overview(
     workspace_paths: &WorkspacePaths,
     workspace_key: &str,
 ) -> Result<OverviewObservability, UiReadError> {
+    let redactor = TaggedValueRedactor::load_workspace(workspace_paths)
+        .map_err(|_| UiReadError::Unavailable)?;
     let Some(reader) = optional_reader(workspace_paths)? else {
         let health = crate::observability::export::build_health_summary(
             None,
             workspace_key,
             crate::observability::report::CollectionStatus::NotCollected,
+            &redactor,
         )
         .map_err(|_| UiReadError::Unavailable)?;
         return Ok(OverviewObservability {
@@ -260,9 +275,10 @@ pub(crate) fn overview(
         Some(&transaction),
         workspace_key,
         crate::observability::report::CollectionStatus::Ready,
+        &redactor,
     )
     .map_err(|_| UiReadError::Unavailable)?;
-    let last_recall = load_latest_bundle_summary(&transaction, workspace_key)?;
+    let last_recall = load_latest_bundle_summary(&transaction, workspace_key, &redactor)?;
     let error_query = ActivityQuery {
         limit: OVERVIEW_ERROR_LIMIT,
         cursor: None,
@@ -271,7 +287,7 @@ pub(crate) fn overview(
         command: None,
     };
     let (last_errors, last_errors_more_results) =
-        load_latest_errors(&transaction, workspace_key, error_query.limit)?;
+        load_latest_errors(&transaction, workspace_key, error_query.limit, &redactor)?;
     transaction.commit().map_err(|_| UiReadError::Unavailable)?;
     Ok(OverviewObservability {
         collection_status: UiCollectionStatus::Ready,
@@ -347,6 +363,7 @@ fn activity_in_transaction(
     query: &ActivityQuery,
     scope: &str,
     cursor: Option<(String, String)>,
+    redactor: &TaggedValueRedactor,
 ) -> Result<ActivityResponse, UiReadError> {
     let (sql, parameters) = activity_page_sql(
         workspace_key,
@@ -363,14 +380,20 @@ fn activity_in_transaction(
         .query(rusqlite::params_from_iter(parameters))
         .map_err(|_| UiReadError::Unavailable)?;
     let mut items = Vec::new();
+    let mut cursor_parts = Vec::new();
     while let Some(row) = rows.next().map_err(|_| UiReadError::Unavailable)? {
-        items.push(activity_item_from_row(row, workspace_key)?);
+        let mut item = activity_item_from_row(row, workspace_key)?;
+        cursor_parts.push((item.timestamp.clone(), item.id.clone()));
+        redact_activity_item(&mut item, redactor)?;
+        items.push(item);
     }
     let more_results = items.len() > query.limit;
     items.truncate(query.limit);
     let next_cursor = if more_results {
-        let last = items.last().ok_or(UiReadError::Unavailable)?;
-        Some(encode_activity_cursor(scope, &last.timestamp, &last.id)?)
+        let (timestamp, id) = cursor_parts
+            .get(query.limit.saturating_sub(1))
+            .ok_or(UiReadError::Unavailable)?;
+        Some(encode_activity_cursor(scope, timestamp, id)?)
     } else {
         None
     };
@@ -499,6 +522,7 @@ fn load_latest_errors(
     transaction: &Transaction<'_>,
     workspace_key: &str,
     limit: usize,
+    redactor: &TaggedValueRedactor,
 ) -> Result<(Vec<ActivityItem>, bool), UiReadError> {
     let mut statement = transaction
         .prepare(LATEST_ERRORS_SQL)
@@ -508,7 +532,9 @@ fn load_latest_errors(
         .map_err(|_| UiReadError::Unavailable)?;
     let mut items = Vec::new();
     while let Some(row) = rows.next().map_err(|_| UiReadError::Unavailable)? {
-        items.push(activity_item_from_row(row, workspace_key)?);
+        let mut item = activity_item_from_row(row, workspace_key)?;
+        redact_activity_item(&mut item, redactor)?;
+        items.push(item);
     }
     let more_results = items.len() > limit;
     items.truncate(limit);
@@ -519,6 +545,7 @@ fn load_bundle_summary(
     transaction: &Transaction<'_>,
     workspace_key: &str,
     bundle_id: &str,
+    redactor: &TaggedValueRedactor,
 ) -> Result<Option<BundleSummary>, UiReadError> {
     transaction
         .query_row(
@@ -528,7 +555,7 @@ fn load_bundle_summary(
              FROM recall_bundles
              WHERE bundle_id = ?1 AND workspace_key = ?2",
             params![bundle_id, workspace_key],
-            |row| bundle_summary_from_row(row, workspace_key).map_err(ui_to_sql_error),
+            |row| bundle_summary_from_row(row, workspace_key, redactor).map_err(ui_to_sql_error),
         )
         .optional()
         .map_err(|_| UiReadError::Unavailable)
@@ -537,6 +564,7 @@ fn load_bundle_summary(
 fn load_latest_bundle_summary(
     transaction: &Transaction<'_>,
     workspace_key: &str,
+    redactor: &TaggedValueRedactor,
 ) -> Result<Option<BundleSummary>, UiReadError> {
     transaction
         .query_row(
@@ -547,7 +575,7 @@ fn load_latest_bundle_summary(
              WHERE workspace_key = ?1
              ORDER BY timestamp DESC, bundle_id DESC LIMIT 1",
             [workspace_key],
-            |row| bundle_summary_from_row(row, workspace_key).map_err(ui_to_sql_error),
+            |row| bundle_summary_from_row(row, workspace_key, redactor).map_err(ui_to_sql_error),
         )
         .optional()
         .map_err(|_| UiReadError::Unavailable)
@@ -556,6 +584,7 @@ fn load_latest_bundle_summary(
 fn bundle_summary_from_row(
     row: &rusqlite::Row<'_>,
     workspace_key: &str,
+    redactor: &TaggedValueRedactor,
 ) -> Result<BundleSummary, UiReadError> {
     let bundle_id: String = row.get(0).map_err(|_| UiReadError::Unavailable)?;
     let timestamp: String = row.get(1).map_err(|_| UiReadError::Unavailable)?;
@@ -585,7 +614,7 @@ fn bundle_summary_from_row(
     {
         return Err(UiReadError::Unavailable);
     }
-    Ok(BundleSummary {
+    let mut summary = BundleSummary {
         bundle_id,
         timestamp,
         product_version: safe_observability_text(product_version, 128),
@@ -596,7 +625,9 @@ fn bundle_summary_from_row(
         more_results: more_results == 1,
         continuation_count: u64::try_from(continuation_count)
             .map_err(|_| UiReadError::Unavailable)?,
-    })
+    };
+    redact_bundle_summary(&mut summary, redactor)?;
+    Ok(summary)
 }
 
 fn bundle_node_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<BundleNodeItem> {
@@ -668,22 +699,37 @@ fn validate_bundle_nodes(nodes: &[BundleNodeItem]) -> Result<(), UiReadError> {
     Ok(())
 }
 
-fn redact_bundle_nodes(nodes: &mut [BundleNodeItem]) {
+fn redact_bundle_nodes(
+    nodes: &mut [BundleNodeItem],
+    redactor: &TaggedValueRedactor,
+) -> Result<(), UiReadError> {
     for node in nodes {
-        node.node_title = safe_observability_text(std::mem::take(&mut node.node_title), 512);
+        node.first_seen_at =
+            safe_tagged_observability_text(std::mem::take(&mut node.first_seen_at), 128, redactor)?;
+        node.node_type =
+            safe_tagged_observability_text(std::mem::take(&mut node.node_type), 128, redactor)?;
+        node.node_title =
+            safe_tagged_observability_text(std::mem::take(&mut node.node_title), 512, redactor)?;
         node.bounded_summary = node
             .bounded_summary
             .take()
-            .map(|value| safe_observability_text(value, 2_048));
+            .map(|value| safe_tagged_observability_text(value, 2_048, redactor))
+            .transpose()?;
         node.source_ref = node
             .source_ref
             .take()
-            .map(|value| safe_observability_text(value, 2_048));
+            .map(|value| safe_tagged_observability_text(value, 2_048, redactor))
+            .transpose()?;
         node.trust_level = node
             .trust_level
             .take()
-            .map(|value| safe_observability_text(value, 256));
+            .map(|value| safe_tagged_observability_text(value, 256, redactor))
+            .transpose()?;
+        for reason in &mut node.selection_reasons {
+            *reason = safe_tagged_observability_text(std::mem::take(reason), 128, redactor)?;
+        }
     }
+    Ok(())
 }
 
 fn fetch_limit(limit: usize) -> Result<i64, UiReadError> {
@@ -800,6 +846,72 @@ fn safe_observability_text(value: String, maximum_bytes: usize) -> String {
     super::truncate_utf8(super::redact_sensitive_text(&value), maximum_bytes)
 }
 
+fn safe_tagged_observability_text(
+    value: String,
+    maximum_bytes: usize,
+    redactor: &TaggedValueRedactor,
+) -> Result<String, UiReadError> {
+    let value = redactor
+        .redact_str(&value)
+        .map_err(|_| UiReadError::Unavailable)?;
+    Ok(safe_observability_text(value, maximum_bytes))
+}
+
+fn redact_activity_item(
+    item: &mut ActivityItem,
+    redactor: &TaggedValueRedactor,
+) -> Result<(), UiReadError> {
+    item.id = safe_tagged_observability_text(std::mem::take(&mut item.id), 128, redactor)?;
+    item.timestamp =
+        safe_tagged_observability_text(std::mem::take(&mut item.timestamp), 128, redactor)?;
+    item.product_version =
+        safe_tagged_observability_text(std::mem::take(&mut item.product_version), 128, redactor)?;
+    item.event_type =
+        safe_tagged_observability_text(std::mem::take(&mut item.event_type), 128, redactor)?;
+    item.command =
+        safe_tagged_observability_text(std::mem::take(&mut item.command), 128, redactor)?;
+    item.correlation_id =
+        safe_tagged_observability_text(std::mem::take(&mut item.correlation_id), 128, redactor)?;
+    item.bundle_id = item
+        .bundle_id
+        .take()
+        .map(|value| safe_tagged_observability_text(value, 128, redactor))
+        .transpose()?;
+    item.outcome =
+        safe_tagged_observability_text(std::mem::take(&mut item.outcome), 128, redactor)?;
+    item.error_code = item
+        .error_code
+        .take()
+        .map(|value| safe_tagged_observability_text(value, 128, redactor))
+        .transpose()?;
+    Ok(())
+}
+
+fn redact_bundle_summary(
+    summary: &mut BundleSummary,
+    redactor: &TaggedValueRedactor,
+) -> Result<(), UiReadError> {
+    summary.bundle_id =
+        safe_tagged_observability_text(std::mem::take(&mut summary.bundle_id), 128, redactor)?;
+    summary.timestamp =
+        safe_tagged_observability_text(std::mem::take(&mut summary.timestamp), 128, redactor)?;
+    summary.product_version = safe_tagged_observability_text(
+        std::mem::take(&mut summary.product_version),
+        128,
+        redactor,
+    )?;
+    summary.correlation_id =
+        safe_tagged_observability_text(std::mem::take(&mut summary.correlation_id), 128, redactor)?;
+    summary.outcome =
+        safe_tagged_observability_text(std::mem::take(&mut summary.outcome), 128, redactor)?;
+    summary.error_code = summary
+        .error_code
+        .take()
+        .map(|value| safe_tagged_observability_text(value, 128, redactor))
+        .transpose()?;
+    Ok(())
+}
+
 fn valid_text(value: &str, maximum_bytes: usize, required: bool) -> bool {
     value.len() <= maximum_bytes
         && !value.as_bytes().contains(&0)
@@ -807,7 +919,8 @@ fn valid_text(value: &str, maximum_bytes: usize, required: bool) -> bool {
 }
 
 fn valid_identifier(value: &str) -> bool {
-    super::validate_ascii_identifier("stored_identifier", value, 128).is_ok()
+    value == TEST_SECRET_REDACTION_MARKER
+        || super::validate_ascii_identifier("stored_identifier", value, 128).is_ok()
 }
 
 fn ui_to_sql_error(_error: UiReadError) -> rusqlite::Error {

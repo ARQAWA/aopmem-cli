@@ -8,8 +8,13 @@ use super::{
     open_reader, redact_sensitive_text, truncate_utf8, validate_ascii_identifier,
     validate_positive_id, validate_uuid_v4, ObservabilityOpenError, OBSERVABILITY_SCHEMA_VERSION,
 };
-use crate::audit::{AnchoredDir, CommittedPublishOutcome};
+use crate::audit::AnchoredDir;
 use crate::output::OutputWarning;
+use crate::platform_publish::{
+    publish_regular, PublishError, PublishFailureDetails, PublishMode, PublishOutcome,
+    PublishPhase, PublishStrategy,
+};
+use crate::redaction::TaggedValueRedactor;
 use crate::storage::{self, OpenWorkspaceReadOnlyError, WorkspacePaths};
 use crate::tools;
 use rusqlite::{Connection, OptionalExtension, Transaction};
@@ -32,11 +37,12 @@ const TEMP_NAME_PREFIX: &str = ".aopmem-debug-capsule-";
 const TEMP_CREATE_ATTEMPTS: usize = 16;
 const ZIP_ENTRY_PERMISSIONS: u32 = 0o600;
 pub(crate) const EXPORT_PUBLISHED_WITH_WARNING: &str = "EXPORT_PUBLISHED_WITH_WARNING";
-const OPERATIONAL_SCHEMA_VERSION: &str = "003";
-const REQUIRED_MIGRATIONS: [(&str, &str); 3] = [
+const OPERATIONAL_SCHEMA_VERSION: &str = "004";
+const REQUIRED_MIGRATIONS: [(&str, &str); 4] = [
     ("001", "001_init"),
     ("002", "002_nodes_summary_index"),
     ("003", "003_task_recall_exact_indexes"),
+    ("004", "004_task_protocol_and_tool_aliases"),
 ];
 const OPERATIONAL_TABLE_COLUMNS: &[(&str, &[&str])] = &[
     ("schema_migrations", &["version", "name", "applied_at"]),
@@ -105,6 +111,16 @@ const OPERATIONAL_TABLE_COLUMNS: &[(&str, &[&str])] = &[
             "contract_json",
             "created_at",
             "updated_at",
+        ],
+    ),
+    (
+        "tool_aliases",
+        &[
+            "alias",
+            "canonical_tool_id",
+            "created_at",
+            "source",
+            "status",
         ],
     ),
     (
@@ -190,7 +206,29 @@ pub(crate) enum ExportError {
     #[error("debug capsule sync failed")]
     Sync,
     #[error("debug capsule atomic publish failed")]
-    Publish,
+    Publish(Box<DebugCapsulePublishFailure>),
+    #[error("tagged-value redaction failed")]
+    Redaction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct DebugCapsulePublishFailure {
+    pub(crate) code: &'static str,
+    pub(crate) operation: &'static str,
+    pub(crate) source: &'static str,
+    pub(crate) destination: &'static str,
+    pub(crate) mode: &'static str,
+    pub(crate) strategy: &'static str,
+    pub(crate) phase: &'static str,
+    pub(crate) raw_os_error: Option<i32>,
+    pub(crate) io_kind: &'static str,
+    pub(crate) source_exists: bool,
+    pub(crate) destination_exists: bool,
+    pub(crate) source_size: Option<u64>,
+    pub(crate) final_validated: bool,
+    pub(crate) committed: bool,
+    pub(crate) durability_confirmed: bool,
+    pub(crate) temporary_cleanup_confirmed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -409,13 +447,30 @@ impl TemporaryArchive {
     fn disarm(&mut self) {
         self.cleanup = false;
     }
+
+    fn cleanup_and_confirm(&mut self) -> bool {
+        if !self.cleanup {
+            return true;
+        }
+        match self.directory.remove_regular_os(&self.name) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => {}
+        }
+        let confirmed = matches!(
+            self.directory.open_regular_optional_os(&self.name),
+            Ok(None)
+        );
+        if confirmed {
+            self.disarm();
+        }
+        confirmed
+    }
 }
 
 impl Drop for TemporaryArchive {
     fn drop(&mut self) {
-        if self.cleanup {
-            let _ = self.directory.remove_regular_os(&self.name);
-        }
+        let _ = self.cleanup_and_confirm();
     }
 }
 
@@ -424,6 +479,18 @@ pub(crate) fn export_debug_capsule(
     workspace_paths: &WorkspacePaths,
     output: &Path,
 ) -> Result<ExportResult, ExportError> {
+    export_debug_capsule_with_publisher(workspace_key, workspace_paths, output, publish_regular)
+}
+
+type PublishFn =
+    fn(&AnchoredDir, File, &OsStr, &OsStr, PublishMode) -> Result<PublishOutcome, PublishError>;
+
+fn export_debug_capsule_with_publisher(
+    workspace_key: &str,
+    workspace_paths: &WorkspacePaths,
+    output: &Path,
+    publisher: PublishFn,
+) -> Result<ExportResult, ExportError> {
     validate_workspace_binding(workspace_key, workspace_paths)?;
     let target = prepare_output_target(output)?;
     let operational = open_operational_reader(workspace_paths)?;
@@ -431,6 +498,8 @@ pub(crate) fn export_debug_capsule(
         .unchecked_transaction()
         .map_err(|_| ExportError::WorkspaceInvalid)?;
     establish_operational_snapshot(&operational_snapshot)?;
+    let redactor =
+        TaggedValueRedactor::load(&operational_snapshot).map_err(|_| ExportError::Redaction)?;
 
     let observability_reader = open_optional_observability_reader(workspace_paths)?;
     let observability_snapshot = observability_reader
@@ -449,8 +518,12 @@ pub(crate) fn export_debug_capsule(
             } else {
                 ReferenceSource::ObservabilityLatestPersisted
             };
-            let report =
-                report::effectiveness_report_in_snapshot(snapshot, workspace_key, &reference)?;
+            let report = report::effectiveness_report_in_snapshot(
+                snapshot,
+                workspace_key,
+                &reference,
+                &redactor,
+            )?;
             (reference, source, report)
         }
         None => {
@@ -469,6 +542,7 @@ pub(crate) fn export_debug_capsule(
         &report,
         &operational_snapshot,
         observability_snapshot.as_ref(),
+        &redactor,
     )?;
 
     operational_snapshot
@@ -479,16 +553,37 @@ pub(crate) fn export_debug_capsule(
             .commit()
             .map_err(|_| ExportError::Observability(ObserveReadError::ReadFailed))?;
     }
-    let publication = match target.directory.publish_regular_no_replace_committed_os(
-        &publish_source,
+    let publication = match publisher(
+        &target.directory,
+        publish_source,
         &temporary.name,
         &target.file_name,
+        PublishMode::NoReplace,
     ) {
         Ok(outcome) => outcome,
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
             return Err(ExportError::OutputExists);
         }
-        Err(_) => return Err(ExportError::Publish),
+        Err(error) => {
+            let mut details = error.details();
+            details.temporary_cleanup_confirmed = temporary.cleanup_and_confirm();
+            if details.temporary_cleanup_confirmed {
+                details.source_exists = false;
+            }
+            if details.committed && details.final_validated {
+                return Ok(ExportResult {
+                    output: target.display_path.display().to_string(),
+                    entries: CAPSULE_ENTRIES.len(),
+                    bytes,
+                    collection_status: report.collection_status,
+                    reference_at: reference_at.as_str().to_string(),
+                    publication_status: PublicationStatus::PublishedWithWarning,
+                    temporary_cleanup_confirmed: details.temporary_cleanup_confirmed,
+                    warning: Some(publication_warning()),
+                });
+            }
+            return Err(ExportError::Publish(Box::new(details.into())));
+        }
     };
     if publication.temporary_cleanup_confirmed {
         temporary.disarm();
@@ -507,6 +602,60 @@ pub(crate) fn export_debug_capsule(
     })
 }
 
+impl From<PublishFailureDetails> for DebugCapsulePublishFailure {
+    fn from(details: PublishFailureDetails) -> Self {
+        Self {
+            code: details.code,
+            operation: details.operation,
+            source: details.source,
+            destination: details.destination,
+            mode: publish_mode_name(details.mode),
+            strategy: publish_strategy_name(details.strategy),
+            phase: publish_phase_name(details.phase),
+            raw_os_error: details.raw_os_error,
+            io_kind: details.io_kind,
+            source_exists: details.source_exists,
+            destination_exists: details.destination_exists,
+            source_size: details.source_size,
+            final_validated: details.final_validated,
+            committed: details.committed,
+            durability_confirmed: details.durability_confirmed,
+            temporary_cleanup_confirmed: details.temporary_cleanup_confirmed,
+        }
+    }
+}
+
+const fn publish_mode_name(mode: PublishMode) -> &'static str {
+    match mode {
+        PublishMode::ReplaceOrCreate => "replace_or_create",
+        PublishMode::NoReplace => "no_replace",
+    }
+}
+
+const fn publish_strategy_name(strategy: PublishStrategy) -> &'static str {
+    match strategy {
+        PublishStrategy::Undetermined => "undetermined",
+        PublishStrategy::WindowsReplaceFileW => "windows_replace_file_w",
+        PublishStrategy::WindowsMoveFileExW => "windows_move_file_ex_w",
+        PublishStrategy::UnixRenameAt => "unix_rename_at",
+        PublishStrategy::UnixLinkAtUnlinkAt => "unix_link_at_unlink_at",
+    }
+}
+
+const fn publish_phase_name(phase: PublishPhase) -> &'static str {
+    match phase {
+        PublishPhase::ValidateParent => "validate_parent",
+        PublishPhase::ValidateSource => "validate_source",
+        PublishPhase::ValidateDestination => "validate_destination",
+        PublishPhase::FlushSource => "flush_source",
+        PublishPhase::CloseHandles => "close_handles",
+        PublishPhase::OsPublish => "os_publish",
+        PublishPhase::ReopenDestination => "reopen_destination",
+        PublishPhase::ValidatePublishedIdentity => "validate_published_identity",
+        PublishPhase::SyncParent => "sync_parent",
+    }
+}
+
 fn validate_workspace_binding(
     workspace_key: &str,
     workspace_paths: &WorkspacePaths,
@@ -520,19 +669,23 @@ fn validate_workspace_binding(
     Ok(())
 }
 
-fn publication_result(
-    outcome: CommittedPublishOutcome,
-) -> (PublicationStatus, Option<OutputWarning>) {
+fn publication_result(outcome: PublishOutcome) -> (PublicationStatus, Option<OutputWarning>) {
     if outcome.durability_confirmed && outcome.temporary_cleanup_confirmed {
         (PublicationStatus::Durable, None)
     } else {
         (
             PublicationStatus::PublishedWithWarning,
-            Some(OutputWarning {
-                code: EXPORT_PUBLISHED_WITH_WARNING,
-                message: "debug capsule was published, but directory durability or temporary cleanup could not be confirmed".to_string(),
-            }),
+            Some(publication_warning()),
         )
+    }
+}
+
+fn publication_warning() -> OutputWarning {
+    OutputWarning {
+        code: EXPORT_PUBLISHED_WITH_WARNING,
+        message:
+            "debug capsule was published, but directory durability or temporary cleanup could not be confirmed"
+                .to_string(),
     }
 }
 
@@ -566,7 +719,7 @@ fn prepare_output_target(output: &Path) -> Result<OutputTarget, ExportError> {
 }
 
 fn open_operational_reader(workspace_paths: &WorkspacePaths) -> Result<Connection, ExportError> {
-    match storage::open_workspace_db_read_only(workspace_paths) {
+    match storage::open_workspace_db_live_read_only(workspace_paths) {
         Ok(connection) => Ok(connection),
         Err(OpenWorkspaceReadOnlyError::Missing(_)) => Err(ExportError::WorkspaceMissing),
         Err(OpenWorkspaceReadOnlyError::UnsafePath(_)) => Err(ExportError::WorkspaceUnsafe),
@@ -577,7 +730,7 @@ fn open_operational_reader(workspace_paths: &WorkspacePaths) -> Result<Connectio
 fn establish_operational_snapshot(transaction: &Transaction<'_>) -> Result<(), ExportError> {
     validate_sqlite_integrity(transaction).map_err(|_| ExportError::WorkspaceInvalid)?;
     let mut statement = transaction
-        .prepare("SELECT version, name FROM schema_migrations ORDER BY version LIMIT 4")
+        .prepare("SELECT version, name FROM schema_migrations ORDER BY version LIMIT 5")
         .map_err(|_| ExportError::WorkspaceInvalid)?;
     let migrations = statement
         .query_map([], |row| {
@@ -746,6 +899,7 @@ fn random_temporary_name() -> Result<OsString, ExportError> {
     Ok(name.into())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_archive(
     file: File,
     workspace_key: &str,
@@ -754,6 +908,7 @@ fn write_archive(
     report: &EffectivenessReport,
     operational: &Transaction<'_>,
     observability: Option<&Transaction<'_>>,
+    redactor: &TaggedValueRedactor,
 ) -> Result<(File, u64), ExportError> {
     let mut archive = ZipWriter::new(file);
     let manifest = Manifest {
@@ -769,18 +924,23 @@ fn write_archive(
     };
     let product = build_product_summary()?;
     let workspace = build_workspace_summary(report, reference_at);
-    let health = build_health_summary(observability, workspace_key, report.collection_status)?;
-    write_json_entry(&mut archive, CAPSULE_ENTRIES[0], &manifest)?;
-    write_json_entry(&mut archive, CAPSULE_ENTRIES[1], &product)?;
-    write_json_entry(&mut archive, CAPSULE_ENTRIES[2], &workspace)?;
-    write_memory_summary(&mut archive, operational)?;
-    write_json_entry(&mut archive, CAPSULE_ENTRIES[4], &health)?;
-    write_events_jsonl(&mut archive, observability, workspace_key)?;
-    write_recall_bundles_jsonl(&mut archive, observability, workspace_key)?;
-    write_bundle_nodes_jsonl(&mut archive, observability, workspace_key)?;
-    write_feedback_jsonl(&mut archive, observability, workspace_key)?;
-    write_tools_summary(&mut archive, operational)?;
-    write_mcp_summary(&mut archive, operational)?;
+    let health = build_health_summary(
+        observability,
+        workspace_key,
+        report.collection_status,
+        redactor,
+    )?;
+    write_json_entry(&mut archive, CAPSULE_ENTRIES[0], &manifest, redactor)?;
+    write_json_entry(&mut archive, CAPSULE_ENTRIES[1], &product, redactor)?;
+    write_json_entry(&mut archive, CAPSULE_ENTRIES[2], &workspace, redactor)?;
+    write_memory_summary(&mut archive, operational, redactor)?;
+    write_json_entry(&mut archive, CAPSULE_ENTRIES[4], &health, redactor)?;
+    write_events_jsonl(&mut archive, observability, workspace_key, redactor)?;
+    write_recall_bundles_jsonl(&mut archive, observability, workspace_key, redactor)?;
+    write_bundle_nodes_jsonl(&mut archive, observability, workspace_key, redactor)?;
+    write_feedback_jsonl(&mut archive, observability, workspace_key, redactor)?;
+    write_tools_summary(&mut archive, operational, redactor)?;
+    write_mcp_summary(&mut archive, operational, redactor)?;
     start_entry(&mut archive, CAPSULE_ENTRIES[11])?;
     archive
         .write_all(README.as_bytes())
@@ -824,6 +984,7 @@ pub(crate) fn build_health_summary(
     observability: Option<&Transaction<'_>>,
     workspace_key: &str,
     collection_status: CollectionStatus,
+    redactor: &TaggedValueRedactor,
 ) -> Result<HealthSummary, ExportError> {
     let not_collected = || HealthObservation {
         status: HealthObservationStatus::NotCollected,
@@ -839,9 +1000,9 @@ pub(crate) fn build_health_summary(
     };
     Ok(HealthSummary {
         collection_status,
-        doctor: latest_health_observation(observability, workspace_key, "doctor")?
+        doctor: latest_health_observation(observability, workspace_key, "doctor", redactor)?
             .unwrap_or_else(&not_collected),
-        verify: latest_health_observation(observability, workspace_key, "verify")?
+        verify: latest_health_observation(observability, workspace_key, "verify", redactor)?
             .unwrap_or_else(not_collected),
     })
 }
@@ -850,6 +1011,7 @@ fn latest_health_observation(
     observability: &Transaction<'_>,
     workspace_key: &str,
     event_type: &str,
+    redactor: &TaggedValueRedactor,
 ) -> Result<Option<HealthObservation>, ExportError> {
     let mut statement = observability
         .prepare(
@@ -878,7 +1040,8 @@ fn latest_health_observation(
     let error_code = row
         .get::<_, Option<String>>(10)
         .map_err(|_| invalid_observability())?
-        .map(|value| redact_observability_text(&value, 128));
+        .map(|value| redact_observability_text(&value, 128, redactor))
+        .transpose()?;
     Ok(Some(HealthObservation {
         status,
         observed_at: Some(row.get(1).map_err(|_| invalid_observability())?),
@@ -889,10 +1052,11 @@ fn latest_health_observation(
 fn write_memory_summary<W: Write + Seek>(
     archive: &mut ZipWriter<W>,
     operational: &Transaction<'_>,
+    redactor: &TaggedValueRedactor,
 ) -> Result<(), ExportError> {
     let header = build_memory_summary_header(operational)?;
     start_entry(archive, CAPSULE_ENTRIES[3])?;
-    let header_json = serde_json::to_vec(&header).map_err(|_| ExportError::Serialization)?;
+    let header_json = redacted_json_bytes(&header, redactor)?;
     let prefix = header_json
         .strip_suffix(b"}")
         .ok_or(ExportError::Serialization)?;
@@ -926,11 +1090,11 @@ fn write_memory_summary<W: Write + Seek>(
     let mut first = true;
     let mut streamed = 0_u64;
     while let Some(row) = rows.next().map_err(|_| ExportError::WorkspaceInvalid)? {
-        let item = memory_node_summary_from_row(row)?;
+        let item = memory_node_summary_from_row(row, redactor)?;
         streamed = streamed
             .checked_add(1)
             .ok_or(ExportError::WorkspaceInvalid)?;
-        write_json_array_item(archive, &mut first, &item)?;
+        write_json_array_item(archive, &mut first, &item, redactor)?;
     }
     if streamed != header.node_count {
         return Err(ExportError::WorkspaceInvalid);
@@ -981,6 +1145,7 @@ pub(crate) fn build_memory_summary_header(
 
 pub(crate) fn memory_node_summary_from_row(
     row: &rusqlite::Row<'_>,
+    redactor: &TaggedValueRedactor,
 ) -> Result<MemoryNodeSummary, ExportError> {
     let id: i64 = row.get(0).map_err(|_| ExportError::WorkspaceInvalid)?;
     let node_type: String = row.get(1).map_err(|_| ExportError::WorkspaceInvalid)?;
@@ -1003,17 +1168,24 @@ pub(crate) fn memory_node_summary_from_row(
         id,
         node_type,
         status,
-        title: safe_required_text(&title, storage::MAX_NODE_TITLE_BYTES, 512)?,
-        summary: safe_optional_text(summary.as_deref(), storage::MAX_NODE_SUMMARY_BYTES, 2_048)?,
+        title: safe_required_text(&title, storage::MAX_NODE_TITLE_BYTES, 512, redactor)?,
+        summary: safe_optional_text(
+            summary.as_deref(),
+            storage::MAX_NODE_SUMMARY_BYTES,
+            2_048,
+            redactor,
+        )?,
         source_ref: safe_optional_text(
             source_ref.as_deref(),
             storage::MAX_NODE_SOURCE_REF_BYTES,
             2_048,
+            redactor,
         )?,
         trust_level: safe_optional_text(
             trust_level.as_deref(),
             storage::MAX_NODE_TRUST_LEVEL_BYTES,
             storage::MAX_NODE_TRUST_LEVEL_BYTES,
+            redactor,
         )?,
         confidence,
         incoming_links: nonnegative_count(incoming_links)?,
@@ -1025,6 +1197,7 @@ fn write_events_jsonl<W: Write + Seek>(
     archive: &mut ZipWriter<W>,
     observability: Option<&Transaction<'_>>,
     workspace_key: &str,
+    redactor: &TaggedValueRedactor,
 ) -> Result<(), ExportError> {
     start_entry(archive, CAPSULE_ENTRIES[5])?;
     let Some(observability) = observability else {
@@ -1050,7 +1223,8 @@ fn write_events_jsonl<W: Write + Seek>(
                 &row.get::<_, String>(2)
                     .map_err(|_| invalid_observability())?,
                 128,
-            ),
+                redactor,
+            )?,
             workspace_key: row.get(3).map_err(|_| invalid_observability())?,
             event_type: row.get(4).map_err(|_| invalid_observability())?,
             command: row.get(5).map_err(|_| invalid_observability())?,
@@ -1061,9 +1235,10 @@ fn write_events_jsonl<W: Write + Seek>(
             error_code: row
                 .get::<_, Option<String>>(10)
                 .map_err(|_| invalid_observability())?
-                .map(|value| redact_observability_text(&value, 128)),
+                .map(|value| redact_observability_text(&value, 128, redactor))
+                .transpose()?,
         };
-        write_json_line(archive, &line)?;
+        write_json_line(archive, &line, redactor)?;
     }
     Ok(())
 }
@@ -1072,6 +1247,7 @@ fn write_recall_bundles_jsonl<W: Write + Seek>(
     archive: &mut ZipWriter<W>,
     observability: Option<&Transaction<'_>>,
     workspace_key: &str,
+    redactor: &TaggedValueRedactor,
 ) -> Result<(), ExportError> {
     start_entry(archive, CAPSULE_ENTRIES[6])?;
     let Some(observability) = observability else {
@@ -1119,16 +1295,18 @@ fn write_recall_bundles_jsonl<W: Write + Seek>(
         let line = RecallBundleLine {
             bundle_id,
             timestamp,
-            product_version: redact_observability_text(&product_version, 128),
+            product_version: redact_observability_text(&product_version, 128, redactor)?,
             workspace_key: stored_workspace,
             correlation_id,
             outcome,
-            error_code: error_code.map(|value| redact_observability_text(&value, 128)),
+            error_code: error_code
+                .map(|value| redact_observability_text(&value, 128, redactor))
+                .transpose()?,
             duration_ms: nonnegative_observability(duration_ms)?,
             more_results: more_results == 1,
             continuation_count: nonnegative_observability(continuation_count)?,
         };
-        write_json_line(archive, &line)?;
+        write_json_line(archive, &line, redactor)?;
     }
     Ok(())
 }
@@ -1137,6 +1315,7 @@ fn write_bundle_nodes_jsonl<W: Write + Seek>(
     archive: &mut ZipWriter<W>,
     observability: Option<&Transaction<'_>>,
     workspace_key: &str,
+    redactor: &TaggedValueRedactor,
 ) -> Result<(), ExportError> {
     start_entry(archive, CAPSULE_ENTRIES[7])?;
     let Some(observability) = observability else {
@@ -1206,17 +1385,23 @@ fn write_bundle_nodes_jsonl<W: Write + Seek>(
             node_id,
             first_seen_at,
             node_type,
-            node_title: redact_observability_text(&node_title, 512),
-            bounded_summary: bounded_summary.map(|value| redact_observability_text(&value, 2_048)),
-            source_ref: source_ref.map(|value| redact_observability_text(&value, 2_048)),
-            trust_level: trust_level.map(|value| {
-                redact_observability_text(&value, storage::MAX_NODE_TRUST_LEVEL_BYTES)
-            }),
+            node_title: redact_observability_text(&node_title, 512, redactor)?,
+            bounded_summary: bounded_summary
+                .map(|value| redact_observability_text(&value, 2_048, redactor))
+                .transpose()?,
+            source_ref: source_ref
+                .map(|value| redact_observability_text(&value, 2_048, redactor))
+                .transpose()?,
+            trust_level: trust_level
+                .map(|value| {
+                    redact_observability_text(&value, storage::MAX_NODE_TRUST_LEVEL_BYTES, redactor)
+                })
+                .transpose()?,
             confidence,
             score,
             selection_reasons,
         };
-        write_json_line(archive, &line)?;
+        write_json_line(archive, &line, redactor)?;
     }
     Ok(())
 }
@@ -1225,6 +1410,7 @@ fn write_feedback_jsonl<W: Write + Seek>(
     archive: &mut ZipWriter<W>,
     observability: Option<&Transaction<'_>>,
     workspace_key: &str,
+    redactor: &TaggedValueRedactor,
 ) -> Result<(), ExportError> {
     start_entry(archive, CAPSULE_ENTRIES[8])?;
     let Some(observability) = observability else {
@@ -1261,9 +1447,11 @@ fn write_feedback_jsonl<W: Write + Seek>(
             timestamp,
             bundle_id,
             outcome,
-            reason: reason.map(|value| redact_observability_text(&value, 512)),
+            reason: reason
+                .map(|value| redact_observability_text(&value, 512, redactor))
+                .transpose()?,
         };
-        write_json_line(archive, &line)?;
+        write_json_line(archive, &line, redactor)?;
     }
     Ok(())
 }
@@ -1271,6 +1459,7 @@ fn write_feedback_jsonl<W: Write + Seek>(
 fn write_tools_summary<W: Write + Seek>(
     archive: &mut ZipWriter<W>,
     operational: &Transaction<'_>,
+    redactor: &TaggedValueRedactor,
 ) -> Result<(), ExportError> {
     let count = scalar_count(operational, "SELECT COUNT(*) FROM tool_contracts")?;
     start_counted_array_entry(archive, CAPSULE_ENTRIES[9], count)?;
@@ -1287,11 +1476,11 @@ fn write_tools_summary<W: Write + Seek>(
     let mut first = true;
     let mut streamed = 0_u64;
     while let Some(row) = rows.next().map_err(|_| ExportError::WorkspaceInvalid)? {
-        let item = tool_summary_from_row(row)?;
+        let item = tool_summary_from_row(row, redactor)?;
         streamed = streamed
             .checked_add(1)
             .ok_or(ExportError::WorkspaceInvalid)?;
-        write_json_array_item(archive, &mut first, &item)?;
+        write_json_array_item(archive, &mut first, &item, redactor)?;
     }
     if streamed != count {
         return Err(ExportError::WorkspaceInvalid);
@@ -1301,6 +1490,7 @@ fn write_tools_summary<W: Write + Seek>(
 
 pub(crate) fn tool_summary_from_row(
     row: &rusqlite::Row<'_>,
+    redactor: &TaggedValueRedactor,
 ) -> Result<ToolSummaryItem, ExportError> {
     let tool_id: String = row.get(0).map_err(|_| ExportError::WorkspaceInvalid)?;
     if !safe_tool_id(&tool_id) {
@@ -1311,18 +1501,20 @@ pub(crate) fn tool_summary_from_row(
         return Err(ExportError::WorkspaceInvalid);
     }
     Ok(ToolSummaryItem {
-        tool_id: safe_required_text(&tool_id, tools::MAX_TOOL_ID_BYTES, 256)?,
+        tool_id: safe_required_text(&tool_id, tools::MAX_TOOL_ID_BYTES, 256, redactor)?,
         name: safe_required_text(
             &row.get::<_, String>(1)
                 .map_err(|_| ExportError::WorkspaceInvalid)?,
             tools::MAX_TOOL_NAME_BYTES,
             512,
+            redactor,
         )?,
         status: safe_required_text(
             &row.get::<_, String>(2)
                 .map_err(|_| ExportError::WorkspaceInvalid)?,
             tools::MAX_TOOL_TEXT_BYTES,
             256,
+            redactor,
         )?,
         owner_workflow: safe_optional_required_text(
             row.get::<_, Option<String>>(3)
@@ -1330,6 +1522,7 @@ pub(crate) fn tool_summary_from_row(
                 .as_deref(),
             tools::MAX_TOOL_TEXT_BYTES,
             512,
+            redactor,
         )?,
         side_effects,
         approval_requirement: safe_required_text(
@@ -1337,6 +1530,7 @@ pub(crate) fn tool_summary_from_row(
                 .map_err(|_| ExportError::WorkspaceInvalid)?,
             tools::MAX_TOOL_TEXT_BYTES,
             256,
+            redactor,
         )?,
     })
 }
@@ -1344,6 +1538,7 @@ pub(crate) fn tool_summary_from_row(
 fn write_mcp_summary<W: Write + Seek>(
     archive: &mut ZipWriter<W>,
     operational: &Transaction<'_>,
+    redactor: &TaggedValueRedactor,
 ) -> Result<(), ExportError> {
     let count = scalar_count(operational, "SELECT COUNT(*) FROM mcp_profiles")?;
     start_counted_array_entry(archive, CAPSULE_ENTRIES[10], count)?;
@@ -1360,11 +1555,11 @@ fn write_mcp_summary<W: Write + Seek>(
     let mut first = true;
     let mut streamed = 0_u64;
     while let Some(row) = rows.next().map_err(|_| ExportError::WorkspaceInvalid)? {
-        let item = mcp_summary_from_row(row)?;
+        let item = mcp_summary_from_row(row, redactor)?;
         streamed = streamed
             .checked_add(1)
             .ok_or(ExportError::WorkspaceInvalid)?;
-        write_json_array_item(archive, &mut first, &item)?;
+        write_json_array_item(archive, &mut first, &item, redactor)?;
     }
     if streamed != count {
         return Err(ExportError::WorkspaceInvalid);
@@ -1372,55 +1567,66 @@ fn write_mcp_summary<W: Write + Seek>(
     archive.write_all(b"]}\n").map_err(|_| ExportError::Zip)
 }
 
-pub(crate) fn mcp_summary_from_row(row: &rusqlite::Row<'_>) -> Result<McpSummaryItem, ExportError> {
+pub(crate) fn mcp_summary_from_row(
+    row: &rusqlite::Row<'_>,
+    redactor: &TaggedValueRedactor,
+) -> Result<McpSummaryItem, ExportError> {
     Ok(McpSummaryItem {
         id: safe_required_text(
             &row.get::<_, String>(0)
                 .map_err(|_| ExportError::WorkspaceInvalid)?,
             storage::MAX_MCP_ID_BYTES,
             256,
+            redactor,
         )?,
         name: safe_required_text(
             &row.get::<_, String>(1)
                 .map_err(|_| ExportError::WorkspaceInvalid)?,
             storage::MAX_MCP_NAME_BYTES,
             512,
+            redactor,
         )?,
         kind: safe_required_text(
             &row.get::<_, String>(2)
                 .map_err(|_| ExportError::WorkspaceInvalid)?,
             storage::MAX_MCP_FIELD_BYTES,
             256,
+            redactor,
         )?,
         status: safe_required_text(
             &row.get::<_, String>(3)
                 .map_err(|_| ExportError::WorkspaceInvalid)?,
             storage::MAX_MCP_FIELD_BYTES,
             256,
+            redactor,
         )?,
         read_operations: safe_required_text(
             &row.get::<_, String>(4)
                 .map_err(|_| ExportError::WorkspaceInvalid)?,
             storage::MAX_MCP_FIELD_BYTES,
             2_048,
+            redactor,
         )?,
         write_operations: safe_required_text(
             &row.get::<_, String>(5)
                 .map_err(|_| ExportError::WorkspaceInvalid)?,
             storage::MAX_MCP_FIELD_BYTES,
             2_048,
+            redactor,
         )?,
         side_effects: safe_required_text(
             &row.get::<_, String>(6)
                 .map_err(|_| ExportError::WorkspaceInvalid)?,
             storage::MAX_MCP_FIELD_BYTES,
             256,
+            redactor,
         )?,
         approval_requirement: safe_required_text(
             &row.get::<_, String>(7)
                 .map_err(|_| ExportError::WorkspaceInvalid)?,
             storage::MAX_MCP_FIELD_BYTES,
             256,
+            redactor,
         )?,
     })
 }
@@ -1494,32 +1700,46 @@ fn valid_optional_required_observability_text(value: Option<&str>, maximum_bytes
     value.is_none_or(|value| valid_observability_text(value, maximum_bytes, true))
 }
 
-fn redact_observability_text(value: &str, maximum_bytes: usize) -> String {
-    truncate_utf8(redact_sensitive_text(value), maximum_bytes)
+fn redact_observability_text(
+    value: &str,
+    maximum_bytes: usize,
+    redactor: &TaggedValueRedactor,
+) -> Result<String, ExportError> {
+    let tagged = redact_export_text(value, redactor)?;
+    Ok(truncate_utf8(redact_sensitive_text(&tagged), maximum_bytes))
+}
+
+fn redact_export_text(value: &str, redactor: &TaggedValueRedactor) -> Result<String, ExportError> {
+    let bytes = redactor
+        .redact_bytes_with_json_copies(value.as_bytes())
+        .map_err(|_| ExportError::Redaction)?;
+    String::from_utf8(bytes).map_err(|_| ExportError::Redaction)
 }
 
 fn safe_required_text(
     value: &str,
     input_limit: usize,
     output_limit: usize,
+    redactor: &TaggedValueRedactor,
 ) -> Result<String, ExportError> {
     if value.as_bytes().contains(&0) || value.trim().is_empty() || value.len() > input_limit {
         return Err(ExportError::WorkspaceInvalid);
     }
-    Ok(truncate_utf8(redact_sensitive_text(value), output_limit))
+    redact_observability_text(value, output_limit, redactor)
 }
 
 fn safe_optional_text(
     value: Option<&str>,
     input_limit: usize,
     output_limit: usize,
+    redactor: &TaggedValueRedactor,
 ) -> Result<Option<String>, ExportError> {
     value
         .map(|value| {
             if value.as_bytes().contains(&0) || value.len() > input_limit {
                 return Err(ExportError::WorkspaceInvalid);
             }
-            Ok(truncate_utf8(redact_sensitive_text(value), output_limit))
+            redact_observability_text(value, output_limit, redactor)
         })
         .transpose()
 }
@@ -1528,9 +1748,10 @@ fn safe_optional_required_text(
     value: Option<&str>,
     input_limit: usize,
     output_limit: usize,
+    redactor: &TaggedValueRedactor,
 ) -> Result<Option<String>, ExportError> {
     value
-        .map(|value| safe_required_text(value, input_limit, output_limit))
+        .map(|value| safe_required_text(value, input_limit, output_limit, redactor))
         .transpose()
 }
 
@@ -1551,19 +1772,25 @@ fn write_json_array_item<W: Write + Seek, T: Serialize>(
     archive: &mut ZipWriter<W>,
     first: &mut bool,
     item: &T,
+    redactor: &TaggedValueRedactor,
 ) -> Result<(), ExportError> {
     if !*first {
         archive.write_all(b",").map_err(|_| ExportError::Zip)?;
     }
     *first = false;
-    serde_json::to_writer(&mut *archive, item).map_err(|_| ExportError::Serialization)
+    archive
+        .write_all(&redacted_json_bytes(item, redactor)?)
+        .map_err(|_| ExportError::Zip)
 }
 
 fn write_json_line<W: Write + Seek, T: Serialize>(
     archive: &mut ZipWriter<W>,
     value: &T,
+    redactor: &TaggedValueRedactor,
 ) -> Result<(), ExportError> {
-    serde_json::to_writer(&mut *archive, value).map_err(|_| ExportError::Serialization)?;
+    archive
+        .write_all(&redacted_json_bytes(value, redactor)?)
+        .map_err(|_| ExportError::Zip)?;
     archive.write_all(b"\n").map_err(|_| ExportError::Zip)
 }
 
@@ -1571,10 +1798,50 @@ fn write_json_entry<W: Write + Seek, T: Serialize>(
     archive: &mut ZipWriter<W>,
     name: &str,
     value: &T,
+    redactor: &TaggedValueRedactor,
 ) -> Result<(), ExportError> {
     start_entry(archive, name)?;
-    serde_json::to_writer(&mut *archive, value).map_err(|_| ExportError::Serialization)?;
+    archive
+        .write_all(&redacted_json_bytes(value, redactor)?)
+        .map_err(|_| ExportError::Zip)?;
     archive.write_all(b"\n").map_err(|_| ExportError::Zip)
+}
+
+fn redacted_json_bytes<T: Serialize>(
+    value: &T,
+    redactor: &TaggedValueRedactor,
+) -> Result<Vec<u8>, ExportError> {
+    let mut value = serde_json::to_value(value).map_err(|_| ExportError::Serialization)?;
+    redact_json_strings(&mut value, redactor)?;
+    serde_json::to_vec(&value).map_err(|_| ExportError::Serialization)
+}
+
+fn redact_json_strings(
+    value: &mut serde_json::Value,
+    redactor: &TaggedValueRedactor,
+) -> Result<(), ExportError> {
+    match value {
+        serde_json::Value::String(text) => {
+            *text = redact_export_text(text, redactor)?;
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                redact_json_strings(item, redactor)?;
+            }
+        }
+        serde_json::Value::Object(fields) => {
+            let original = std::mem::take(fields);
+            for (key, mut field) in original {
+                let key = redact_export_text(&key, redactor)?;
+                redact_json_strings(&mut field, redactor)?;
+                if fields.insert(key, field).is_some() {
+                    return Err(ExportError::Redaction);
+                }
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
+    Ok(())
 }
 
 fn start_entry<W: Write + Seek>(archive: &mut ZipWriter<W>, name: &str) -> Result<(), ExportError> {
@@ -2087,6 +2354,21 @@ mod tests {
                 .collect::<Vec<_>>(),
             CAPSULE_ENTRIES
         );
+        let file = File::open(&first).expect("capsule metadata should open");
+        let mut archive = ZipArchive::new(file).expect("capsule metadata should be ZIP");
+        assert_eq!(archive.len(), CAPSULE_ENTRIES.len());
+        for (index, expected_name) in CAPSULE_ENTRIES.iter().enumerate() {
+            let entry = archive
+                .by_index(index)
+                .expect("ordered ZIP metadata should read");
+            assert_eq!(entry.name(), *expected_name);
+            assert_eq!(entry.compression(), CompressionMethod::Stored);
+            assert_eq!(entry.last_modified(), Some(zip::DateTime::default()));
+            assert_eq!(
+                entry.unix_mode().map(|mode| mode & 0o777),
+                Some(ZIP_ENTRY_PERMISSIONS)
+            );
+        }
         let manifest = entry_json(&entries, "manifest.json");
         assert_eq!(manifest["entries"], serde_json::json!(CAPSULE_ENTRIES));
         assert_eq!(manifest["deterministic"], true);
@@ -2141,6 +2423,84 @@ mod tests {
             assert!(!all_text.contains(canary), "secret survived: {canary}");
         }
         assert!(all_text.contains("видимый"));
+    }
+
+    #[test]
+    fn stage_010_export_redacts_tagged_value_before_json_escaping() {
+        let workspace = TestWorkspace::new("stage-010-json-escape");
+        let secret = "TEST_ONLY_STAGE010_\"quote\"\\slash\nline";
+        let serialized_secret =
+            serde_json::to_string(secret).expect("test secret should JSON serialize");
+        mutate_database(workspace.paths.db(), |connection| {
+            connection
+                .execute(
+                    "INSERT INTO nodes (
+                        node_type, status, title, body, source_ref,
+                        confidence, trust_level
+                     ) VALUES (
+                        'raw_note', 'active', 'Authorized test credential',
+                        ?1, 'source=user_instruction', 1.0, 'high'
+                     )",
+                    [secret],
+                )
+                .expect("tagged node should insert");
+            let secret_node_id = connection.last_insert_rowid();
+            connection
+                .execute(
+                    "INSERT INTO tags (node_id, tag) VALUES (?1, ?2)",
+                    params![secret_node_id, crate::redaction::TEST_SECRET_TAG],
+                )
+                .expect("exact secret tag should insert");
+            connection
+                .execute(
+                    "INSERT INTO nodes (
+                        node_type, status, title, summary
+                     ) VALUES ('rule', 'active', ?1, ?2)",
+                    params![
+                        format!("copy: {secret}"),
+                        format!("serialized copy: {serialized_secret}")
+                    ],
+                )
+                .expect("exportable copies should insert");
+        });
+
+        let output = workspace.output("stage-010.zip");
+        export_debug_capsule(&workspace.key, &workspace.paths, &output)
+            .expect("tagged export should succeed");
+
+        let connection = Connection::open(workspace.paths.db())
+            .expect("operational database should remain readable");
+        let stored: String = connection
+            .query_row(
+                "SELECT body FROM nodes
+                 WHERE title = 'Authorized test credential'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("authorized exact body should remain");
+        assert_eq!(stored, secret);
+
+        let escaped = serde_json::to_string(secret).expect("fake secret should JSON encode");
+        let escaped = escaped
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+            .expect("JSON string should have quotes");
+        let entries = archive_entries(&output);
+        let joined = entries
+            .iter()
+            .flat_map(|(_, bytes)| bytes.iter().copied())
+            .collect::<Vec<_>>();
+        let joined = String::from_utf8(joined).expect("capsule entries should be UTF-8");
+        assert!(!joined.contains(secret), "raw tagged value survived");
+        assert!(
+            !joined.contains(escaped),
+            "JSON-escaped tagged value survived"
+        );
+        assert!(
+            !joined.contains(&serialized_secret),
+            "stored JSON-string copy survived"
+        );
+        assert!(joined.contains(crate::redaction::TEST_SECRET_REDACTION_MARKER));
     }
 
     #[test]
@@ -2301,6 +2661,98 @@ mod tests {
     }
 
     #[test]
+    fn temp_non_ascii_and_long_normal_output_paths_publish() {
+        let workspace = TestWorkspace::new("windows-path-shapes");
+        assert!(workspace.output_dir.starts_with(env::temp_dir()));
+
+        let non_ascii = workspace.output("капсула-данные.zip");
+        export_debug_capsule(&workspace.key, &workspace.paths, &non_ascii)
+            .expect("non-ASCII output under the OS temp tree should publish");
+        assert!(non_ascii.is_file());
+
+        let mut long_parent = workspace.output_dir.clone();
+        for index in 0..10 {
+            long_parent.push(format!("long-normal-component-{index:02}-abcdefgh"));
+        }
+        fs::create_dir_all(&long_parent).expect("long normal output parent should create");
+        let long_output = long_parent.join("длинная-капсула.zip");
+        assert!(
+            long_output.as_os_str().to_string_lossy().len() > 260,
+            "fixture should exceed legacy MAX_PATH"
+        );
+        export_debug_capsule(&workspace.key, &workspace.paths, &long_output)
+            .expect("long normal output path should publish");
+        assert!(long_output.is_file());
+        assert!(capsule_temporary_names(&long_parent).is_empty());
+    }
+
+    #[test]
+    fn injected_error_87_is_structured_and_leaves_marker_output_and_temp_safe() {
+        let workspace = TestWorkspace::new("error-87");
+        crate::audit::ensure_pending_snapshot_marker(workspace.paths.audit_git())
+            .expect("pending marker fixture should create");
+        let marker = workspace
+            .paths
+            .audit_git()
+            .join(crate::audit::PENDING_SNAPSHOT_MARKER_FILE_NAME);
+        let marker_before = fs::read(&marker).expect("pending marker should read");
+        let output = workspace.output("must-not-publish.zip");
+
+        let error = export_debug_capsule_with_publisher(
+            &workspace.key,
+            &workspace.paths,
+            &output,
+            crate::platform_publish::publish_regular_injected_os_error87,
+        )
+        .expect_err("injected error 87 should fail");
+        let ExportError::Publish(details) = error else {
+            panic!("error 87 should preserve publish details");
+        };
+        assert_eq!(details.code, "PLATFORM_PUBLISH_FAILED");
+        assert_eq!(details.operation, "publish_regular");
+        assert_eq!(details.mode, "no_replace");
+        assert_eq!(details.phase, "os_publish");
+        assert_eq!(details.raw_os_error, Some(87));
+        assert!(!details.committed);
+        assert!(!details.final_validated);
+        assert!(!details.source_exists);
+        assert!(!details.destination_exists);
+        assert!(details.temporary_cleanup_confirmed);
+        assert!(!output.exists());
+        assert!(capsule_temporary_names(&workspace.output_dir).is_empty());
+        assert_eq!(
+            fs::read(&marker).expect("pending marker should remain"),
+            marker_before
+        );
+    }
+
+    #[test]
+    fn committed_validated_sync_failure_is_success_with_warning() {
+        let workspace = TestWorkspace::new("sync-warning");
+        let output = workspace.output("published-with-warning.zip");
+
+        let result = export_debug_capsule_with_publisher(
+            &workspace.key,
+            &workspace.paths,
+            &output,
+            crate::platform_publish::publish_regular_injected_sync_parent,
+        )
+        .expect("validated committed output should remain core success");
+
+        assert!(output.is_file());
+        assert_eq!(
+            result.publication_status,
+            PublicationStatus::PublishedWithWarning
+        );
+        assert_eq!(
+            result.warning.expect("publication warning").code,
+            EXPORT_PUBLISHED_WITH_WARNING
+        );
+        assert!(result.temporary_cleanup_confirmed);
+        assert!(capsule_temporary_names(&workspace.output_dir).is_empty());
+    }
+
+    #[test]
     fn late_observability_validation_failure_removes_temporary_archive() {
         let workspace = TestWorkspace::new("late-failure-cleanup");
         insert_privacy_fixture(&workspace);
@@ -2334,7 +2786,11 @@ mod tests {
 
     #[test]
     fn publication_warning_is_stable_and_keeps_core_success_typed() {
-        let (status, warning) = publication_result(CommittedPublishOutcome {
+        let (status, warning) = publication_result(PublishOutcome {
+            strategy: crate::platform_publish::PublishStrategy::UnixLinkAtUnlinkAt,
+            destination_existed: false,
+            committed: true,
+            final_validated: true,
             durability_confirmed: false,
             temporary_cleanup_confirmed: false,
         });
@@ -2379,6 +2835,65 @@ mod tests {
                 "export must not create a rollback journal"
             );
         }
+    }
+
+    #[test]
+    fn live_wal_is_visible_with_query_only_and_db_wal_bytes_unchanged() {
+        let workspace = TestWorkspace::new("live-wal");
+        let writer = Connection::open(workspace.paths.db()).expect("live writer should open");
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode = WAL;
+                 PRAGMA wal_autocheckpoint = 0;
+                 PRAGMA foreign_keys = ON;",
+            )
+            .expect("live WAL settings should apply");
+        writer
+            .execute(
+                "INSERT INTO nodes (
+                    node_type, status, title, summary, body, source_ref,
+                    confidence, trust_level
+                 ) VALUES (
+                    'rule', 'active', 'LIVE_WAL_VISIBLE', 'bounded', NULL,
+                    'test', 1.0, 'high'
+                 )",
+                [],
+            )
+            .expect("committed live WAL row should insert");
+
+        let mut wal_name = workspace.paths.db().as_os_str().to_os_string();
+        wal_name.push("-wal");
+        let wal = PathBuf::from(wal_name);
+        assert!(wal.is_file(), "uncheckpointed WAL should remain live");
+        let database_before = file_snapshot(workspace.paths.db());
+        let wal_before = file_snapshot(&wal);
+
+        let reader = open_operational_reader(&workspace.paths)
+            .expect("live read-only operational connection should open");
+        let query_only: i64 = reader
+            .query_row("PRAGMA query_only", [], |row| row.get(0))
+            .expect("query_only should read");
+        assert_eq!(query_only, 1);
+        drop(reader);
+
+        let output = workspace.output("live-wal.zip");
+        export_debug_capsule(&workspace.key, &workspace.paths, &output)
+            .expect("live WAL export should succeed");
+
+        assert_eq!(file_snapshot(workspace.paths.db()), database_before);
+        assert_eq!(file_snapshot(&wal), wal_before);
+        assert!(
+            !workspace.paths.observability().exists(),
+            "export must not create observability or self-record"
+        );
+        let entries = archive_entries(&output);
+        let memory = entry_json(&entries, "memory_summary.json");
+        assert!(memory["nodes"]
+            .as_array()
+            .expect("nodes should be an array")
+            .iter()
+            .any(|node| node["title"] == "LIVE_WAL_VISIBLE"));
+        drop(writer);
     }
 
     #[test]
@@ -2499,9 +3014,14 @@ mod tests {
             .expect("replacement should write");
         replacement.sync_all().expect("replacement should sync");
 
-        assert!(directory
-            .publish_regular_no_replace_committed_os(&original, source_name, destination_name)
-            .is_err());
+        assert!(publish_regular(
+            &directory,
+            original,
+            source_name,
+            destination_name,
+            PublishMode::NoReplace,
+        )
+        .is_err());
         assert!(directory
             .open_regular_optional_os(destination_name)
             .expect("destination lookup should succeed")
@@ -2526,6 +3046,18 @@ mod tests {
             fs::read(&outside_file).expect("outside file should read"),
             b"outside"
         );
+
+        let outside_output_directory = workspace.home.join("outside-output-directory");
+        fs::create_dir(&outside_output_directory).expect("outside output directory should create");
+        let linked_output_parent = workspace.home.join("linked-output-parent");
+        symlink(&outside_output_directory, &linked_output_parent)
+            .expect("output parent symlink should create");
+        let linked_parent_output = linked_output_parent.join("capsule.zip");
+        assert!(matches!(
+            export_debug_capsule(&workspace.key, &workspace.paths, &linked_parent_output),
+            Err(ExportError::UnsafeOutput)
+        ));
+        assert!(!outside_output_directory.join("capsule.zip").exists());
 
         let outside_directory = workspace.home.join("outside-observability");
         fs::create_dir(&outside_directory).expect("outside directory should create");

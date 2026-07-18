@@ -1,8 +1,9 @@
 //! One lifecycle for every operational-memory mutation.
 
+use std::ffi::OsString;
 use std::fmt;
 use std::fs;
-use std::io;
+use std::io::{self, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -82,7 +83,15 @@ enum RollbackAction {
     RemoveCreatedTree(PathBuf),
     RemoveCreatedDirectory(PathBuf),
     RemoveCreatedFile(PathBuf),
-    RestoreFile { path: PathBuf, bytes: Vec<u8> },
+    RestoreFile {
+        path: PathBuf,
+        bytes: Vec<u8>,
+    },
+    RestoreAnchoredFile {
+        directory: audit::AnchoredDir,
+        name: OsString,
+        bytes: Vec<u8>,
+    },
 }
 
 impl MutationEffects {
@@ -108,6 +117,21 @@ impl MutationEffects {
     pub fn register_file_restore(&mut self, path: PathBuf, bytes: Vec<u8>) {
         self.rollback_actions
             .push(RollbackAction::RestoreFile { path, bytes });
+    }
+
+    /// Restores an overwritten regular file through its held no-follow parent.
+    pub(crate) fn register_anchored_file_restore(
+        &mut self,
+        directory: audit::AnchoredDir,
+        name: OsString,
+        bytes: Vec<u8>,
+    ) {
+        self.rollback_actions
+            .push(RollbackAction::RestoreAnchoredFile {
+                directory,
+                name,
+                bytes,
+            });
     }
 
     fn rollback(self) -> io::Result<()> {
@@ -142,6 +166,18 @@ fn apply_rollback_action(action: RollbackAction) -> io::Result<()> {
         RollbackAction::RemoveCreatedDirectory(path) => ignore_not_found(fs::remove_dir(path)),
         RollbackAction::RemoveCreatedFile(path) => ignore_not_found(fs::remove_file(path)),
         RollbackAction::RestoreFile { path, bytes } => fs::write(path, bytes),
+        RollbackAction::RestoreAnchoredFile {
+            directory,
+            name,
+            bytes,
+        } => {
+            let mut file = directory.open_regular_for_update_os(&name)?;
+            file.seek(SeekFrom::Start(0))?;
+            file.set_len(0)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            directory.verify_logical_identity()
+        }
     }
 }
 
@@ -287,6 +323,9 @@ fn snapshot_error_to_mutation<E>(error: audit::SnapshotError) -> MutationError<E
     match error {
         audit::SnapshotError::Db(error) => MutationError::Db(error),
         audit::SnapshotError::Io(error) => MutationError::Io(error),
+        audit::SnapshotError::Redaction(error) => {
+            MutationError::Io(io::Error::other(error.to_string()))
+        }
     }
 }
 
@@ -294,6 +333,7 @@ fn snapshot_error_to_io(error: audit::SnapshotError) -> io::Error {
     match error {
         audit::SnapshotError::Io(error) => error,
         audit::SnapshotError::Db(error) => io::Error::other(error.to_string()),
+        audit::SnapshotError::Redaction(error) => io::Error::other(error.to_string()),
     }
 }
 
@@ -377,7 +417,7 @@ mod tests {
         })
         .expect("coordinated mutation should succeed");
 
-        assert_eq!(outcome.value, 3);
+        assert_eq!(outcome.value, 4);
         assert!(outcome.warning.is_none());
         let report = outcome
             .snapshot_report

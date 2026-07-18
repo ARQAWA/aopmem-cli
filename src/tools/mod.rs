@@ -1,23 +1,28 @@
 //! Tool registry and `tool.json` contract helpers.
 
-use std::fs;
-use std::io::{self, Read, Write};
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, File};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::str::FromStr;
 #[cfg(test)]
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
+#[cfg(test)]
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::types::Type;
-use rusqlite::{params, Connection, OptionalExtension, Row};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::artifacts::{self, ToolArtifactCaptureFiles, ToolArtifactStaging};
+use crate::audit::AnchoredDir;
 use crate::mutation::MutationEffects;
 use crate::storage;
 
@@ -46,6 +51,13 @@ const ARTIFACT_FAILURE_SYNC: u8 = 3;
 const ARTIFACT_FAILURE_PUBLISH: u8 = 4;
 #[cfg(test)]
 static ARTIFACT_FAILURE_MODE: AtomicU8 = AtomicU8::new(ARTIFACT_FAILURE_NONE);
+#[cfg(test)]
+static IMPLEMENTATION_SWAP_AFTER_HASH: Mutex<Option<(PathBuf, PathBuf, PathBuf)>> =
+    Mutex::new(None);
+#[cfg(all(test, target_os = "macos"))]
+static DARWIN_FORCE_CLONE_FALLBACK: AtomicBool = AtomicBool::new(false);
+#[cfg(all(test, target_os = "macos"))]
+static DARWIN_MUTATE_SOURCE_DURING_FALLBACK: AtomicBool = AtomicBool::new(false);
 
 /// Default maximum wall-clock time for one tool process.
 pub const DEFAULT_TOOL_RUN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -65,6 +77,28 @@ pub const MAX_TOOL_NAME_BYTES: usize = 4 * 1024;
 pub const MAX_TOOL_TEXT_BYTES: usize = 16 * 1024;
 pub const MAX_TOOL_SCHEMA_BYTES: usize = 128 * 1024;
 pub const MAX_TOOL_EXAMPLES: usize = 100;
+/// Hard bounds for direct tool aliases and their bulk APIs.
+pub const MAX_TOOL_ALIAS_BYTES: usize = MAX_TOOL_ID_BYTES;
+pub const MAX_TOOL_ALIAS_SOURCE_BYTES: usize = 128;
+pub const MAX_TOOL_ALIAS_PAGE_SIZE: usize = 1_000;
+pub const MAX_TOOL_ALIAS_BATCH_SIZE: usize = 1_000;
+/// Hard bounds for one deterministic duplicate-plan operation.
+pub const MAX_TOOL_DEDUPE_TOOLS: usize = 1_000;
+pub const MAX_TOOL_DEDUPE_PAIRS: usize = 10_000;
+pub const MAX_TOOL_IMPLEMENTATION_FILES: usize = 256;
+pub const MAX_TOOL_IMPLEMENTATION_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_TOOL_IMPLEMENTATION_DEPTH: usize = 16;
+pub const MAX_TOOL_IMPLEMENTATION_ENTRIES: usize = 1_024;
+pub const MAX_TOOL_MANIFEST_BYTES: usize = 1024 * 1024;
+/// Bounded technical explanation accepted only for a possible-overlap review.
+pub const MAX_TOOL_TECHNICAL_DISTINCTION_BYTES: usize = 1024;
+/// Maximum shortlisted existing tools inspected by one creation preflight.
+pub const MAX_TOOL_CREATION_GUARD_CANDIDATES: usize = 64;
+const MAX_TOOL_CREATION_GUARD_TOKENS_PER_DOCUMENT: usize = 512;
+const MAX_TOOL_CREATION_GUARD_TOTAL_TOKENS: usize = 262_144;
+/// The only persisted alias state in RC5.
+pub const TOOL_ALIAS_STATUS_ACTIVE: &str = "active";
+const TOOL_ALIAS_BULK_SAVEPOINT: &str = "aopmem_tool_alias_bulk";
 /// Hard maximum wall-clock time accepted by the runner.
 pub const MAX_TOOL_RUN_TIMEOUT: Duration = Duration::from_millis(MAX_TOOL_CONTRACT_TIMEOUT_MS);
 /// Hard maximum captured bytes accepted for each tool output stream.
@@ -192,6 +226,59 @@ pub struct ToolContract {
     pub approval_requirement: String,
     pub examples: Vec<ToolExample>,
     pub runtime: ToolRuntimeInfo,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub platform_launchers: BTreeMap<String, String>,
+}
+
+/// Stable duplicate class shown to callers. Exact-only eligibility is a
+/// separate fact and is never inferred from this label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ToolDuplicateClass {
+    ExactDuplicate,
+    SameImplementationDifferentName,
+    SameCapabilityDifferentWrapper,
+    PossibleOverlap,
+    Distinct,
+}
+
+/// One deterministic comparison from a read-only duplicate plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ToolDuplicateComparison {
+    pub canonical_tool_id: String,
+    pub candidate_tool_id: String,
+    pub class: ToolDuplicateClass,
+    pub exact_only_eligible: bool,
+    pub reasons: Vec<String>,
+}
+
+/// Read-only, bounded duplicate plan reusable by CLI/UI and later apply logic.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ToolDedupePlan {
+    pub writes_performed: bool,
+    pub scanned_tools: usize,
+    pub shortlisted_tools: usize,
+    pub shortlisted_pairs: usize,
+    pub hashed_files: usize,
+    pub comparisons: Vec<ToolDuplicateComparison>,
+}
+
+/// Result of one authoritative exact-only canonicalization pass.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ToolDedupeApplyReport {
+    pub writes_performed: bool,
+    pub scanned_tools: usize,
+    pub hashed_files: usize,
+    pub canonicalized: Vec<ToolCanonicalization>,
+    pub skipped_without_active_canonical: Vec<Vec<String>>,
+    pub possible_overlaps: Vec<ToolDuplicateComparison>,
+}
+
+/// One old id now resolving directly to an active canonical id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ToolCanonicalization {
+    pub canonical_tool_id: String,
+    pub superseded_tool_id: String,
 }
 
 /// SQLite-backed registered tool contract with timestamps.
@@ -209,6 +296,97 @@ pub struct ToolContractsPage {
     pub items: Vec<ToolContractRecord>,
     pub next_after_id: Option<String>,
     pub more_results: bool,
+}
+
+/// One direct alias to an active canonical tool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ToolAlias {
+    pub alias: String,
+    pub canonical_tool_id: String,
+    pub created_at: String,
+    pub source: String,
+    pub status: String,
+}
+
+/// Validated storage input for one direct tool alias.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewToolAlias {
+    pub alias: String,
+    pub canonical_tool_id: String,
+    pub source: String,
+    pub status: String,
+}
+
+/// One keyset-paginated slice of direct tool aliases.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ToolAliasesPage {
+    pub items: Vec<ToolAlias>,
+    pub next_after_alias: Option<String>,
+    pub more_results: bool,
+}
+
+/// How a requested tool id reached its canonical registry record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolIdResolutionKind {
+    DirectCanonical,
+    Alias,
+    SupersededFallback,
+}
+
+/// Deterministic tool-id resolution without filesystem side effects.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ToolIdResolution {
+    pub requested_id: String,
+    pub canonical_tool_id: String,
+    pub matched_alias: Option<String>,
+    pub canonical_status: String,
+    pub kind: ToolIdResolutionKind,
+}
+
+/// Creation-guard classification. Exact fingerprint equality is deliberately
+/// absent because a not-yet-created draft has no implementation bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ToolCreationGuardClass {
+    ActiveIdCollision,
+    AliasCollision,
+    PossibleOverlap,
+}
+
+/// One safe candidate returned by the creation guard.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ToolCreationGuardCandidate {
+    pub canonical_tool_id: String,
+    pub alias_suggestion: String,
+    pub class: ToolCreationGuardClass,
+    pub reasons: Vec<String>,
+}
+
+/// Read-only decision made before draft creation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "decision", rename_all = "snake_case")]
+pub enum ToolCreationGuardDecision {
+    Allowed {
+        technical_distinction_provided: bool,
+        reviewed_candidates: Vec<ToolCreationGuardCandidate>,
+    },
+    Duplicate {
+        candidate: ToolCreationGuardCandidate,
+        writes_performed: bool,
+    },
+    OverlapReviewRequired {
+        candidate: ToolCreationGuardCandidate,
+        writes_performed: bool,
+    },
+}
+
+impl ToolCreationGuardDecision {
+    /// Returns true only when draft creation may proceed.
+    #[must_use]
+    pub const fn is_allowed(&self) -> bool {
+        matches!(self, Self::Allowed { .. })
+    }
 }
 
 /// Minimal input for `aopmem tool create-draft`.
@@ -230,6 +408,14 @@ pub struct DraftToolRecord {
     pub tool_json_path: String,
     pub bin_dir: String,
     pub runtime_dir: String,
+}
+
+/// Safe CLI result from a guarded draft creation.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct GuardedDraftToolRecord {
+    #[serde(flatten)]
+    pub draft: DraftToolRecord,
+    pub technical_distinction_provided: bool,
 }
 
 /// Result of a validated tool manifest.
@@ -435,6 +621,8 @@ pub enum ToolContractValidationError {
     BlankOwnerWorkflow,
     #[error("missing required field: command.entrypoint")]
     MissingCommandEntrypoint,
+    #[error("command.entrypoint must be relative and stay inside the tool directory: {0}")]
+    CommandEntrypointOutsideToolDir(String),
     #[error("args_schema must be a JSON object")]
     ArgsSchemaMustBeObject,
     #[error("output_schema must be a JSON object")]
@@ -455,6 +643,10 @@ pub enum ToolContractValidationError {
     RuntimeExecutablePathOutsideToolDir(String),
     #[error("runtime.runtime_dir must be relative and stay inside the tool directory: {0}")]
     RuntimeDirectoryOutsideToolDir(String),
+    #[error("platform launcher name is invalid: {0}")]
+    InvalidPlatformLauncherName(String),
+    #[error("platform launcher path must be relative and stay inside the tool directory: {0}")]
+    PlatformLauncherOutsideToolDir(String),
     #[error("{field} must be between {minimum} and {maximum} inclusive; received {actual}")]
     RuntimeLimitOutOfRange {
         field: &'static str,
@@ -477,6 +669,66 @@ pub enum ToolContractStorageError {
     Json(#[from] serde_json::Error),
 }
 
+/// Bounded input failures for direct tool aliases.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum ToolAliasValidationError {
+    #[error("missing required field: alias")]
+    MissingAlias,
+    #[error("alias must be a single tool id: {0}")]
+    InvalidAlias(String),
+    #[error("missing required field: canonical_tool_id")]
+    MissingCanonicalToolId,
+    #[error("canonical_tool_id must be a single tool id: {0}")]
+    InvalidCanonicalToolId(String),
+    #[error("missing required field: source")]
+    MissingSource,
+    #[error("{field} exceeds {max_bytes} bytes")]
+    FieldTooLong {
+        field: &'static str,
+        max_bytes: usize,
+    },
+    #[error("{field} must not contain NUL")]
+    ContainsNul { field: &'static str },
+    #[error("invalid tool alias status: {0}; expected active")]
+    InvalidStatus(String),
+    #[error("tool alias page limit exceeds {max_items} items")]
+    PageTooLarge { max_items: usize },
+    #[error("tool alias batch exceeds {max_items} items")]
+    BatchTooLarge { max_items: usize },
+    #[error("tool alias batch contains duplicate alias: {0}")]
+    DuplicateBatchAlias(String),
+}
+
+/// Bounded validation errors for the non-persisted overlap explanation.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum ToolTechnicalDistinctionError {
+    #[error("technical distinction must contain a non-blank UTF-8 explanation")]
+    Blank,
+    #[error("technical distinction exceeds {max_bytes} bytes")]
+    TooLong { max_bytes: usize },
+    #[error("technical distinction must not contain NUL")]
+    ContainsNul,
+}
+
+/// Typed storage and invariant failures for direct tool aliases.
+#[derive(Debug, Error)]
+pub enum ToolAliasStorageError {
+    #[error("{0}")]
+    Validation(#[from] ToolAliasValidationError),
+    #[error("tool alias already exists: {0}")]
+    AliasAlreadyExists(String),
+    #[error("canonical tool not found: {0}")]
+    CanonicalToolNotFound(String),
+    #[error("tool alias target is another alias: {0}")]
+    AliasTargetIsAlias(String),
+    #[error("canonical tool must be active: {tool_id} has status {status}")]
+    CanonicalToolNotActive { tool_id: String, status: String },
+    #[error("tool alias cannot shadow non-superseded tool: {tool_id} has status {status}")]
+    AliasShadowsTool { tool_id: String, status: String },
+    #[error("{0}")]
+    Db(#[from] rusqlite::Error),
+}
+
 /// File read/write errors for local `tool.json`.
 #[derive(Debug, Error)]
 pub enum ToolJsonError {
@@ -497,6 +749,80 @@ pub enum CreateDraftToolError {
     Json(#[from] ToolJsonError),
     #[error("{0}")]
     Io(#[from] io::Error),
+}
+
+/// Fail-closed errors from a bounded, read-only duplicate plan.
+#[derive(Debug, Error)]
+pub enum ToolDedupePlanError {
+    #[error("tool registry exceeds duplicate-plan limit of {max_tools} tools")]
+    TooManyTools { max_tools: usize },
+    #[error("duplicate shortlist exceeds {max_pairs} candidate pairs")]
+    TooManyPairs { max_pairs: usize },
+    #[error("tool contract drift detected between SQLite and tool.json: {0}")]
+    ContractDrift(String),
+    #[error("tool implementation contains an unsafe path or file type: {0}")]
+    UnsafeImplementationPath(String),
+    #[error("tool implementation exceeds {max_files} files: {tool_id}")]
+    TooManyImplementationFiles { tool_id: String, max_files: usize },
+    #[error("tool implementation exceeds {max_entries} descendant entries")]
+    TooManyImplementationEntries { max_entries: usize },
+    #[error("tool implementation exceeds {max_bytes} bytes: {tool_id}")]
+    ImplementationTooLarge { tool_id: String, max_bytes: u64 },
+    #[error("tool implementation changed while fingerprinting: {0}")]
+    ImplementationDrift(String),
+    #[error("{0}")]
+    Db(#[from] rusqlite::Error),
+    #[error("{0}")]
+    Json(#[from] ToolJsonError),
+    #[error("{0}")]
+    Io(#[from] io::Error),
+    #[error("failed to serialize canonical tool fingerprint")]
+    Serialization,
+}
+
+/// Errors from the in-mutation exact-only canonicalizer.
+#[derive(Debug, Error)]
+pub enum ToolDedupeApplyError {
+    #[error(transparent)]
+    Plan(#[from] ToolDedupePlanError),
+    #[error(transparent)]
+    Alias(#[from] ToolAliasStorageError),
+    #[error(transparent)]
+    Db(#[from] rusqlite::Error),
+    #[error(transparent)]
+    Json(#[from] ToolJsonError),
+    #[error("failed to serialize canonical tool contract")]
+    Serialization,
+    #[error(transparent)]
+    Io(#[from] io::Error),
+}
+
+/// Fail-closed errors from tool creation preflight.
+#[derive(Debug, Error)]
+pub enum ToolCreationGuardError {
+    #[error("{0}")]
+    Validation(#[from] ToolContractValidationError),
+    #[error("{0}")]
+    Alias(#[from] ToolAliasStorageError),
+    #[error("{0}")]
+    Plan(#[from] ToolDedupePlanError),
+    #[error("tool creation shortlist exceeds {max_candidates} candidates")]
+    TooManyCandidates { max_candidates: usize },
+    #[error("tool creation search exceeds {max_tokens} bounded description tokens")]
+    TooManySearchTokens { max_tokens: usize },
+    #[error("{0}")]
+    Db(#[from] rusqlite::Error),
+}
+
+/// Combined errors for the authoritative in-mutation creation-guard recheck.
+#[derive(Debug, Error)]
+pub enum GuardedCreateDraftError {
+    #[error("{0}")]
+    Guard(#[from] ToolCreationGuardError),
+    #[error("tool creation blocked by registry guard")]
+    Blocked(ToolCreationGuardDecision),
+    #[error("{0}")]
+    Create(#[from] CreateDraftToolError),
 }
 
 /// Combined errors for `aopmem tool validate`.
@@ -778,6 +1104,1639 @@ pub fn list_tool_contracts_page(
     })
 }
 
+/// Lists canonical (non-superseded) tool contracts with stable keyset
+/// pagination. Alias rows never consume this page's limit or cursor.
+pub fn list_canonical_tool_contracts_page(
+    connection: &Connection,
+    after_tool_id: Option<&str>,
+    limit: usize,
+) -> rusqlite::Result<ToolContractsPage> {
+    if limit == 0 {
+        return Ok(ToolContractsPage {
+            items: Vec::new(),
+            next_after_id: None,
+            more_results: false,
+        });
+    }
+    let query_limit = i64::try_from(limit)
+        .ok()
+        .and_then(|value| value.checked_add(1))
+        .ok_or(rusqlite::Error::InvalidQuery)?;
+    let sql = match after_tool_id {
+        Some(_) => {
+            "
+            SELECT tool_id, name, status, owner_workflow, side_effects,
+                   approval_requirement, contract_json, created_at, updated_at
+            FROM tool_contracts
+            WHERE status <> 'superseded' AND tool_id > ?1
+            ORDER BY tool_id ASC
+            LIMIT ?2
+            "
+        }
+        None => {
+            "
+            SELECT tool_id, name, status, owner_workflow, side_effects,
+                   approval_requirement, contract_json, created_at, updated_at
+            FROM tool_contracts
+            WHERE status <> 'superseded'
+            ORDER BY tool_id ASC
+            LIMIT ?1
+            "
+        }
+    };
+    let mut statement = connection.prepare(sql)?;
+    let mut items = match after_tool_id {
+        Some(after_tool_id) => statement
+            .query_map(
+                params![after_tool_id, query_limit],
+                row_to_tool_contract_record,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?,
+        None => statement
+            .query_map([query_limit], row_to_tool_contract_record)?
+            .collect::<rusqlite::Result<Vec<_>>>()?,
+    };
+    let more_results = items.len() > limit;
+    if more_results {
+        items.pop();
+    }
+    let next_after_id = more_results
+        .then(|| items.last().map(|record| record.contract.tool_id.clone()))
+        .flatten();
+    Ok(ToolContractsPage {
+        items,
+        next_after_id,
+        more_results,
+    })
+}
+
+#[derive(Serialize)]
+struct CapabilityFingerprintInput<'a> {
+    args_schema: Value,
+    output_schema: Value,
+    side_effects: &'a str,
+    approval_requirement: &'a str,
+    timeout_ms: u64,
+    stdout_limit_bytes: u64,
+    stderr_limit_bytes: u64,
+    supports_dry_run: bool,
+    output_mode: &'a str,
+}
+
+#[derive(Serialize)]
+struct CanonicalFingerprintInput<'a> {
+    capability: CapabilityFingerprintInput<'a>,
+    command_entrypoint: String,
+    executable_path: String,
+    runtime_dir: Option<String>,
+    platform_launchers: BTreeMap<String, String>,
+    implementation_files: &'a BTreeMap<String, String>,
+}
+
+struct FingerprintedTool {
+    record: ToolContractRecord,
+    capability_fingerprint: String,
+    canonical_fingerprint: String,
+    implementation_fingerprint: String,
+    normalized_label: String,
+}
+
+struct ImplementationFingerprint {
+    files: BTreeMap<String, String>,
+    content_fingerprint: String,
+    hashed_files: usize,
+}
+
+/// Builds a deterministic duplicate plan without writing SQLite,
+/// observability, manifests, executables, or any other workspace path.
+pub fn plan_tool_deduplication(
+    workspace_paths: &storage::WorkspacePaths,
+    connection: &Connection,
+) -> Result<ToolDedupePlan, ToolDedupePlanError> {
+    let page = list_tool_contracts_page(connection, None, MAX_TOOL_DEDUPE_TOOLS)?;
+    if page.more_results {
+        return Err(ToolDedupePlanError::TooManyTools {
+            max_tools: MAX_TOOL_DEDUPE_TOOLS,
+        });
+    }
+    let records = page.items;
+    let scanned_tools = records.len();
+
+    let mut capability_fingerprints = Vec::with_capacity(records.len());
+    let mut normalized_labels = Vec::with_capacity(records.len());
+    let mut capability_buckets: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    let mut label_buckets: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    let mut token_buckets: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+
+    for (index, record) in records.iter().enumerate() {
+        let capability = capability_fingerprint(&record.contract)?;
+        let label = normalized_tool_label(&record.contract);
+        capability_buckets
+            .entry(capability.clone())
+            .or_default()
+            .push(index);
+        if !label.is_empty() {
+            label_buckets.entry(label.clone()).or_default().push(index);
+            for token in label.split('-') {
+                token_buckets
+                    .entry(token.to_string())
+                    .or_default()
+                    .push(index);
+            }
+        }
+        capability_fingerprints.push(capability);
+        normalized_labels.push(label);
+    }
+
+    let mut pairs = BTreeSet::new();
+    add_bucket_pairs(&capability_buckets, &mut pairs)?;
+    add_bucket_pairs(&label_buckets, &mut pairs)?;
+    add_bucket_pairs(&token_buckets, &mut pairs)?;
+
+    let shortlisted_indices = pairs
+        .iter()
+        .flat_map(|(left, right)| [*left, *right])
+        .collect::<BTreeSet<_>>();
+    let mut fingerprinted = BTreeMap::new();
+    let mut hashed_files = 0_usize;
+    for index in shortlisted_indices.iter().copied() {
+        let (tool, tool_hashed_files) = fingerprint_registered_tool(
+            workspace_paths,
+            records[index].clone(),
+            capability_fingerprints[index].clone(),
+            normalized_labels[index].clone(),
+        )?;
+        hashed_files = hashed_files
+            .checked_add(tool_hashed_files)
+            .ok_or(ToolDedupePlanError::Serialization)?;
+        fingerprinted.insert(index, tool);
+    }
+
+    let mut comparisons = Vec::with_capacity(pairs.len());
+    for (left, right) in pairs {
+        let left = fingerprinted
+            .get(&left)
+            .ok_or(ToolDedupePlanError::Serialization)?;
+        let right = fingerprinted
+            .get(&right)
+            .ok_or(ToolDedupePlanError::Serialization)?;
+        comparisons.push(compare_fingerprinted_tools(left, right));
+    }
+    comparisons.sort_by(|left, right| {
+        left.canonical_tool_id
+            .cmp(&right.canonical_tool_id)
+            .then_with(|| left.candidate_tool_id.cmp(&right.candidate_tool_id))
+            .then_with(|| left.class.cmp(&right.class))
+    });
+
+    Ok(ToolDedupePlan {
+        writes_performed: false,
+        scanned_tools,
+        shortlisted_tools: shortlisted_indices.len(),
+        shortlisted_pairs: comparisons.len(),
+        hashed_files,
+        comparisons,
+    })
+}
+
+/// Rebuilds the Stage 012 fingerprint state under the caller's active
+/// mutation transaction, then canonicalizes only equal full fingerprints.
+///
+/// This deliberately scans each bounded implementation once and groups by
+/// fingerprint. It never expands an equal-fingerprint bucket into pairs.
+pub fn apply_exact_only_deduplication_in_mutation(
+    workspace_paths: &storage::WorkspacePaths,
+    connection: &Connection,
+    effects: &mut MutationEffects,
+) -> Result<ToolDedupeApplyReport, ToolDedupeApplyError> {
+    let page = list_tool_contracts_page(connection, None, MAX_TOOL_DEDUPE_TOOLS)?;
+    if page.more_results {
+        return Err(ToolDedupePlanError::TooManyTools {
+            max_tools: MAX_TOOL_DEDUPE_TOOLS,
+        }
+        .into());
+    }
+    let records = page.items;
+    let mut capabilities = Vec::with_capacity(records.len());
+    let mut labels = Vec::with_capacity(records.len());
+    let mut signal_buckets: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (index, record) in records.iter().enumerate() {
+        let capability = capability_fingerprint(&record.contract)?;
+        let label = normalized_tool_label(&record.contract);
+        signal_buckets
+            .entry(format!("c:{capability}"))
+            .or_default()
+            .push(index);
+        if !label.is_empty() {
+            signal_buckets
+                .entry(format!("l:{label}"))
+                .or_default()
+                .push(index);
+            for token in label.split('-') {
+                signal_buckets
+                    .entry(format!("t:{token}"))
+                    .or_default()
+                    .push(index);
+            }
+        }
+        capabilities.push(capability);
+        labels.push(label);
+    }
+    let mut shortlisted = BTreeSet::new();
+    for bucket in signal_buckets.values() {
+        if bucket.len() > 1 {
+            shortlisted.extend(bucket.iter().copied());
+        }
+    }
+    let mut fingerprinted = BTreeMap::new();
+    let mut fingerprint_buckets: BTreeMap<String, Vec<ToolContractRecord>> = BTreeMap::new();
+    let mut hashed_files = 0_usize;
+    for index in shortlisted.iter().copied() {
+        let (tool, count) = fingerprint_registered_tool(
+            workspace_paths,
+            records[index].clone(),
+            capabilities[index].clone(),
+            labels[index].clone(),
+        )?;
+        hashed_files = hashed_files
+            .checked_add(count)
+            .ok_or(ToolDedupeApplyError::Serialization)?;
+        fingerprint_buckets
+            .entry(tool.canonical_fingerprint.clone())
+            .or_default()
+            .push(tool.record.clone());
+        fingerprinted.insert(index, tool);
+    }
+
+    let mut canonicalized = Vec::new();
+    let mut skipped_without_active_canonical = Vec::new();
+    for records in fingerprint_buckets.values_mut() {
+        if records.len() < 2 {
+            continue;
+        }
+        records.sort_by(|left, right| canonical_record_key(left).cmp(&canonical_record_key(right)));
+        let Some(canonical) = records
+            .iter()
+            .find(|record| record.contract.status == "active")
+            .cloned()
+        else {
+            skipped_without_active_canonical.push(
+                records
+                    .iter()
+                    .map(|record| record.contract.tool_id.clone())
+                    .collect(),
+            );
+            continue;
+        };
+        for duplicate in records
+            .iter()
+            .filter(|record| record.contract.tool_id != canonical.contract.tool_id)
+        {
+            if canonicalize_exact_duplicate(
+                workspace_paths,
+                connection,
+                effects,
+                &canonical,
+                duplicate,
+            )? {
+                canonicalized.push(ToolCanonicalization {
+                    canonical_tool_id: canonical.contract.tool_id.clone(),
+                    superseded_tool_id: duplicate.contract.tool_id.clone(),
+                });
+            }
+        }
+    }
+    canonicalized.sort_by(|left, right| {
+        left.canonical_tool_id
+            .cmp(&right.canonical_tool_id)
+            .then_with(|| left.superseded_tool_id.cmp(&right.superseded_tool_id))
+    });
+    skipped_without_active_canonical.sort();
+    Ok(ToolDedupeApplyReport {
+        writes_performed: !canonicalized.is_empty(),
+        scanned_tools: records.len(),
+        hashed_files,
+        canonicalized,
+        skipped_without_active_canonical,
+        possible_overlaps: authoritative_overlap_reports(&signal_buckets, &fingerprinted)?,
+    })
+}
+
+fn canonicalize_exact_duplicate(
+    workspace_paths: &storage::WorkspacePaths,
+    connection: &Connection,
+    effects: &mut MutationEffects,
+    canonical: &ToolContractRecord,
+    duplicate: &ToolContractRecord,
+) -> Result<bool, ToolDedupeApplyError> {
+    let duplicate_id = &duplicate.contract.tool_id;
+    let canonical_id = &canonical.contract.tool_id;
+    let alias_correct = get_tool_alias(connection, duplicate_id)?
+        .is_some_and(|alias| alias.canonical_tool_id == *canonical_id);
+    if duplicate.contract.status == "superseded" && alias_correct {
+        return Ok(false);
+    }
+    if duplicate.contract.status == "superseded" {
+        if get_tool_alias(connection, duplicate_id)?.is_some() {
+            remove_tool_alias(connection, duplicate_id)?;
+        }
+        add_tool_alias(
+            connection,
+            &NewToolAlias {
+                alias: duplicate_id.clone(),
+                canonical_tool_id: canonical_id.clone(),
+                source: "exact_only_dedupe".to_string(),
+                status: TOOL_ALIAS_STATUS_ACTIVE.to_string(),
+            },
+        )?;
+        return Ok(true);
+    }
+
+    let root = anchored_tool_directory(workspace_paths, duplicate_id)?;
+    let mut manifest =
+        root.open_regular_for_update_os(std::ffi::OsStr::new(TOOL_JSON_FILE_NAME))?;
+    let mut original = Vec::new();
+    manifest.read_to_end(&mut original)?;
+    let mut contract: ToolContract =
+        serde_json::from_slice(&original).map_err(ToolJsonError::Json)?;
+    validate_tool_contract(&contract).map_err(ToolJsonError::Validation)?;
+    if contract != duplicate.contract {
+        return Err(ToolDedupePlanError::ContractDrift(duplicate_id.clone()).into());
+    }
+    contract.status = "superseded".to_string();
+    let replacement =
+        serde_json::to_vec_pretty(&contract).map_err(|_| ToolDedupeApplyError::Serialization)?;
+    effects.register_anchored_file_restore(
+        root.clone(),
+        std::ffi::OsString::from(TOOL_JSON_FILE_NAME),
+        original,
+    );
+    manifest.seek(SeekFrom::Start(0))?;
+    manifest.set_len(0)?;
+    manifest.write_all(&replacement)?;
+    manifest.sync_all()?;
+    root.verify_logical_identity()?;
+
+    let contract_json =
+        serde_json::to_string_pretty(&contract).map_err(|_| ToolDedupeApplyError::Serialization)?;
+    // A duplicate can itself be a current alias target. Retarget those direct
+    // aliases before its status changes; SQLite forbids orphaning them.
+    connection.execute(
+        "UPDATE tool_aliases SET canonical_tool_id = ?1 WHERE canonical_tool_id = ?2 AND status = 'active'",
+        params![canonical_id, duplicate_id],
+    )?;
+    let changed = connection.execute(
+        "UPDATE tool_contracts SET status = 'superseded', contract_json = ?1, updated_at = CURRENT_TIMESTAMP WHERE tool_id = ?2",
+        params![contract_json, duplicate_id],
+    )?;
+    if changed != 1 {
+        return Err(ToolDedupeApplyError::Db(
+            rusqlite::Error::QueryReturnedNoRows,
+        ));
+    }
+    if let Some(alias) = get_tool_alias(connection, duplicate_id)? {
+        if alias.canonical_tool_id != *canonical_id {
+            remove_tool_alias(connection, duplicate_id)?;
+        }
+    }
+    if !alias_correct {
+        add_tool_alias(
+            connection,
+            &NewToolAlias {
+                alias: duplicate_id.clone(),
+                canonical_tool_id: canonical_id.clone(),
+                source: "exact_only_dedupe".to_string(),
+                status: TOOL_ALIAS_STATUS_ACTIVE.to_string(),
+            },
+        )?;
+    }
+    Ok(true)
+}
+
+fn authoritative_overlap_reports(
+    buckets: &BTreeMap<String, Vec<usize>>,
+    fingerprinted: &BTreeMap<usize, FingerprintedTool>,
+) -> Result<Vec<ToolDuplicateComparison>, ToolDedupeApplyError> {
+    let mut pairs = BTreeSet::new();
+    for bucket in buckets.values() {
+        let mut representatives = BTreeMap::new();
+        for index in bucket {
+            if let Some(item) = fingerprinted.get(index) {
+                representatives
+                    .entry(item.canonical_fingerprint.as_str())
+                    .or_insert(item);
+            }
+        }
+        let representatives = representatives.into_values().collect::<Vec<_>>();
+        for (offset, left) in representatives.iter().enumerate() {
+            for right in &representatives[offset + 1..] {
+                pairs.insert((
+                    left.record.contract.tool_id.clone(),
+                    right.record.contract.tool_id.clone(),
+                ));
+                if pairs.len() > MAX_TOOL_DEDUPE_PAIRS {
+                    return Err(ToolDedupePlanError::TooManyPairs {
+                        max_pairs: MAX_TOOL_DEDUPE_PAIRS,
+                    }
+                    .into());
+                }
+            }
+        }
+    }
+    let by_id = fingerprinted
+        .values()
+        .map(|item| (item.record.contract.tool_id.as_str(), item))
+        .collect::<BTreeMap<_, _>>();
+    Ok(pairs
+        .into_iter()
+        .filter_map(|(left, right)| {
+            Some(compare_fingerprinted_tools(
+                by_id.get(left.as_str())?,
+                by_id.get(right.as_str())?,
+            ))
+        })
+        .collect())
+}
+
+fn fingerprint_registered_tool(
+    workspace_paths: &storage::WorkspacePaths,
+    record: ToolContractRecord,
+    capability_fingerprint: String,
+    normalized_label: String,
+) -> Result<(FingerprintedTool, usize), ToolDedupePlanError> {
+    let anchor = anchored_tool_directory(workspace_paths, &record.contract.tool_id)?;
+    let mut implementation_paths = Vec::new();
+    let mut entries_seen = 0_usize;
+    collect_implementation_paths(&anchor, "", 0, &mut entries_seen, &mut implementation_paths)?;
+    let manifest = read_anchored_tool_json(&anchor)?;
+    if manifest != record.contract {
+        return Err(ToolDedupePlanError::ContractDrift(
+            record.contract.tool_id.clone(),
+        ));
+    }
+    let implementation =
+        fingerprint_tool_implementation(&anchor, &record.contract.tool_id, implementation_paths)?;
+    validate_declared_implementation_paths(&record.contract, &implementation.files)?;
+    let canonical_fingerprint =
+        canonical_tool_fingerprint(&record.contract, &implementation.files)?;
+    let manifest_after = read_anchored_tool_json(&anchor)?;
+    if manifest_after != record.contract {
+        return Err(ToolDedupePlanError::ImplementationDrift(
+            record.contract.tool_id.clone(),
+        ));
+    }
+    anchor.verify_logical_identity()?;
+    let hashed_files = implementation.hashed_files;
+    Ok((
+        FingerprintedTool {
+            record,
+            capability_fingerprint,
+            canonical_fingerprint,
+            implementation_fingerprint: implementation.content_fingerprint,
+            normalized_label,
+        },
+        hashed_files,
+    ))
+}
+
+/// Validates an explicit technical distinction without retaining its content.
+pub fn validate_technical_distinction(value: &str) -> Result<(), ToolTechnicalDistinctionError> {
+    if value.is_empty() || value.trim().is_empty() {
+        return Err(ToolTechnicalDistinctionError::Blank);
+    }
+    if value.len() > MAX_TOOL_TECHNICAL_DISTINCTION_BYTES {
+        return Err(ToolTechnicalDistinctionError::TooLong {
+            max_bytes: MAX_TOOL_TECHNICAL_DISTINCTION_BYTES,
+        });
+    }
+    if value.as_bytes().contains(&0) {
+        return Err(ToolTechnicalDistinctionError::ContainsNul);
+    }
+    Ok(())
+}
+
+/// Runs the bounded, read-only creation guard.
+///
+/// Existing candidates are validated with the same anchored Stage 012
+/// fingerprint path. The proposed draft has no implementation bytes, so this
+/// function never claims full-fingerprint equality for it.
+pub fn preflight_tool_creation(
+    workspace_paths: &storage::WorkspacePaths,
+    connection: &Connection,
+    input: &DraftToolInput,
+    runtime: &DraftToolRuntimeInput,
+    technical_distinction_provided: bool,
+) -> Result<ToolCreationGuardDecision, ToolCreationGuardError> {
+    let (decision, records) = creation_guard_registry_decision(
+        connection,
+        input,
+        runtime,
+        technical_distinction_provided,
+    )?;
+    if matches!(decision, ToolCreationGuardDecision::Duplicate { .. }) {
+        return Ok(decision);
+    }
+
+    for record in records {
+        let capability = capability_fingerprint(&record.contract)?;
+        let label = normalized_tool_label(&record.contract);
+        let _ = fingerprint_registered_tool(workspace_paths, record, capability, label)?;
+    }
+    Ok(decision)
+}
+
+/// Rechecks registry-only guard facts inside the coordinated mutation.
+///
+/// Filesystem candidates were already anchored and hashed during immutable
+/// preflight. This second pass closes the registry race without hashing twice.
+pub fn recheck_tool_creation_registry(
+    connection: &Connection,
+    input: &DraftToolInput,
+    runtime: &DraftToolRuntimeInput,
+    technical_distinction_provided: bool,
+) -> Result<ToolCreationGuardDecision, ToolCreationGuardError> {
+    creation_guard_registry_decision(connection, input, runtime, technical_distinction_provided)
+        .map(|(decision, _)| decision)
+}
+
+fn creation_guard_registry_decision(
+    connection: &Connection,
+    input: &DraftToolInput,
+    runtime: &DraftToolRuntimeInput,
+    technical_distinction_provided: bool,
+) -> Result<(ToolCreationGuardDecision, Vec<ToolContractRecord>), ToolCreationGuardError> {
+    validate_draft_tool_input_with_runtime(input, runtime)?;
+    if let Some(record) = get_tool_contract(connection, &input.tool_id)? {
+        let candidate = ToolCreationGuardCandidate {
+            canonical_tool_id: record.contract.tool_id,
+            alias_suggestion: input.tool_id.clone(),
+            class: ToolCreationGuardClass::ActiveIdCollision,
+            reasons: vec!["registry_id_collision".to_string()],
+        };
+        return Ok((
+            ToolCreationGuardDecision::Duplicate {
+                candidate,
+                writes_performed: false,
+            },
+            Vec::new(),
+        ));
+    }
+    if let Some(alias) = get_tool_alias(connection, &input.tool_id)? {
+        let candidate = ToolCreationGuardCandidate {
+            canonical_tool_id: alias.canonical_tool_id,
+            alias_suggestion: input.tool_id.clone(),
+            class: ToolCreationGuardClass::AliasCollision,
+            reasons: vec!["registry_alias_collision".to_string()],
+        };
+        return Ok((
+            ToolCreationGuardDecision::Duplicate {
+                candidate,
+                writes_performed: false,
+            },
+            Vec::new(),
+        ));
+    }
+
+    let page = list_tool_contracts_page(connection, None, MAX_TOOL_DEDUPE_TOOLS)?;
+    if page.more_results {
+        return Err(ToolDedupePlanError::TooManyTools {
+            max_tools: MAX_TOOL_DEDUPE_TOOLS,
+        }
+        .into());
+    }
+    let proposed = draft_tool_contract_with_runtime(input, runtime);
+    let proposed_capability = capability_fingerprint(&proposed)?;
+    let proposed_label = normalized_tool_label(&proposed);
+    let records = page.items;
+    let bm25_scores = creation_bm25_scores(&proposed, &records)?;
+    let mut candidates = Vec::new();
+    for record in records {
+        let score = bm25_scores
+            .get(&record.contract.tool_id)
+            .copied()
+            .unwrap_or(0.0);
+        let reasons = creation_overlap_reasons(
+            &proposed_capability,
+            &proposed_label,
+            score,
+            &record.contract,
+        )?;
+        if !reasons.is_empty() {
+            candidates.push((record, reasons, score));
+        }
+    }
+    candidates.sort_by(
+        |(left_record, left_reasons, left_score), (right_record, right_reasons, right_score)| {
+            creation_reason_rank(left_reasons)
+                .cmp(&creation_reason_rank(right_reasons))
+                .then_with(|| right_score.total_cmp(left_score))
+                .then_with(|| {
+                    left_record
+                        .contract
+                        .tool_id
+                        .cmp(&right_record.contract.tool_id)
+                })
+        },
+    );
+    if candidates.len() > MAX_TOOL_CREATION_GUARD_CANDIDATES {
+        return Err(ToolCreationGuardError::TooManyCandidates {
+            max_candidates: MAX_TOOL_CREATION_GUARD_CANDIDATES,
+        });
+    }
+    let reviewed_candidates = candidates
+        .iter()
+        .map(|(record, reasons, _)| ToolCreationGuardCandidate {
+            canonical_tool_id: record.contract.tool_id.clone(),
+            alias_suggestion: input.tool_id.clone(),
+            class: ToolCreationGuardClass::PossibleOverlap,
+            reasons: reasons.clone(),
+        })
+        .collect::<Vec<_>>();
+    let records = candidates
+        .into_iter()
+        .map(|(record, _, _)| record)
+        .collect::<Vec<_>>();
+    let decision = match reviewed_candidates.first().cloned() {
+        Some(candidate) if !technical_distinction_provided => {
+            ToolCreationGuardDecision::OverlapReviewRequired {
+                candidate,
+                writes_performed: false,
+            }
+        }
+        _ => ToolCreationGuardDecision::Allowed {
+            technical_distinction_provided,
+            reviewed_candidates,
+        },
+    };
+    Ok((decision, records))
+}
+
+fn creation_overlap_reasons(
+    proposed_capability: &str,
+    proposed_label: &str,
+    bm25_score: f64,
+    existing: &ToolContract,
+) -> Result<Vec<String>, ToolDedupePlanError> {
+    let mut reasons = Vec::new();
+    let label_equal =
+        !proposed_label.is_empty() && normalized_tool_label(existing) == proposed_label;
+    if label_equal {
+        reasons.push("normalized_capability_label_equal".to_string());
+    }
+    if bm25_score > 0.0 {
+        reasons.push("bm25_description_candidate".to_string());
+    }
+    if reasons.is_empty() {
+        return Ok(reasons);
+    }
+    if capability_fingerprint(existing)? == proposed_capability {
+        reasons.push("capability_signature_equal".to_string());
+    }
+    reasons.sort();
+    reasons.dedup();
+    Ok(reasons)
+}
+
+fn creation_reason_rank(reasons: &[String]) -> u8 {
+    if reasons
+        .iter()
+        .any(|reason| reason == "capability_signature_equal")
+    {
+        0
+    } else if reasons
+        .iter()
+        .any(|reason| reason == "normalized_capability_label_equal")
+    {
+        1
+    } else {
+        2
+    }
+}
+
+fn creation_bm25_scores(
+    proposed: &ToolContract,
+    records: &[ToolContractRecord],
+) -> Result<BTreeMap<String, f64>, ToolCreationGuardError> {
+    const K1: f64 = 1.2;
+    const B: f64 = 0.75;
+    let query_terms = searchable_tool_terms(proposed)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    if query_terms.is_empty() || records.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let documents = records
+        .iter()
+        .map(|record| {
+            let terms = searchable_tool_terms(&record.contract);
+            let mut frequencies = BTreeMap::<String, usize>::new();
+            for term in &terms {
+                *frequencies.entry(term.clone()).or_default() += 1;
+            }
+            (record.contract.tool_id.clone(), terms.len(), frequencies)
+        })
+        .collect::<Vec<_>>();
+    let total_tokens = documents
+        .iter()
+        .try_fold(query_terms.len(), |total, (_, length, _)| {
+            total.checked_add(*length)
+        });
+    if total_tokens.is_none_or(|total| total > MAX_TOOL_CREATION_GUARD_TOTAL_TOKENS) {
+        return Err(ToolCreationGuardError::TooManySearchTokens {
+            max_tokens: MAX_TOOL_CREATION_GUARD_TOTAL_TOKENS,
+        });
+    }
+    let mut document_frequency = BTreeMap::<String, usize>::new();
+    for term in &query_terms {
+        let count = documents
+            .iter()
+            .filter(|(_, _, frequencies)| frequencies.contains_key(term))
+            .count();
+        document_frequency.insert(term.clone(), count);
+    }
+    let document_count = documents.len() as f64;
+    let average_length = documents
+        .iter()
+        .map(|(_, length, _)| *length as f64)
+        .sum::<f64>()
+        / document_count;
+    Ok(documents
+        .into_iter()
+        .map(|(tool_id, length, frequencies)| {
+            let length = length as f64;
+            let score = query_terms
+                .iter()
+                .filter_map(|term| {
+                    let frequency = frequencies.get(term).copied()? as f64;
+                    let matching_documents =
+                        document_frequency.get(term).copied().unwrap_or_default() as f64;
+                    let inverse_document_frequency = ((document_count - matching_documents + 0.5)
+                        / (matching_documents + 0.5)
+                        + 1.0)
+                        .ln();
+                    let normalization = if average_length > 0.0 {
+                        1.0 - B + B * length / average_length
+                    } else {
+                        1.0
+                    };
+                    Some(
+                        inverse_document_frequency * frequency * (K1 + 1.0)
+                            / (frequency + K1 * normalization),
+                    )
+                })
+                .sum();
+            (tool_id, score)
+        })
+        .collect())
+}
+
+fn searchable_tool_terms(contract: &ToolContract) -> Vec<String> {
+    contract
+        .tool_id
+        .chars()
+        .chain(std::iter::once(' '))
+        .chain(contract.name.chars())
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .filter(|token| {
+            token.len() >= 3
+                && !token.bytes().all(|byte| byte.is_ascii_digit())
+                && !matches!(*token, "tool" | "stage" | "test" | "aopmem")
+        })
+        .take(MAX_TOOL_CREATION_GUARD_TOKENS_PER_DOCUMENT)
+        .map(str::to_string)
+        .collect()
+}
+
+fn add_bucket_pairs(
+    buckets: &BTreeMap<String, Vec<usize>>,
+    pairs: &mut BTreeSet<(usize, usize)>,
+) -> Result<(), ToolDedupePlanError> {
+    for indices in buckets.values() {
+        let possible_pairs = indices
+            .len()
+            .checked_mul(indices.len().saturating_sub(1))
+            .and_then(|value| value.checked_div(2))
+            .ok_or(ToolDedupePlanError::TooManyPairs {
+                max_pairs: MAX_TOOL_DEDUPE_PAIRS,
+            })?;
+        if possible_pairs > MAX_TOOL_DEDUPE_PAIRS {
+            return Err(ToolDedupePlanError::TooManyPairs {
+                max_pairs: MAX_TOOL_DEDUPE_PAIRS,
+            });
+        }
+        for (offset, left) in indices.iter().enumerate() {
+            for right in &indices[offset + 1..] {
+                pairs.insert((*left, *right));
+                if pairs.len() > MAX_TOOL_DEDUPE_PAIRS {
+                    return Err(ToolDedupePlanError::TooManyPairs {
+                        max_pairs: MAX_TOOL_DEDUPE_PAIRS,
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_declared_implementation_paths(
+    contract: &ToolContract,
+    implementation_files: &BTreeMap<String, String>,
+) -> Result<(), ToolDedupePlanError> {
+    let required = std::iter::once(contract.command.entrypoint.as_str())
+        .chain(std::iter::once(contract.runtime.executable_path.as_str()))
+        .chain(contract.platform_launchers.values().map(String::as_str));
+    for path in required {
+        let normalized = normalized_relative_path(path);
+        if !implementation_files.contains_key(&normalized) {
+            return Err(ToolDedupePlanError::UnsafeImplementationPath(format!(
+                "{}:{normalized}",
+                contract.tool_id
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn compare_fingerprinted_tools(
+    left: &FingerprintedTool,
+    right: &FingerprintedTool,
+) -> ToolDuplicateComparison {
+    let full_equal = left.canonical_fingerprint == right.canonical_fingerprint;
+    let implementation_equal = left.implementation_fingerprint == right.implementation_fingerprint;
+    let capability_equal = left.capability_fingerprint == right.capability_fingerprint;
+    let label_equal =
+        !left.normalized_label.is_empty() && left.normalized_label == right.normalized_label;
+
+    let (class, reasons) = if full_equal && left.record.contract.name != right.record.contract.name
+    {
+        (
+            ToolDuplicateClass::SameImplementationDifferentName,
+            vec![
+                "canonical_fingerprint_equal".to_string(),
+                "display_name_differs".to_string(),
+            ],
+        )
+    } else if full_equal {
+        (
+            ToolDuplicateClass::ExactDuplicate,
+            vec!["canonical_fingerprint_equal".to_string()],
+        )
+    } else if implementation_equal {
+        (
+            ToolDuplicateClass::SameImplementationDifferentName,
+            vec![
+                "implementation_fingerprint_equal".to_string(),
+                "canonical_fingerprint_differs".to_string(),
+            ],
+        )
+    } else if capability_equal {
+        (
+            ToolDuplicateClass::SameCapabilityDifferentWrapper,
+            vec![
+                "capability_fingerprint_equal".to_string(),
+                "implementation_fingerprint_differs".to_string(),
+            ],
+        )
+    } else if label_equal {
+        (
+            ToolDuplicateClass::PossibleOverlap,
+            vec!["normalized_capability_label_equal".to_string()],
+        )
+    } else {
+        (
+            ToolDuplicateClass::Distinct,
+            vec!["shortlist_signal_only".to_string()],
+        )
+    };
+
+    let (canonical, candidate) = select_canonical_record(&left.record, &right.record);
+    ToolDuplicateComparison {
+        canonical_tool_id: canonical.contract.tool_id.clone(),
+        candidate_tool_id: candidate.contract.tool_id.clone(),
+        class,
+        exact_only_eligible: full_equal,
+        reasons,
+    }
+}
+
+fn select_canonical_record<'a>(
+    left: &'a ToolContractRecord,
+    right: &'a ToolContractRecord,
+) -> (&'a ToolContractRecord, &'a ToolContractRecord) {
+    if canonical_record_key(left) <= canonical_record_key(right) {
+        (left, right)
+    } else {
+        (right, left)
+    }
+}
+
+fn canonical_record_key(record: &ToolContractRecord) -> (u8, u8, usize, &str, &str) {
+    (
+        if record.contract.status == "active" {
+            0
+        } else {
+            1
+        },
+        if has_non_neutral_tool_suffix(&record.contract.tool_id) {
+            1
+        } else {
+            0
+        },
+        record.contract.tool_id.len(),
+        record.contract.tool_id.as_str(),
+        record.created_at.as_str(),
+    )
+}
+
+fn has_non_neutral_tool_suffix(tool_id: &str) -> bool {
+    const SUFFIXES: &[&str] = &[
+        "internal", "user", "windows", "win", "macos", "linux", "wrapper",
+    ];
+    tool_id
+        .split(['-', '_'])
+        .next_back()
+        .is_some_and(|suffix| SUFFIXES.contains(&suffix))
+}
+
+fn normalized_tool_label(contract: &ToolContract) -> String {
+    const COSMETIC_TOKENS: &[&str] = &[
+        "internal", "user", "windows", "win", "macos", "linux", "wrapper", "tool",
+    ];
+    let mut tokens = contract
+        .name
+        .chars()
+        .chain(std::iter::once(' '))
+        .chain(contract.tool_id.chars())
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .filter(|token| !COSMETIC_TOKENS.contains(token))
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    tokens.remove("");
+    tokens.into_iter().collect::<Vec<_>>().join("-")
+}
+
+fn capability_fingerprint(contract: &ToolContract) -> Result<String, ToolDedupePlanError> {
+    let input = CapabilityFingerprintInput {
+        args_schema: canonical_json_value(&contract.args_schema),
+        output_schema: canonical_json_value(&contract.output_schema),
+        side_effects: &contract.side_effects,
+        approval_requirement: &contract.approval_requirement,
+        timeout_ms: contract.runtime.timeout_ms,
+        stdout_limit_bytes: contract.runtime.stdout_limit_bytes,
+        stderr_limit_bytes: contract.runtime.stderr_limit_bytes,
+        supports_dry_run: contract.runtime.supports_dry_run,
+        output_mode: contract.runtime.output_mode.as_str(),
+    };
+    hash_serializable("aopmem.tool.capability.v1", &input)
+}
+
+fn canonical_tool_fingerprint(
+    contract: &ToolContract,
+    implementation_files: &BTreeMap<String, String>,
+) -> Result<String, ToolDedupePlanError> {
+    let platform_launchers = contract
+        .platform_launchers
+        .iter()
+        .map(|(platform, path)| (platform.clone(), normalized_relative_path(path)))
+        .collect();
+    let input = CanonicalFingerprintInput {
+        capability: CapabilityFingerprintInput {
+            args_schema: canonical_json_value(&contract.args_schema),
+            output_schema: canonical_json_value(&contract.output_schema),
+            side_effects: &contract.side_effects,
+            approval_requirement: &contract.approval_requirement,
+            timeout_ms: contract.runtime.timeout_ms,
+            stdout_limit_bytes: contract.runtime.stdout_limit_bytes,
+            stderr_limit_bytes: contract.runtime.stderr_limit_bytes,
+            supports_dry_run: contract.runtime.supports_dry_run,
+            output_mode: contract.runtime.output_mode.as_str(),
+        },
+        command_entrypoint: normalized_relative_path(&contract.command.entrypoint),
+        executable_path: normalized_relative_path(&contract.runtime.executable_path),
+        runtime_dir: contract
+            .runtime
+            .runtime_dir
+            .as_deref()
+            .map(normalized_relative_path),
+        platform_launchers,
+        implementation_files,
+    };
+    hash_serializable("aopmem.tool.canonical.v1", &input)
+}
+
+fn normalized_relative_path(value: &str) -> String {
+    Path::new(value)
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => value.to_str(),
+            Component::CurDir => None,
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn canonical_json_value(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => {
+            let sorted = object
+                .iter()
+                .map(|(key, value)| (key.clone(), canonical_json_value(value)))
+                .collect();
+            Value::Object(sorted)
+        }
+        Value::Array(values) => Value::Array(values.iter().map(canonical_json_value).collect()),
+        other => other.clone(),
+    }
+}
+
+fn hash_serializable(domain: &str, value: &impl Serialize) -> Result<String, ToolDedupePlanError> {
+    let bytes = serde_json::to_vec(value).map_err(|_| ToolDedupePlanError::Serialization)?;
+    let mut hasher = Sha256::new();
+    hash_component(&mut hasher, domain.as_bytes());
+    hash_component(&mut hasher, &bytes);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn hash_component(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_be_bytes());
+    hasher.update(bytes);
+}
+
+fn fingerprint_tool_implementation(
+    root: &AnchoredDir,
+    tool_id: &str,
+    mut paths: Vec<String>,
+) -> Result<ImplementationFingerprint, ToolDedupePlanError> {
+    paths.sort();
+    if paths.len() > MAX_TOOL_IMPLEMENTATION_FILES {
+        return Err(ToolDedupePlanError::TooManyImplementationFiles {
+            tool_id: tool_id.to_string(),
+            max_files: MAX_TOOL_IMPLEMENTATION_FILES,
+        });
+    }
+
+    let mut total_bytes = 0_u64;
+    let mut files = BTreeMap::new();
+    let mut content_hashes = Vec::with_capacity(paths.len());
+    for relative in paths {
+        let (directory, name, mut file) = open_anchored_relative_file(root, &relative)?;
+        let before = file.metadata()?;
+        total_bytes = total_bytes.checked_add(before.len()).ok_or_else(|| {
+            ToolDedupePlanError::ImplementationTooLarge {
+                tool_id: tool_id.to_string(),
+                max_bytes: MAX_TOOL_IMPLEMENTATION_BYTES,
+            }
+        })?;
+        if total_bytes > MAX_TOOL_IMPLEMENTATION_BYTES {
+            return Err(ToolDedupePlanError::ImplementationTooLarge {
+                tool_id: tool_id.to_string(),
+                max_bytes: MAX_TOOL_IMPLEMENTATION_BYTES,
+            });
+        }
+        let digest = hash_open_file_once(&mut file)?;
+        #[cfg(test)]
+        replace_implementation_after_hash_for_test(&directory.logical_path().join(&name))?;
+        let after = file.metadata()?;
+        if before.len() != after.len()
+            || before.modified().ok() != after.modified().ok()
+            || !after.is_file()
+        {
+            return Err(ToolDedupePlanError::ImplementationDrift(format!(
+                "{tool_id}:{relative}"
+            )));
+        }
+        if !directory.regular_child_matches_open_file(&name, &file)? {
+            return Err(ToolDedupePlanError::ImplementationDrift(format!(
+                "{tool_id}:{relative}"
+            )));
+        }
+        content_hashes.push(digest.clone());
+        files.insert(relative, digest);
+    }
+    content_hashes.sort();
+    let content_fingerprint =
+        hash_serializable("aopmem.tool.implementation-content.v1", &content_hashes)?;
+    Ok(ImplementationFingerprint {
+        hashed_files: files.len(),
+        files,
+        content_fingerprint,
+    })
+}
+
+fn collect_implementation_paths(
+    directory: &AnchoredDir,
+    relative_directory: &str,
+    depth: usize,
+    entries_seen: &mut usize,
+    paths: &mut Vec<String>,
+) -> Result<(), ToolDedupePlanError> {
+    if depth > MAX_TOOL_IMPLEMENTATION_DEPTH {
+        return Err(ToolDedupePlanError::UnsafeImplementationPath(
+            directory.logical_path().display().to_string(),
+        ));
+    }
+    directory.verify_logical_identity()?;
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(directory.logical_path())? {
+        *entries_seen = entries_seen.checked_add(1).ok_or(
+            ToolDedupePlanError::TooManyImplementationEntries {
+                max_entries: MAX_TOOL_IMPLEMENTATION_ENTRIES,
+            },
+        )?;
+        if *entries_seen > MAX_TOOL_IMPLEMENTATION_ENTRIES {
+            return Err(ToolDedupePlanError::TooManyImplementationEntries {
+                max_entries: MAX_TOOL_IMPLEMENTATION_ENTRIES,
+            });
+        }
+        entries.push(entry?);
+    }
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let name = entry.file_name();
+        let path = directory.logical_path().join(&name);
+        let name = name.to_str().ok_or_else(|| {
+            ToolDedupePlanError::UnsafeImplementationPath(path.display().to_string())
+        })?;
+        let metadata = fs::symlink_metadata(&path)?;
+        if tool_root_is_link_or_reparse_point(&metadata) {
+            return Err(ToolDedupePlanError::UnsafeImplementationPath(
+                path.display().to_string(),
+            ));
+        }
+        let relative = if relative_directory.is_empty() {
+            name.to_string()
+        } else {
+            format!("{relative_directory}/{name}")
+        };
+        if relative == TOOL_JSON_FILE_NAME {
+            directory.open_regular_os(entry.file_name().as_os_str())?;
+            continue;
+        }
+        if metadata.is_dir() {
+            let child = directory.child_dir_os(entry.file_name().as_os_str(), false)?;
+            collect_implementation_paths(&child, &relative, depth + 1, entries_seen, paths)?;
+        } else if metadata.is_file() {
+            directory.open_regular_os(entry.file_name().as_os_str())?;
+            paths.push(relative);
+            if paths.len() > MAX_TOOL_IMPLEMENTATION_FILES {
+                return Err(ToolDedupePlanError::TooManyImplementationFiles {
+                    tool_id: directory
+                        .logical_path()
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("<invalid>")
+                        .to_string(),
+                    max_files: MAX_TOOL_IMPLEMENTATION_FILES,
+                });
+            }
+        } else {
+            return Err(ToolDedupePlanError::UnsafeImplementationPath(
+                path.display().to_string(),
+            ));
+        }
+    }
+    directory.verify_logical_identity()?;
+    Ok(())
+}
+
+fn anchored_tool_directory(
+    workspace_paths: &storage::WorkspacePaths,
+    tool_id: &str,
+) -> Result<AnchoredDir, ToolDedupePlanError> {
+    if !is_single_tool_directory_name(tool_id) {
+        return Err(ToolDedupePlanError::UnsafeImplementationPath(
+            tool_id.to_string(),
+        ));
+    }
+    let workspace = AnchoredDir::open_workspace(workspace_paths.root(), None)?;
+    let tools_name = workspace_paths.tools().file_name().ok_or_else(|| {
+        ToolDedupePlanError::UnsafeImplementationPath(workspace_paths.tools().display().to_string())
+    })?;
+    let tools = workspace.child_dir_os(tools_name, false)?;
+    Ok(tools.child_dir_os(std::ffi::OsStr::new(tool_id), false)?)
+}
+
+fn read_anchored_tool_json(root: &AnchoredDir) -> Result<ToolContract, ToolDedupePlanError> {
+    let name = std::ffi::OsStr::new(TOOL_JSON_FILE_NAME);
+    let mut file = root.open_regular_os(name)?;
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take((MAX_TOOL_MANIFEST_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if !root.regular_child_matches_open_file(name, &file)? {
+        return Err(ToolDedupePlanError::ImplementationDrift(
+            "manifest".to_string(),
+        ));
+    }
+    if bytes.len() > MAX_TOOL_MANIFEST_BYTES {
+        return Err(ToolDedupePlanError::UnsafeImplementationPath(format!(
+            "{}:{TOOL_JSON_FILE_NAME}",
+            root.logical_path().display()
+        )));
+    }
+    let contract: ToolContract = serde_json::from_slice(&bytes)
+        .map_err(ToolJsonError::Json)
+        .map_err(ToolDedupePlanError::Json)?;
+    validate_tool_contract(&contract)
+        .map_err(ToolJsonError::Validation)
+        .map_err(ToolDedupePlanError::Json)?;
+    Ok(contract)
+}
+
+fn open_anchored_relative_file(
+    root: &AnchoredDir,
+    relative: &str,
+) -> Result<(AnchoredDir, std::ffi::OsString, File), ToolDedupePlanError> {
+    let components = Path::new(relative).components().collect::<Vec<_>>();
+    if components.is_empty() {
+        return Err(ToolDedupePlanError::UnsafeImplementationPath(
+            relative.to_string(),
+        ));
+    }
+    let mut directory = root.clone();
+    for component in &components[..components.len() - 1] {
+        let Component::Normal(name) = component else {
+            return Err(ToolDedupePlanError::UnsafeImplementationPath(
+                relative.to_string(),
+            ));
+        };
+        directory = directory.child_dir_os(name, false)?;
+    }
+    let Component::Normal(name) = components[components.len() - 1] else {
+        return Err(ToolDedupePlanError::UnsafeImplementationPath(
+            relative.to_string(),
+        ));
+    };
+    let file = directory.open_regular_os(name)?;
+    Ok((directory, name.to_os_string(), file))
+}
+
+#[cfg(test)]
+fn replace_implementation_after_hash_for_test(current: &Path) -> io::Result<()> {
+    let mut hook = IMPLEMENTATION_SWAP_AFTER_HASH
+        .lock()
+        .map_err(|_| io::Error::other("implementation swap hook lock poisoned"))?;
+    let replacement = hook.take();
+    if let Some((target, replacement, destination)) = replacement {
+        if target != current {
+            *hook = Some((target, replacement, destination));
+            return Ok(());
+        }
+        fs::rename(replacement, destination)?;
+    }
+    Ok(())
+}
+
+fn hash_open_file_once(file: &mut File) -> Result<String, ToolDedupePlanError> {
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Adds one direct alias to an active canonical tool.
+///
+/// This function changes SQLite only. It never creates a directory, manifest,
+/// executable, or artifact namespace.
+pub fn add_tool_alias(
+    connection: &Connection,
+    input: &NewToolAlias,
+) -> Result<ToolAlias, ToolAliasStorageError> {
+    validate_new_tool_alias(input)?;
+    if get_tool_alias(connection, &input.alias)?.is_some() {
+        return Err(ToolAliasStorageError::AliasAlreadyExists(
+            input.alias.clone(),
+        ));
+    }
+    if get_tool_alias(connection, &input.canonical_tool_id)?.is_some() {
+        return Err(ToolAliasStorageError::AliasTargetIsAlias(
+            input.canonical_tool_id.clone(),
+        ));
+    }
+
+    let target = get_tool_contract(connection, &input.canonical_tool_id)?.ok_or_else(|| {
+        ToolAliasStorageError::CanonicalToolNotFound(input.canonical_tool_id.clone())
+    })?;
+    if target.contract.status != "active" {
+        return Err(ToolAliasStorageError::CanonicalToolNotActive {
+            tool_id: input.canonical_tool_id.clone(),
+            status: target.contract.status,
+        });
+    }
+
+    if let Some(direct) = get_tool_contract(connection, &input.alias)? {
+        if direct.contract.status != "superseded" {
+            return Err(ToolAliasStorageError::AliasShadowsTool {
+                tool_id: input.alias.clone(),
+                status: direct.contract.status,
+            });
+        }
+    }
+
+    connection.execute(
+        "
+        INSERT INTO tool_aliases (
+            alias, canonical_tool_id, source, status
+        ) VALUES (?1, ?2, ?3, ?4)
+        ",
+        params![
+            &input.alias,
+            &input.canonical_tool_id,
+            &input.source,
+            &input.status
+        ],
+    )?;
+
+    get_tool_alias(connection, &input.alias)?
+        .ok_or_else(|| ToolAliasStorageError::Db(rusqlite::Error::QueryReturnedNoRows))
+}
+
+/// Adds a bounded batch atomically under a nested SQLite savepoint.
+pub fn add_tool_aliases(
+    connection: &Connection,
+    inputs: &[NewToolAlias],
+) -> Result<Vec<ToolAlias>, ToolAliasStorageError> {
+    if inputs.len() > MAX_TOOL_ALIAS_BATCH_SIZE {
+        return Err(ToolAliasValidationError::BatchTooLarge {
+            max_items: MAX_TOOL_ALIAS_BATCH_SIZE,
+        }
+        .into());
+    }
+
+    let mut aliases = BTreeSet::new();
+    for input in inputs {
+        validate_new_tool_alias(input)?;
+        if !aliases.insert(input.alias.as_str()) {
+            return Err(ToolAliasValidationError::DuplicateBatchAlias(input.alias.clone()).into());
+        }
+    }
+
+    connection.execute_batch(&format!("SAVEPOINT {TOOL_ALIAS_BULK_SAVEPOINT}"))?;
+    let result = inputs
+        .iter()
+        .map(|input| add_tool_alias(connection, input))
+        .collect::<Result<Vec<_>, _>>();
+    match result {
+        Ok(records) => {
+            connection.execute_batch(&format!("RELEASE SAVEPOINT {TOOL_ALIAS_BULK_SAVEPOINT}"))?;
+            Ok(records)
+        }
+        Err(error) => {
+            if let Err(rollback_error) = connection.execute_batch(&format!(
+                "ROLLBACK TO SAVEPOINT {TOOL_ALIAS_BULK_SAVEPOINT};\
+                 RELEASE SAVEPOINT {TOOL_ALIAS_BULK_SAVEPOINT}"
+            )) {
+                return Err(ToolAliasStorageError::Db(rollback_error));
+            }
+            Err(error)
+        }
+    }
+}
+
+/// Looks up one direct tool alias by exact id.
+pub fn get_tool_alias(
+    connection: &Connection,
+    alias: &str,
+) -> Result<Option<ToolAlias>, ToolAliasStorageError> {
+    validate_tool_alias_id("alias", alias)?;
+    connection
+        .query_row(
+            "
+            SELECT alias, canonical_tool_id, created_at, source, status
+            FROM tool_aliases
+            WHERE alias = ?1
+            ",
+            [alias],
+            row_to_tool_alias,
+        )
+        .optional()
+        .map_err(ToolAliasStorageError::Db)
+}
+
+/// Lists every direct tool alias in deterministic exact-id order.
+pub fn list_tool_aliases(connection: &Connection) -> Result<Vec<ToolAlias>, ToolAliasStorageError> {
+    let mut statement = connection.prepare(
+        "
+        SELECT alias, canonical_tool_id, created_at, source, status
+        FROM tool_aliases
+        ORDER BY alias ASC
+        ",
+    )?;
+    let aliases = statement
+        .query_map([], row_to_tool_alias)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(aliases)
+}
+
+/// Loads aliases for a bounded canonical page in one indexed SQL query.
+pub fn list_tool_aliases_for_canonical_ids(
+    connection: &Connection,
+    canonical_tool_ids: &[String],
+) -> Result<BTreeMap<String, Vec<ToolAlias>>, ToolAliasStorageError> {
+    if canonical_tool_ids.len() > MAX_TOOL_ALIAS_PAGE_SIZE {
+        return Err(ToolAliasValidationError::PageTooLarge {
+            max_items: MAX_TOOL_ALIAS_PAGE_SIZE,
+        }
+        .into());
+    }
+    let mut grouped = canonical_tool_ids
+        .iter()
+        .map(|tool_id| (tool_id.clone(), Vec::new()))
+        .collect::<BTreeMap<_, _>>();
+    if canonical_tool_ids.is_empty() {
+        return Ok(grouped);
+    }
+    for tool_id in canonical_tool_ids {
+        validate_tool_alias_id("canonical_tool_id", tool_id)?;
+    }
+    let placeholders = (1..=canonical_tool_ids.len())
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "
+        SELECT alias, canonical_tool_id, created_at, source, status
+        FROM tool_aliases
+        WHERE canonical_tool_id IN ({placeholders})
+          AND status = 'active'
+        ORDER BY canonical_tool_id ASC, alias ASC
+        "
+    );
+    let mut statement = connection.prepare(&sql)?;
+    let aliases = statement
+        .query_map(
+            params_from_iter(canonical_tool_ids.iter()),
+            row_to_tool_alias,
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for alias in aliases {
+        grouped
+            .entry(alias.canonical_tool_id.clone())
+            .or_default()
+            .push(alias);
+    }
+    Ok(grouped)
+}
+
+/// Lists one bounded, stable keyset page of direct tool aliases.
+pub fn list_tool_aliases_page(
+    connection: &Connection,
+    after_alias: Option<&str>,
+    limit: usize,
+) -> Result<ToolAliasesPage, ToolAliasStorageError> {
+    if limit > MAX_TOOL_ALIAS_PAGE_SIZE {
+        return Err(ToolAliasValidationError::PageTooLarge {
+            max_items: MAX_TOOL_ALIAS_PAGE_SIZE,
+        }
+        .into());
+    }
+    if let Some(after_alias) = after_alias {
+        validate_tool_alias_id("after_alias", after_alias)?;
+    }
+    if limit == 0 {
+        return Ok(ToolAliasesPage {
+            items: Vec::new(),
+            next_after_alias: None,
+            more_results: false,
+        });
+    }
+
+    let query_limit = i64::try_from(limit)
+        .ok()
+        .and_then(|value| value.checked_add(1))
+        .ok_or(rusqlite::Error::InvalidQuery)?;
+    let mut items = match after_alias {
+        Some(after_alias) => {
+            let mut statement = connection.prepare(
+                "
+                SELECT alias, canonical_tool_id, created_at, source, status
+                FROM tool_aliases
+                WHERE alias > ?1
+                ORDER BY alias ASC
+                LIMIT ?2
+                ",
+            )?;
+            let page = statement
+                .query_map(params![after_alias, query_limit], row_to_tool_alias)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            page
+        }
+        None => {
+            let mut statement = connection.prepare(
+                "
+                SELECT alias, canonical_tool_id, created_at, source, status
+                FROM tool_aliases
+                ORDER BY alias ASC
+                LIMIT ?1
+                ",
+            )?;
+            let page = statement
+                .query_map([query_limit], row_to_tool_alias)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            page
+        }
+    };
+
+    let more_results = items.len() > limit;
+    if more_results {
+        items.pop();
+    }
+    let next_after_alias = more_results
+        .then(|| items.last().map(|record| record.alias.clone()))
+        .flatten();
+    Ok(ToolAliasesPage {
+        items,
+        next_after_alias,
+        more_results,
+    })
+}
+
+/// Removes one exact alias without touching its canonical tool files.
+pub fn remove_tool_alias(
+    connection: &Connection,
+    alias: &str,
+) -> Result<Option<ToolAlias>, ToolAliasStorageError> {
+    let existing = get_tool_alias(connection, alias)?;
+    if existing.is_some() {
+        connection.execute("DELETE FROM tool_aliases WHERE alias = ?1", [alias])?;
+    }
+    Ok(existing)
+}
+
+/// Resolves one requested id with stable precedence.
+///
+/// Direct non-superseded tools win first. An active alias to an active target
+/// wins over a direct superseded record. A superseded direct record remains a
+/// final compatibility fallback.
+pub fn resolve_tool_id(
+    connection: &Connection,
+    requested_id: &str,
+) -> Result<Option<ToolIdResolution>, ToolAliasStorageError> {
+    validate_tool_alias_id("requested_id", requested_id)?;
+    connection
+        .query_row(
+            "
+            WITH candidates (
+                precedence, requested_id, canonical_tool_id,
+                matched_alias, canonical_status, resolution_kind
+            ) AS (
+                SELECT
+                    0, ?1, tool_id, NULL, status, 'direct_canonical'
+                FROM tool_contracts
+                WHERE tool_id = ?1 AND status <> 'superseded'
+                UNION ALL
+                SELECT
+                    1, ?1, aliases.canonical_tool_id, aliases.alias,
+                    canonical.status, 'alias'
+                FROM tool_aliases AS aliases
+                JOIN tool_contracts AS canonical
+                  ON canonical.tool_id = aliases.canonical_tool_id
+                WHERE aliases.alias = ?1
+                  AND aliases.status = 'active'
+                  AND canonical.status = 'active'
+                UNION ALL
+                SELECT
+                    2, ?1, tool_id, NULL, status, 'superseded_fallback'
+                FROM tool_contracts
+                WHERE tool_id = ?1 AND status = 'superseded'
+            )
+            SELECT
+                requested_id, canonical_tool_id, matched_alias,
+                canonical_status, resolution_kind
+            FROM candidates
+            ORDER BY precedence ASC
+            LIMIT 1
+            ",
+            [requested_id],
+            row_to_tool_id_resolution,
+        )
+        .optional()
+        .map_err(ToolAliasStorageError::Db)
+}
+
 /// Writes `tool.json` under `tools/<tool-id>/`.
 pub fn write_tool_json(
     workspace_paths: &storage::WorkspacePaths,
@@ -860,6 +2819,34 @@ pub fn create_draft_tool_in_mutation_with_runtime(
         |staging_root, tool_root| fs::rename(staging_root, tool_root),
         effects,
     )
+}
+
+/// Rechecks the creation guard before the first write and creates the draft
+/// only when the registry decision still permits it.
+pub fn create_guarded_draft_tool_in_mutation(
+    workspace_paths: &storage::WorkspacePaths,
+    connection: &Connection,
+    input: &DraftToolInput,
+    runtime: &DraftToolRuntimeInput,
+    technical_distinction_provided: bool,
+    effects: &mut MutationEffects,
+) -> Result<GuardedDraftToolRecord, GuardedCreateDraftError> {
+    let decision =
+        recheck_tool_creation_registry(connection, input, runtime, technical_distinction_provided)?;
+    if !decision.is_allowed() {
+        return Err(GuardedCreateDraftError::Blocked(decision));
+    }
+    let draft = create_draft_tool_in_mutation_with_runtime(
+        workspace_paths,
+        connection,
+        input,
+        runtime,
+        effects,
+    )?;
+    Ok(GuardedDraftToolRecord {
+        draft,
+        technical_distinction_provided,
+    })
 }
 
 fn create_draft_tool_with_publish(
@@ -1519,6 +3506,30 @@ fn prepare_tool_command(
 }
 
 #[cfg(target_os = "macos")]
+fn darwin_clone_fallback_forced() -> bool {
+    #[cfg(test)]
+    {
+        DARWIN_FORCE_CLONE_FALLBACK.load(Ordering::SeqCst)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn darwin_mutate_source_during_fallback() -> bool {
+    #[cfg(test)]
+    {
+        DARWIN_MUTATE_SOURCE_DURING_FALLBACK.load(Ordering::SeqCst)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn prepare_tool_command(
     executable_path: &Path,
     tool_root: &Path,
@@ -1527,7 +3538,7 @@ fn prepare_tool_command(
     use std::ffi::CString;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::os::unix::process::CommandExt;
 
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1536,10 +3547,33 @@ fn prepare_tool_command(
         inode: u64,
     }
 
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    struct FileState {
+        identity: FileIdentity,
+        len: u64,
+        mode: u32,
+        modified_seconds: i64,
+        modified_nanoseconds: i64,
+        changed_seconds: i64,
+        changed_nanoseconds: i64,
+    }
+
     fn metadata_identity(metadata: &fs::Metadata) -> FileIdentity {
         FileIdentity {
             device: metadata.dev(),
             inode: metadata.ino(),
+        }
+    }
+
+    fn metadata_state(metadata: &fs::Metadata) -> FileState {
+        FileState {
+            identity: metadata_identity(metadata),
+            len: metadata.len(),
+            mode: metadata.mode(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+            changed_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
         }
     }
 
@@ -1582,6 +3616,26 @@ fn prepare_tool_command(
             )
         })?;
         let fd = unsafe { libc::openat(directory_fd, component.as_ptr(), flags) };
+        if fd < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+        }
+    }
+
+    fn createat_component(
+        directory_fd: libc::c_int,
+        component: &CString,
+        mode: u32,
+    ) -> io::Result<OwnedFd> {
+        let fd = unsafe {
+            libc::openat(
+                directory_fd,
+                component.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                mode as libc::c_uint,
+            )
+        };
         if fd < 0 {
             Err(io::Error::last_os_error())
         } else {
@@ -1643,61 +3697,104 @@ fn prepare_tool_command(
         executable_name,
         libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
     )?;
-    if fd_identity(executable_fd.as_raw_fd())? != metadata_identity(&expected_executable) {
+    let opened_executable = File::from(executable_fd.try_clone()?);
+    let expected_executable_state = metadata_state(&expected_executable);
+    let opened_executable_state = metadata_state(&opened_executable.metadata()?);
+    if opened_executable_state != expected_executable_state
+        || fd_identity(executable_fd.as_raw_fd())? != expected_executable_state.identity
+    {
         return Err(io::Error::other(
             "validated tool executable changed before process spawn",
+        ));
+    }
+    if expected_executable.len() > MAX_TOOL_IMPLEMENTATION_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "validated tool executable exceeds the snapshot byte ceiling",
         ));
     }
 
     let anchor_name = format!(".aopmem-exec-{}", uuid::Uuid::new_v4());
     let anchor_name_c = CString::new(anchor_name.as_bytes())
         .map_err(|_| io::Error::other("generated executable anchor name was invalid"))?;
-    let executable_name_c = CString::new(executable_name.as_bytes()).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "validated tool path contains an interior NUL byte",
-        )
-    })?;
-    if unsafe {
-        libc::linkat(
-            directory_fd,
-            executable_name_c.as_ptr(),
-            root_fd.as_raw_fd(),
-            anchor_name_c.as_ptr(),
-            0,
-        )
-    } != 0
-    {
-        let error = io::Error::last_os_error();
-        return Err(error);
-    }
     drop(current_directory);
     let anchor_root_fd = unsafe { libc::fcntl(root_fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 64) };
     if anchor_root_fd < 0 {
-        let error = io::Error::last_os_error();
-        let _unlink_result =
-            unsafe { libc::unlinkat(root_fd.as_raw_fd(), anchor_name_c.as_ptr(), 0) };
-        return Err(error);
+        return Err(io::Error::last_os_error());
     }
     let executable_anchor = DarwinExecutableAnchor {
         root_fd: unsafe { OwnedFd::from_raw_fd(anchor_root_fd) },
         name: anchor_name_c,
     };
-    let anchor_fd = openat_component(
-        root_fd.as_raw_fd(),
-        std::ffi::OsStr::new(&anchor_name),
-        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-    )?;
-    if fd_identity(anchor_fd.as_raw_fd())? != fd_identity(executable_fd.as_raw_fd())? {
+    let executable_mode = expected_executable.permissions().mode() & 0o777;
+    const CLONE_NOOWNERCOPY: u32 = 0x0002;
+    unsafe extern "C" {
+        fn fclonefileat(
+            source_fd: libc::c_int,
+            destination_directory_fd: libc::c_int,
+            destination_name: *const libc::c_char,
+            flags: u32,
+        ) -> libc::c_int;
+    }
+    let clone_result = if darwin_clone_fallback_forced() {
+        -1
+    } else {
+        unsafe {
+            fclonefileat(
+                executable_fd.as_raw_fd(),
+                root_fd.as_raw_fd(),
+                executable_anchor.name.as_ptr(),
+                CLONE_NOOWNERCOPY,
+            )
+        }
+    };
+    if clone_result != 0 {
+        let clone_error = if darwin_clone_fallback_forced() {
+            io::Error::from_raw_os_error(libc::ENOTSUP)
+        } else {
+            io::Error::last_os_error()
+        };
+        if !matches!(
+            clone_error.raw_os_error(),
+            Some(libc::ENOTSUP) | Some(libc::EXDEV)
+        ) {
+            return Err(clone_error);
+        }
+        let anchor_fd = createat_component(
+            root_fd.as_raw_fd(),
+            &executable_anchor.name,
+            executable_mode,
+        )?;
+        let mut source = File::from(executable_fd.try_clone()?);
+        source.seek(SeekFrom::Start(0))?;
+        let mut snapshot = File::from(anchor_fd);
+        let copied = io::copy(
+            &mut source.take(MAX_TOOL_IMPLEMENTATION_BYTES.saturating_add(1)),
+            &mut snapshot,
+        )?;
+        if copied != expected_executable.len() {
+            return Err(io::Error::other(
+                "validated tool executable snapshot was incomplete",
+            ));
+        }
+        snapshot.set_permissions(fs::Permissions::from_mode(executable_mode))?;
+        snapshot.sync_all()?;
+        if darwin_mutate_source_during_fallback() {
+            let mut source_path = fs::OpenOptions::new().write(true).open(executable_path)?;
+            source_path.write_all(b"\n# mutated during snapshot\n")?;
+            source_path.sync_all()?;
+        }
+    }
+    let final_executable = File::from(executable_fd.try_clone()?);
+    if metadata_state(&final_executable.metadata()?) != opened_executable_state {
         return Err(io::Error::other(
-            "validated tool executable changed while creating its stable launch anchor",
+            "validated tool executable changed while creating its stable snapshot",
         ));
     }
-    drop(anchor_fd);
-    // Darwin has no fd-relative exec. A unique hardlink in the already-opened
-    // root gives execve a stable, root-contained pathname even if an executable
-    // ancestor is swapped. Shebang interpreters can expose this pathname as
-    // `$0`, so `$0` is intentionally not the runtime resource base.
+    // Darwin has no fd-relative exec. An APFS clone in the already-opened root
+    // gives execve an O(1), metadata-preserving snapshot even if an executable
+    // ancestor is swapped. Unsupported filesystems use a bounded fd-to-fd copy.
+    // A separate inode also avoids endpoint-security rejection of new hardlinks.
     let stable_executable_path = PathBuf::from(format!("./{anchor_name}"));
     let root_raw_fd = root_fd.as_raw_fd();
     let mut command = Command::new(stable_executable_path);
@@ -1809,7 +3906,6 @@ fn run_bounded_tool_process(
         let remaining = limits.timeout.saturating_sub(started.elapsed());
         thread::sleep(TOOL_RUN_POLL_INTERVAL.min(remaining));
     };
-
     // A direct parent may exit while a descendant still owns inherited pipes.
     // Always close the whole isolated tree before collecting reader results.
     if let Err(error) = terminate_tool_process_tree(&mut process_tree, &mut child) {
@@ -2573,6 +4669,7 @@ struct DarwinProcessIdentity {
 struct DarwinProcessDetails {
     identity: DarwinProcessIdentity,
     parent_pid: libc::pid_t,
+    process_group: libc::pid_t,
     status: u32,
 }
 
@@ -2608,6 +4705,11 @@ struct DarwinProcBsdInfo {
 unsafe extern "C" {
     fn proc_listchildpids(
         parent_pid: libc::pid_t,
+        buffer: *mut libc::c_void,
+        buffer_size: libc::c_int,
+    ) -> libc::c_int;
+    fn proc_listpgrppids(
+        process_group: libc::pid_t,
         buffer: *mut libc::c_void,
         buffer_size: libc::c_int,
     ) -> libc::c_int;
@@ -2766,6 +4868,8 @@ where
             },
             parent_pid: libc::pid_t::try_from(info.parent_pid)
                 .map_err(|_| io::Error::other("macOS parent process id is outside pid_t"))?,
+            process_group: libc::pid_t::try_from(info.process_group)
+                .map_err(|_| io::Error::other("macOS process group is outside pid_t"))?,
             status: info.status,
         }));
     }
@@ -2898,27 +5002,6 @@ fn darwin_process_is_absent(error: &io::Error) -> bool {
 }
 
 #[cfg(target_os = "macos")]
-fn darwin_completed_process_group_error_is_benign(
-    raw_os_error: Option<i32>,
-    direct_process_completed: bool,
-    tracked_process_is_live: bool,
-) -> bool {
-    raw_os_error == Some(libc::ESRCH)
-        || (raw_os_error == Some(libc::EPERM)
-            && direct_process_completed
-            && !tracked_process_is_live)
-}
-
-#[cfg(target_os = "macos")]
-fn darwin_empty_group_eperm_needs_completion_retry(
-    raw_os_error: Option<i32>,
-    direct_process_completed: bool,
-    tracked_process_is_live: bool,
-) -> bool {
-    raw_os_error == Some(libc::EPERM) && !direct_process_completed && !tracked_process_is_live
-}
-
-#[cfg(target_os = "macos")]
 fn darwin_remove_completed_exact_root(
     live: &mut Vec<DarwinProcessIdentity>,
     root: DarwinProcessIdentity,
@@ -2927,6 +5010,66 @@ fn darwin_remove_completed_exact_root(
     if direct_process_completed {
         live.retain(|identity| *identity != root);
     }
+}
+
+#[cfg(target_os = "macos")]
+fn darwin_process_group_pids(process_group: libc::pid_t) -> io::Result<Vec<libc::pid_t>> {
+    let estimated = unsafe { proc_listpgrppids(process_group, std::ptr::null_mut(), 0) };
+    if estimated < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let allocation = usize::try_from(estimated)
+        .map_err(|_| io::Error::other("macOS process-group list size is invalid"))?
+        .saturating_add(16)
+        .min(DARWIN_MAX_TRACKED_TOOL_PROCESSES);
+    if allocation == 0 {
+        return Ok(Vec::new());
+    }
+    let mut pids = vec![0; allocation];
+    let buffer_size = libc::c_int::try_from(
+        pids.len()
+            .saturating_mul(std::mem::size_of::<libc::pid_t>()),
+    )
+    .map_err(|_| io::Error::other("macOS process-group list buffer is too large"))?;
+    let returned =
+        unsafe { proc_listpgrppids(process_group, pids.as_mut_ptr().cast(), buffer_size) };
+    if returned < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let returned = usize::try_from(returned)
+        .map_err(|_| io::Error::other("macOS process-group list result is invalid"))?;
+    if returned >= pids.len() {
+        return Err(io::Error::other(
+            "macOS process-group list exceeded the tracked-process ceiling",
+        ));
+    }
+    pids.truncate(returned);
+    pids.retain(|pid| *pid > 0);
+    Ok(pids)
+}
+
+#[cfg(target_os = "macos")]
+fn darwin_process_group_identities(
+    process_group: libc::pid_t,
+    root: DarwinProcessIdentity,
+) -> io::Result<Vec<DarwinProcessIdentity>> {
+    let mut identities = Vec::new();
+    for pid in darwin_process_group_pids(process_group)? {
+        let Some(details) = darwin_process_details(pid)? else {
+            continue;
+        };
+        if details.process_group != process_group || details.status == DARWIN_ZOMBIE_PROCESS_STATUS
+        {
+            continue;
+        }
+        if details.identity.pid == root.pid && details.identity != root {
+            // The original group is gone and its leader pid was reused. Never
+            // signal identities from the unrelated replacement group.
+            return Ok(Vec::new());
+        }
+        identities.push(details.identity);
+    }
+    Ok(identities)
 }
 
 #[cfg(target_os = "macos")]
@@ -3047,13 +5190,29 @@ fn terminate_tool_process_tree(
     child: &mut std::process::Child,
 ) -> io::Result<()> {
     let deadline = Instant::now() + TOOL_RUN_CLEANUP_TIMEOUT;
+    let mut stopped = std::collections::BTreeMap::new();
     loop {
         let discovered = process_tree.tracker.refresh(child)?;
-        let live = process_tree.tracker.live_identities(child)?;
+        let mut live = process_tree.tracker.live_identities(child)?;
+        live.extend(darwin_process_group_identities(
+            process_tree.process_group,
+            process_tree.tracker.root,
+        )?);
+        darwin_remove_completed_exact_root(
+            &mut live,
+            process_tree.tracker.root,
+            child.try_wait()?.is_some(),
+        );
+        let mut newly_stopped = 0usize;
         for identity in live {
+            if stopped.get(&identity.pid) == Some(&identity) {
+                continue;
+            }
             darwin_signal_identity(identity, process_tree.tracker.root, child, libc::SIGSTOP)?;
+            stopped.insert(identity.pid, identity);
+            newly_stopped += 1;
         }
-        if discovered == 0 {
+        if discovered == 0 && newly_stopped == 0 {
             break;
         }
         if Instant::now() >= deadline {
@@ -3065,48 +5224,31 @@ fn terminate_tool_process_tree(
     }
 
     let mut tracked = process_tree.tracker.live_identities(child)?;
-    loop {
-        if unsafe { libc::kill(-process_tree.process_group, libc::SIGKILL) } == 0 {
-            break;
-        }
-        let error = io::Error::last_os_error();
-        tracked = process_tree.tracker.live_identities(child)?;
-        // Re-check after the libproc scan: the direct shell may complete while
-        // that scan is observing its stale non-zombie process record.
-        let direct_process_completed = child.try_wait()?.is_some();
-        darwin_remove_completed_exact_root(
-            &mut tracked,
-            process_tree.tracker.root,
-            direct_process_completed,
-        );
-        if darwin_completed_process_group_error_is_benign(
-            error.raw_os_error(),
-            direct_process_completed,
-            !tracked.is_empty(),
-        ) {
-            break;
-        }
-        if darwin_empty_group_eperm_needs_completion_retry(
-            error.raw_os_error(),
-            direct_process_completed,
-            !tracked.is_empty(),
-        ) && Instant::now() < deadline
-        {
-            // macOS can briefly report an empty libproc view before waitpid
-            // exposes the fast shell's exit. Retry only until completion can
-            // be confirmed; a visible root or descendant still fails closed.
-            thread::sleep(TOOL_RUN_POLL_INTERVAL);
-            continue;
-        }
-        return Err(error);
-    }
+    tracked.extend(darwin_process_group_identities(
+        process_tree.process_group,
+        process_tree.tracker.root,
+    )?);
+    darwin_remove_completed_exact_root(
+        &mut tracked,
+        process_tree.tracker.root,
+        child.try_wait()?.is_some(),
+    );
     for identity in tracked {
         darwin_signal_identity(identity, process_tree.tracker.root, child, libc::SIGKILL)?;
     }
 
     while Instant::now() < deadline {
         process_tree.tracker.refresh(child)?;
-        let live = process_tree.tracker.live_identities(child)?;
+        let mut live = process_tree.tracker.live_identities(child)?;
+        live.extend(darwin_process_group_identities(
+            process_tree.process_group,
+            process_tree.tracker.root,
+        )?);
+        darwin_remove_completed_exact_root(
+            &mut live,
+            process_tree.tracker.root,
+            child.try_wait()?.is_some(),
+        );
         if live.is_empty() {
             return Ok(());
         }
@@ -3115,7 +5257,11 @@ fn terminate_tool_process_tree(
         }
         thread::sleep(TOOL_RUN_POLL_INTERVAL);
     }
-    if process_tree.tracker.live_identities(child)?.is_empty() {
+    let tracker_empty = process_tree.tracker.live_identities(child)?.is_empty();
+    let group_empty =
+        darwin_process_group_identities(process_tree.process_group, process_tree.tracker.root)?
+            .is_empty();
+    if tracker_empty && group_empty {
         Ok(())
     } else {
         Err(io::Error::new(
@@ -3411,6 +5557,7 @@ fn draft_tool_contract_with_runtime(
             supports_dry_run: runtime.supports_dry_run,
             output_mode: runtime.output_mode,
         },
+        platform_launchers: BTreeMap::new(),
     }
 }
 
@@ -3464,6 +5611,13 @@ fn validate_tool_contract(contract: &ToolContract) -> Result<(), ToolContractVal
         &contract.command.entrypoint,
         MAX_TOOL_TEXT_BYTES,
     )?;
+    if !is_relative_path_inside_tool_dir(&contract.command.entrypoint) {
+        return Err(
+            ToolContractValidationError::CommandEntrypointOutsideToolDir(
+                contract.command.entrypoint.clone(),
+            ),
+        );
+    }
     if !contract.args_schema.is_object() {
         return Err(ToolContractValidationError::ArgsSchemaMustBeObject);
     }
@@ -3546,6 +5700,24 @@ fn validate_tool_contract(contract: &ToolContract) -> Result<(), ToolContractVal
                 contract.runtime.executable_path.clone(),
             ),
         );
+    }
+    for (platform, launcher) in &contract.platform_launchers {
+        if platform.is_empty()
+            || platform.len() > 64
+            || !platform
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        {
+            return Err(ToolContractValidationError::InvalidPlatformLauncherName(
+                platform.clone(),
+            ));
+        }
+        validate_tool_text_size("platform_launchers[]", launcher, MAX_TOOL_TEXT_BYTES)?;
+        if !is_relative_path_inside_tool_dir(launcher) {
+            return Err(ToolContractValidationError::PlatformLauncherOutsideToolDir(
+                launcher.clone(),
+            ));
+        }
     }
 
     Ok(())
@@ -3752,6 +5924,98 @@ fn approval_granted(approved: Option<&str>) -> bool {
     approved.is_some_and(|value| value.contains("+++"))
 }
 
+/// Validates one alias input without reading or writing SQLite.
+pub fn validate_new_tool_alias(input: &NewToolAlias) -> Result<(), ToolAliasValidationError> {
+    validate_tool_alias_id("alias", &input.alias)?;
+    validate_tool_alias_id("canonical_tool_id", &input.canonical_tool_id)?;
+    validate_tool_alias_text(
+        "source",
+        &input.source,
+        MAX_TOOL_ALIAS_SOURCE_BYTES,
+        ToolAliasValidationError::MissingSource,
+    )?;
+    if input.status != TOOL_ALIAS_STATUS_ACTIVE {
+        return Err(ToolAliasValidationError::InvalidStatus(
+            input.status.clone(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_tool_alias_id(
+    field: &'static str,
+    value: &str,
+) -> Result<(), ToolAliasValidationError> {
+    let missing = if field == "canonical_tool_id" {
+        ToolAliasValidationError::MissingCanonicalToolId
+    } else {
+        ToolAliasValidationError::MissingAlias
+    };
+    validate_tool_alias_text(field, value, MAX_TOOL_ALIAS_BYTES, missing)?;
+    if !is_single_tool_directory_name(value) {
+        return Err(if field == "canonical_tool_id" {
+            ToolAliasValidationError::InvalidCanonicalToolId(value.to_string())
+        } else {
+            ToolAliasValidationError::InvalidAlias(value.to_string())
+        });
+    }
+    Ok(())
+}
+
+fn validate_tool_alias_text(
+    field: &'static str,
+    value: &str,
+    max_bytes: usize,
+    missing: ToolAliasValidationError,
+) -> Result<(), ToolAliasValidationError> {
+    if value.trim().is_empty() {
+        return Err(missing);
+    }
+    if value.len() > max_bytes {
+        return Err(ToolAliasValidationError::FieldTooLong { field, max_bytes });
+    }
+    if value.contains('\0') {
+        return Err(ToolAliasValidationError::ContainsNul { field });
+    }
+    Ok(())
+}
+
+fn row_to_tool_alias(row: &Row<'_>) -> rusqlite::Result<ToolAlias> {
+    Ok(ToolAlias {
+        alias: row.get(0)?,
+        canonical_tool_id: row.get(1)?,
+        created_at: row.get(2)?,
+        source: row.get(3)?,
+        status: row.get(4)?,
+    })
+}
+
+fn row_to_tool_id_resolution(row: &Row<'_>) -> rusqlite::Result<ToolIdResolution> {
+    let kind_value: String = row.get(4)?;
+    let kind = match kind_value.as_str() {
+        "direct_canonical" => ToolIdResolutionKind::DirectCanonical,
+        "alias" => ToolIdResolutionKind::Alias,
+        "superseded_fallback" => ToolIdResolutionKind::SupersededFallback,
+        _ => {
+            return Err(rusqlite::Error::FromSqlConversionFailure(
+                4,
+                Type::Text,
+                Box::new(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid tool resolution kind",
+                )),
+            ));
+        }
+    };
+    Ok(ToolIdResolution {
+        requested_id: row.get(0)?,
+        canonical_tool_id: row.get(1)?,
+        matched_alias: row.get(2)?,
+        canonical_status: row.get(3)?,
+        kind,
+    })
+}
+
 fn row_to_tool_contract_record(row: &Row<'_>) -> rusqlite::Result<ToolContractRecord> {
     let contract_json: String = row.get(6)?;
     let mut contract: ToolContract = serde_json::from_str(&contract_json).map_err(|error| {
@@ -3781,7 +6045,7 @@ mod tests {
     use std::fs::OpenOptions;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
     const AOPMEM_HOME_ENV: &str = "AOPMEM_HOME";
     const HOME_ENV: &str = "HOME";
@@ -3824,6 +6088,7 @@ mod tests {
                 supports_dry_run: true,
                 output_mode: ToolOutputMode::Inline,
             },
+            platform_launchers: BTreeMap::new(),
         }
     }
 
@@ -4004,6 +6269,26 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    struct DarwinSnapshotHookGuard;
+
+    #[cfg(target_os = "macos")]
+    impl DarwinSnapshotHookGuard {
+        fn set(force_fallback: bool, mutate_source: bool) -> Self {
+            DARWIN_FORCE_CLONE_FALLBACK.store(force_fallback, Ordering::SeqCst);
+            DARWIN_MUTATE_SOURCE_DURING_FALLBACK.store(mutate_source, Ordering::SeqCst);
+            Self
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for DarwinSnapshotHookGuard {
+        fn drop(&mut self) {
+            DARWIN_FORCE_CLONE_FALLBACK.store(false, Ordering::SeqCst);
+            DARWIN_MUTATE_SOURCE_DURING_FALLBACK.store(false, Ordering::SeqCst);
+        }
+    }
+
     fn setup_test_workspace(
         name: &str,
     ) -> (
@@ -4064,6 +6349,592 @@ mod tests {
         assert!(!process_exists(pid), "descendant process {pid} survived");
     }
 
+    fn register_tool_with_status(connection: &Connection, tool_id: &str, status: &str) {
+        let mut contract = sample_tool_contract(tool_id);
+        contract.status = status.to_string();
+        create_tool_contract(connection, &contract).expect("fixture tool should register");
+    }
+
+    fn alias_input(alias: &str, canonical_tool_id: &str) -> NewToolAlias {
+        NewToolAlias {
+            alias: alias.to_string(),
+            canonical_tool_id: canonical_tool_id.to_string(),
+            source: "stage_011_test".to_string(),
+            status: TOOL_ALIAS_STATUS_ACTIVE.to_string(),
+        }
+    }
+
+    fn stage_026_nearest_rank_p95(values: &[u128]) -> u128 {
+        let mut ordered = values.to_vec();
+        ordered.sort_unstable();
+        ordered[(95 * ordered.len()).div_ceil(100) - 1]
+    }
+
+    fn stage_026_write_alias_benchmark_evidence(rows: &[(String, usize, usize, u128)]) {
+        let Some(output) = env::var_os("AOPMEM_STAGE26_ALIAS_BENCH_OUTPUT") else {
+            return;
+        };
+        let output = PathBuf::from(output);
+        fs::create_dir_all(&output).expect("Stage 026 benchmark output should create");
+        let raw_path = output.join("alias_raw_samples.csv");
+        let mut raw = String::from("corpus,active_tools,phase,sample,elapsed_ns\n");
+        for (corpus, active_tools, sample, elapsed_ns) in rows {
+            raw.push_str(&format!(
+                "{corpus},{active_tools},sample,{sample},{elapsed_ns}\n"
+            ));
+        }
+        fs::write(&raw_path, raw).expect("Stage 026 alias raw evidence should write");
+
+        let mut results = Vec::new();
+        for (corpus, active_tools) in [("small", 16_usize), ("medium", 64), ("large", 256)] {
+            let values = rows
+                .iter()
+                .filter(|(row_corpus, _, _, _)| row_corpus == corpus)
+                .map(|(_, _, _, elapsed_ns)| *elapsed_ns)
+                .collect::<Vec<_>>();
+            assert_eq!(values.len(), 15, "Stage 026 needs exactly 15 samples");
+            let median = {
+                let mut ordered = values.clone();
+                ordered.sort_unstable();
+                ordered[ordered.len() / 2]
+            };
+            results.push(serde_json::json!({
+                "corpus": corpus,
+                "active_tools": active_tools,
+                "samples": 15,
+                "warmups": 3,
+                "method": "in-process resolve_tool_id duration; median; nearest-rank p95",
+                "median_ns": median,
+                "p95_nearest_rank_ns": stage_026_nearest_rank_p95(&values),
+                "resolved_via_alias": true,
+            }));
+        }
+        let summary_path = output.join("alias_summary.json");
+        fs::write(
+            &summary_path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "harness": "src/tools/mod.rs::tests::stage_026_alias_resolution_benchmark",
+                "method_scope": "in-process; do not compare with CLI wall-clock rows",
+                "results": results,
+            }))
+            .expect("Stage 026 alias summary should serialize")
+                + "\n",
+        )
+        .expect("Stage 026 alias summary should write");
+
+        let digest = |path: &Path| {
+            let bytes = fs::read(path).expect("Stage 026 evidence should read for hash");
+            format!("{:x}", Sha256::digest(bytes))
+        };
+        fs::write(
+            output.join("alias_SHA256SUMS"),
+            format!(
+                "{}  alias_raw_samples.csv\n{}  alias_summary.json\n",
+                digest(&raw_path),
+                digest(&summary_path)
+            ),
+        )
+        .expect("Stage 026 alias hashes should write");
+    }
+
+    #[test]
+    fn stage_026_alias_resolution_benchmark() {
+        let mut rows = Vec::new();
+        for (corpus, active_tools) in [("small", 16_usize), ("medium", 64), ("large", 256)] {
+            let mut connection =
+                Connection::open_in_memory().expect("Stage 026 in-memory registry should open");
+            schema::apply_migrations(&mut connection).expect("Stage 026 migrations should apply");
+            for index in 0..active_tools {
+                register_tool_with_status(
+                    &connection,
+                    &format!("stage26-tool-{index:04}"),
+                    "active",
+                );
+            }
+            add_tool_alias(
+                &connection,
+                &alias_input("stage26-reader", "stage26-tool-0000"),
+            )
+            .expect("Stage 026 alias add should succeed");
+            for _ in 0..3 {
+                let resolved = resolve_tool_id(&connection, "stage26-reader")
+                    .expect("Stage 026 alias resolve should query")
+                    .expect("Stage 026 alias should resolve");
+                assert_eq!(resolved.kind, ToolIdResolutionKind::Alias);
+                assert_eq!(resolved.matched_alias.as_deref(), Some("stage26-reader"));
+            }
+            for sample in 1..=15 {
+                let started = Instant::now();
+                let resolved = resolve_tool_id(&connection, "stage26-reader")
+                    .expect("Stage 026 alias resolve should query")
+                    .expect("Stage 026 alias should resolve");
+                let elapsed_ns = started.elapsed().as_nanos();
+                assert_eq!(resolved.kind, ToolIdResolutionKind::Alias);
+                assert_eq!(resolved.matched_alias.as_deref(), Some("stage26-reader"));
+                rows.push((corpus.to_string(), active_tools, sample, elapsed_ns));
+            }
+        }
+        stage_026_write_alias_benchmark_evidence(&rows);
+    }
+
+    fn create_stage_012_tool(
+        workspace_paths: &storage::WorkspacePaths,
+        connection: &Connection,
+        tool_id: &str,
+        name: &str,
+        implementation: &[u8],
+    ) {
+        let input = DraftToolInput {
+            tool_id: tool_id.to_string(),
+            name: name.to_string(),
+            entrypoint: "bin/runner".to_string(),
+            owner_workflow: Some("memory_keeper".to_string()),
+            side_effects: "none".to_string(),
+            approval_requirement: "none".to_string(),
+        };
+        create_draft_tool(workspace_paths, connection, &input)
+            .expect("Stage 012 tool fixture should create");
+        fs::write(
+            tool_dir(workspace_paths, tool_id)
+                .join("bin")
+                .join("runner"),
+            implementation,
+        )
+        .expect("Stage 012 implementation should write");
+    }
+
+    fn install_stage_015_fixture_tool(
+        workspace_paths: &storage::WorkspacePaths,
+        connection: &Connection,
+        tool_id: &str,
+    ) -> ToolContract {
+        let fixture_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/stage_015/confluence_tools")
+            .join(tool_id);
+        let destination = tool_dir(workspace_paths, tool_id);
+        fs::create_dir_all(destination.join("bin"))
+            .expect("Stage 015 fixture tool directory should create");
+        fs::copy(
+            fixture_root.join(TOOL_JSON_FILE_NAME),
+            destination.join(TOOL_JSON_FILE_NAME),
+        )
+        .expect("Stage 015 fixture manifest should copy");
+        let runner = destination.join("bin/runner");
+        fs::copy(fixture_root.join("bin/runner"), &runner)
+            .expect("Stage 015 fixture executable should copy");
+        #[cfg(unix)]
+        {
+            let mut permissions = fs::metadata(&runner)
+                .expect("Stage 015 fixture runner metadata should read")
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&runner, permissions)
+                .expect("Stage 015 fixture runner should become executable");
+        }
+        let contract: ToolContract = serde_json::from_slice(
+            &fs::read(destination.join(TOOL_JSON_FILE_NAME))
+                .expect("Stage 015 fixture manifest should read"),
+        )
+        .expect("Stage 015 fixture manifest must be valid JSON");
+        validate_tool_contract(&contract).expect("Stage 015 fixture contract must validate");
+        create_tool_contract(connection, &contract)
+            .expect("Stage 015 fixture contract should register");
+        contract
+    }
+
+    fn stage_013_draft_input(tool_id: &str, name: &str) -> DraftToolInput {
+        DraftToolInput {
+            tool_id: tool_id.to_string(),
+            name: name.to_string(),
+            entrypoint: "bin/runner".to_string(),
+            owner_workflow: Some("memory_keeper".to_string()),
+            side_effects: "none".to_string(),
+            approval_requirement: "none".to_string(),
+        }
+    }
+
+    #[test]
+    fn stage_013_creation_guard_blocks_collisions_and_overlap_without_writes() {
+        let (home, _aopmem_home, _user_home, workspace_paths, connection) =
+            setup_test_workspace("stage-013-guard");
+        create_stage_012_tool(
+            &workspace_paths,
+            &connection,
+            "canonical-reader",
+            "Canonical Reader",
+            b"reader implementation",
+        );
+        connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .expect("guard fixture should checkpoint");
+        drop(connection);
+        let connection = storage::open_workspace_db_immutable(&workspace_paths)
+            .expect("guard fixture should open immutable");
+        let before = stage_012_tree_snapshot(&home);
+
+        let collision = preflight_tool_creation(
+            &workspace_paths,
+            &connection,
+            &stage_013_draft_input("canonical-reader", "Anything"),
+            &DraftToolRuntimeInput::default(),
+            true,
+        )
+        .expect("id collision should be a safe decision");
+        assert!(matches!(
+            collision,
+            ToolCreationGuardDecision::Duplicate {
+                candidate: ToolCreationGuardCandidate {
+                    class: ToolCreationGuardClass::ActiveIdCollision,
+                    ..
+                },
+                writes_performed: false,
+            }
+        ));
+
+        let overlap_input = stage_013_draft_input("new-reader", "Canonical Reader");
+        let overlap = preflight_tool_creation(
+            &workspace_paths,
+            &connection,
+            &overlap_input,
+            &DraftToolRuntimeInput::default(),
+            false,
+        )
+        .expect("overlap should be detected");
+        assert!(matches!(
+            overlap,
+            ToolCreationGuardDecision::OverlapReviewRequired {
+                writes_performed: false,
+                ..
+            }
+        ));
+        let allowed = preflight_tool_creation(
+            &workspace_paths,
+            &connection,
+            &overlap_input,
+            &DraftToolRuntimeInput::default(),
+            true,
+        )
+        .expect("bounded distinction may bypass only overlap");
+        assert!(matches!(
+            allowed,
+            ToolCreationGuardDecision::Allowed {
+                technical_distinction_provided: true,
+                ref reviewed_candidates,
+            } if !reviewed_candidates.is_empty()
+        ));
+        assert_eq!(before, stage_012_tree_snapshot(&home));
+        drop(connection);
+        fs::remove_dir_all(home).expect("Stage 013 guard home should remove");
+    }
+
+    #[test]
+    fn stage_013_registry_recheck_blocks_race_before_first_write() {
+        let (home, _aopmem_home, _user_home, workspace_paths, connection) =
+            setup_test_workspace("stage-013-race");
+        create_stage_012_tool(
+            &workspace_paths,
+            &connection,
+            "existing",
+            "Existing",
+            b"existing",
+        );
+        let input = stage_013_draft_input("new-id", "Existing");
+        let mut effects = MutationEffects::default();
+        let changes_before = connection.total_changes();
+        let error = create_guarded_draft_tool_in_mutation(
+            &workspace_paths,
+            &connection,
+            &input,
+            &DraftToolRuntimeInput::default(),
+            false,
+            &mut effects,
+        )
+        .expect_err("authoritative registry recheck must block overlap");
+        assert!(matches!(
+            error,
+            GuardedCreateDraftError::Blocked(
+                ToolCreationGuardDecision::OverlapReviewRequired { .. }
+            )
+        ));
+        assert!(get_tool_contract(&connection, "new-id")
+            .expect("registry should remain readable")
+            .is_none());
+        assert_eq!(connection.total_changes(), changes_before);
+        assert!(!tool_dir(&workspace_paths, "new-id").exists());
+        fs::remove_dir_all(home).expect("Stage 013 race home should remove");
+    }
+
+    #[test]
+    fn stage_013_bm25_ranks_multi_term_description_above_repeated_single_term() {
+        let proposed = draft_tool_contract(&stage_013_draft_input(
+            "alpha-beta-client",
+            "Alpha Beta Client",
+        ));
+        let mut repeated = sample_tool_contract("repeated");
+        repeated.name = "Alpha Alpha Alpha Client".to_string();
+        let mut covered = sample_tool_contract("covered");
+        covered.name = "Alpha Beta Client".to_string();
+        let records = vec![
+            ToolContractRecord {
+                contract: repeated,
+                created_at: "2026-01-01".to_string(),
+                updated_at: "2026-01-01".to_string(),
+            },
+            ToolContractRecord {
+                contract: covered,
+                created_at: "2026-01-01".to_string(),
+                updated_at: "2026-01-01".to_string(),
+            },
+        ];
+        let scores = creation_bm25_scores(&proposed, &records).expect("bounded BM25 should score");
+        assert!(scores["covered"] > scores["repeated"]);
+    }
+
+    #[test]
+    fn stage_013_bm25_total_term_bound_fails_closed() {
+        let proposed = draft_tool_contract(&stage_013_draft_input("query", "Token Query"));
+        let records = (0..=MAX_TOOL_CREATION_GUARD_TOTAL_TOKENS
+            / MAX_TOOL_CREATION_GUARD_TOKENS_PER_DOCUMENT)
+            .map(|index| {
+                let mut contract = sample_tool_contract(&format!("bounded-{index}"));
+                contract.name = "token ".repeat(600);
+                ToolContractRecord {
+                    contract,
+                    created_at: "2026-01-01".to_string(),
+                    updated_at: "2026-01-01".to_string(),
+                }
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            creation_bm25_scores(&proposed, &records),
+            Err(ToolCreationGuardError::TooManySearchTokens { .. })
+        ));
+    }
+
+    #[test]
+    fn stage_013_technical_distinction_is_bounded_without_echo_contract() {
+        assert!(validate_technical_distinction("different protocol").is_ok());
+        assert!(matches!(
+            validate_technical_distinction(" "),
+            Err(ToolTechnicalDistinctionError::Blank)
+        ));
+        assert!(matches!(
+            validate_technical_distinction(&"x".repeat(MAX_TOOL_TECHNICAL_DISTINCTION_BYTES + 1)),
+            Err(ToolTechnicalDistinctionError::TooLong { .. })
+        ));
+        assert!(matches!(
+            validate_technical_distinction("canary\0secret"),
+            Err(ToolTechnicalDistinctionError::ContainsNul)
+        ));
+    }
+
+    #[test]
+    fn stage_013_alias_resolution_uses_only_canonical_paths_and_keeps_approval() {
+        let (home, _aopmem_home, _user_home, workspace_paths, connection) =
+            setup_test_workspace("stage-013-alias-run");
+        create_runnable_test_tool(
+            &workspace_paths,
+            &connection,
+            "canonical-writer",
+            "#!/bin/sh\nprintf canonical\n",
+        );
+        let mut contract = read_tool_json(&workspace_paths, "canonical-writer")
+            .expect("canonical contract should read");
+        contract.status = "active".to_string();
+        contract.side_effects = "external_write".to_string();
+        contract.approval_requirement = "explicit".to_string();
+        persist_test_tool_contract(&workspace_paths, &connection, contract);
+        add_tool_alias(
+            &connection,
+            &alias_input("writer-short", "canonical-writer"),
+        )
+        .expect("direct alias should create");
+
+        let resolution = resolve_tool_id(&connection, "writer-short")
+            .expect("alias should resolve")
+            .expect("alias should exist");
+        assert_eq!(resolution.canonical_tool_id, "canonical-writer");
+        assert_eq!(resolution.matched_alias.as_deref(), Some("writer-short"));
+
+        let validation =
+            validate_tool(&workspace_paths, &connection, &resolution.canonical_tool_id)
+                .expect("canonical validation should pass");
+        assert!(validation.tool_json_path.contains("canonical-writer"));
+        assert!(!validation.tool_json_path.contains("writer-short"));
+        let dry_run = dry_run_tool(
+            &workspace_paths,
+            &connection,
+            &resolution.canonical_tool_id,
+            &[],
+        )
+        .expect("canonical dry-run should pass");
+        assert!(dry_run.tool_json_path.contains("canonical-writer"));
+        assert!(!dry_run.tool_json_path.contains("writer-short"));
+        assert!(dry_run.approval_required);
+        assert!(matches!(
+            run_tool(
+                &workspace_paths,
+                &connection,
+                &resolution.canonical_tool_id,
+                &[],
+                None,
+            ),
+            Err(RunToolError::UnsafeActionBlocked { .. })
+        ));
+        let run = run_tool(
+            &workspace_paths,
+            &connection,
+            &resolution.canonical_tool_id,
+            &[],
+            Some("+++"),
+        )
+        .expect("same approval token should run canonical tool");
+        assert_eq!(run.stdout, "canonical");
+        assert!(run.tool_json_path.contains("canonical-writer"));
+        assert!(!tool_dir(&workspace_paths, "writer-short").exists());
+        fs::remove_dir_all(home).expect("Stage 013 alias run home should remove");
+    }
+
+    #[test]
+    fn stage_013_alias_batch_listing_is_one_deterministic_grouped_query() {
+        let (home, _aopmem_home, _user_home, workspace_paths, connection) =
+            setup_test_workspace("stage-013-alias-list");
+        for tool_id in ["alpha", "beta"] {
+            create_stage_012_tool(
+                &workspace_paths,
+                &connection,
+                tool_id,
+                tool_id,
+                tool_id.as_bytes(),
+            );
+            let mut contract =
+                read_tool_json(&workspace_paths, tool_id).expect("contract should read");
+            contract.status = "active".to_string();
+            persist_test_tool_contract(&workspace_paths, &connection, contract);
+        }
+        add_tool_alias(&connection, &alias_input("a-two", "alpha")).expect("alias should add");
+        add_tool_alias(&connection, &alias_input("a-one", "alpha")).expect("alias should add");
+        add_tool_alias(&connection, &alias_input("b-one", "beta")).expect("alias should add");
+        let grouped = list_tool_aliases_for_canonical_ids(
+            &connection,
+            &["beta".to_string(), "alpha".to_string()],
+        )
+        .expect("batch aliases should list");
+        assert_eq!(
+            grouped["alpha"]
+                .iter()
+                .map(|alias| alias.alias.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a-one", "a-two"]
+        );
+        assert_eq!(grouped["beta"][0].alias, "b-one");
+        fs::remove_dir_all(home).expect("Stage 013 alias list home should remove");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stage_013_creation_guard_rejects_symlinked_candidate_and_contract_drift() {
+        use std::os::unix::fs::symlink;
+
+        let (home, _aopmem_home, _user_home, workspace_paths, connection) =
+            setup_test_workspace("stage-013-unsafe");
+        create_stage_012_tool(
+            &workspace_paths,
+            &connection,
+            "unsafe-reader",
+            "Unsafe Reader",
+            b"reader",
+        );
+        let input = stage_013_draft_input("new-unsafe-reader", "Unsafe Reader");
+        let runner = tool_dir(&workspace_paths, "unsafe-reader")
+            .join("bin")
+            .join("runner");
+        fs::remove_file(&runner).expect("fixture runner should remove");
+        symlink("/tmp", &runner).expect("unsafe runner symlink should create");
+        assert!(matches!(
+            preflight_tool_creation(
+                &workspace_paths,
+                &connection,
+                &input,
+                &DraftToolRuntimeInput::default(),
+                true,
+            ),
+            Err(ToolCreationGuardError::Plan(
+                ToolDedupePlanError::UnsafeImplementationPath(_)
+            ))
+        ));
+
+        fs::remove_file(&runner).expect("unsafe symlink should remove");
+        fs::write(&runner, b"reader").expect("runner should restore");
+        let mut drifted =
+            read_tool_json(&workspace_paths, "unsafe-reader").expect("manifest should read");
+        drifted.name = "drifted local name".to_string();
+        fs::write(
+            tool_json_path(&workspace_paths, "unsafe-reader"),
+            serde_json::to_vec_pretty(&drifted).expect("drift manifest should serialize"),
+        )
+        .expect("drift manifest should write");
+        assert!(matches!(
+            preflight_tool_creation(
+                &workspace_paths,
+                &connection,
+                &input,
+                &DraftToolRuntimeInput::default(),
+                true,
+            ),
+            Err(ToolCreationGuardError::Plan(
+                ToolDedupePlanError::ContractDrift(_)
+            ))
+        ));
+        fs::remove_dir_all(home).expect("Stage 013 unsafe home should remove");
+    }
+
+    fn stage_012_tree_snapshot(root: &Path) -> BTreeMap<String, (bool, u64, u128, String)> {
+        fn visit(
+            root: &Path,
+            path: &Path,
+            snapshot: &mut BTreeMap<String, (bool, u64, u128, String)>,
+        ) {
+            let mut entries = fs::read_dir(path)
+                .expect("snapshot directory should read")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("snapshot entries should read");
+            entries.sort_by_key(|entry| entry.file_name());
+            for entry in entries {
+                let path = entry.path();
+                let metadata = fs::symlink_metadata(&path).expect("snapshot metadata should read");
+                let relative = path
+                    .strip_prefix(root)
+                    .expect("snapshot path should stay under root")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let modified = metadata
+                    .modified()
+                    .expect("snapshot mtime should read")
+                    .duration_since(UNIX_EPOCH)
+                    .expect("snapshot mtime should be after epoch")
+                    .as_nanos();
+                let digest = if metadata.is_file() {
+                    let bytes = fs::read(&path).expect("snapshot file should read");
+                    format!("{:x}", Sha256::digest(bytes))
+                } else {
+                    String::new()
+                };
+                snapshot.insert(
+                    relative,
+                    (metadata.is_dir(), metadata.len(), modified, digest),
+                );
+                if metadata.is_dir() {
+                    visit(root, &path, snapshot);
+                }
+            }
+        }
+
+        let mut snapshot = BTreeMap::new();
+        visit(root, root, &mut snapshot);
+        snapshot
+    }
+
     #[test]
     fn create_get_and_list_tool_contracts() {
         let mut connection =
@@ -4083,6 +6954,1333 @@ mod tests {
         assert_eq!(listed, vec![created.clone()]);
         assert!(!created.created_at.is_empty());
         assert!(!created.updated_at.is_empty());
+    }
+
+    #[test]
+    fn stage_012_dedupe_plan_is_deterministic_exact_only_and_zero_write() {
+        let _lock = crate::install::test_env_lock()
+            .lock()
+            .expect("env lock should not be poisoned");
+        let (home, _aopmem_home, _user_home, workspace_paths, connection) =
+            setup_test_workspace("stage-012-zero-write");
+        create_stage_012_tool(
+            &workspace_paths,
+            &connection,
+            "reader",
+            "Reader",
+            b"same implementation",
+        );
+        create_stage_012_tool(
+            &workspace_paths,
+            &connection,
+            "reader-internal",
+            "Internal Reader",
+            b"same implementation",
+        );
+        create_stage_012_tool(
+            &workspace_paths,
+            &connection,
+            "reader-wrapper",
+            "Reader wrapper",
+            b"different wrapper",
+        );
+        connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .expect("fixture WAL should checkpoint");
+        drop(connection);
+
+        let read = storage::open_workspace_db_immutable(&workspace_paths)
+            .expect("immutable DB should open");
+        let before = stage_012_tree_snapshot(&home);
+        let first = plan_tool_deduplication(&workspace_paths, &read)
+            .expect("first duplicate plan should pass");
+        let second = plan_tool_deduplication(&workspace_paths, &read)
+            .expect("second duplicate plan should pass");
+        let after = stage_012_tree_snapshot(&home);
+
+        assert_eq!(first, second);
+        assert_eq!(
+            after, before,
+            "plan changed bytes, mtimes, or directory tree"
+        );
+        assert!(!first.writes_performed);
+        assert_eq!(first.scanned_tools, 3);
+        assert_eq!(first.shortlisted_tools, 3);
+        assert_eq!(first.hashed_files, 3, "each implementation hashes once");
+        assert!(!workspace_paths.observability_db().exists());
+        let json = serde_json::to_value(&first).expect("plan should serialize");
+        assert!(json.get("writes_performed").is_some());
+        assert!(json.get("comparisons").is_some());
+        for comparison in json["comparisons"]
+            .as_array()
+            .expect("comparisons should be an array")
+        {
+            let object = comparison
+                .as_object()
+                .expect("comparison should be an object");
+            assert!(!object.contains_key("canonical_fingerprint"));
+            assert!(!object.contains_key("capability_fingerprint"));
+            assert!(!object.contains_key("implementation_fingerprint"));
+        }
+        let exact = first
+            .comparisons
+            .iter()
+            .find(|item| {
+                item.canonical_tool_id == "reader" && item.candidate_tool_id == "reader-internal"
+            })
+            .expect("exact eligible pair should be present");
+        assert_eq!(
+            exact.class,
+            ToolDuplicateClass::SameImplementationDifferentName
+        );
+        assert!(exact.exact_only_eligible);
+        let wrapper = first
+            .comparisons
+            .iter()
+            .find(|item| item.candidate_tool_id == "reader-wrapper")
+            .expect("wrapper pair should be present");
+        assert_eq!(
+            wrapper.class,
+            ToolDuplicateClass::SameCapabilityDifferentWrapper
+        );
+        assert!(!wrapper.exact_only_eligible);
+
+        drop(read);
+        fs::remove_dir_all(home).expect("Stage 012 fixture home should remove");
+    }
+
+    #[test]
+    fn stage_014_exact_apply_supersedes_aliases_and_replays_without_deleting_files() {
+        let _lock = crate::install::test_env_lock()
+            .lock()
+            .expect("env lock should not be poisoned");
+        let (home, _aopmem_home, _user_home, workspace_paths, connection) =
+            setup_test_workspace("stage-014-exact-apply");
+        create_stage_012_tool(&workspace_paths, &connection, "reader", "Reader", b"same");
+        create_stage_012_tool(
+            &workspace_paths,
+            &connection,
+            "reader-user",
+            "Reader for user",
+            b"same",
+        );
+        let mut canonical =
+            read_tool_json(&workspace_paths, "reader").expect("canonical manifest should read");
+        canonical.status = "active".to_string();
+        persist_test_tool_contract(&workspace_paths, &connection, canonical);
+        let reader_executable = tool_dir(&workspace_paths, "reader-user").join("bin/runner");
+        let reader_directory = tool_dir(&workspace_paths, "reader-user");
+        let first = crate::mutation::mutate_workspace(&workspace_paths, |database, effects| {
+            apply_exact_only_deduplication_in_mutation(&workspace_paths, database, effects)
+        })
+        .expect("exact-only apply should pass");
+        assert_eq!(first.value.canonicalized.len(), 1);
+        assert!(reader_directory.is_dir());
+        assert!(reader_executable.is_file());
+        let superseded = get_tool_contract(&connection, "reader-user")
+            .expect("registry should read")
+            .expect("duplicate should remain");
+        assert_eq!(superseded.contract.status, "superseded");
+        assert!(!superseded.updated_at.is_empty());
+        assert_eq!(
+            read_tool_json(&workspace_paths, "reader-user").expect("manifest"),
+            superseded.contract
+        );
+        assert_eq!(
+            resolve_tool_id(&connection, "reader-user")
+                .expect("alias should resolve")
+                .expect("resolution should exist")
+                .canonical_tool_id,
+            "reader"
+        );
+        let replay = crate::mutation::mutate_workspace(&workspace_paths, |database, effects| {
+            apply_exact_only_deduplication_in_mutation(&workspace_paths, database, effects)
+        })
+        .expect("idempotent replay should pass");
+        assert!(!replay.value.writes_performed);
+        fs::remove_dir_all(home).expect("Stage 014 fixture home should remove");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stage_015_confluence_fixture_proves_generic_exact_canonicalization() {
+        let _lock = crate::install::test_env_lock()
+            .lock()
+            .expect("env lock should not be poisoned");
+        let (home, _aopmem_home, _user_home, paths, connection) =
+            setup_test_workspace("stage-015-confluence-fixture");
+        let canonical = install_stage_015_fixture_tool(&paths, &connection, "confluence_reader");
+        let duplicate =
+            install_stage_015_fixture_tool(&paths, &connection, "confluence_reader_internal");
+        assert_eq!(canonical.status, "active");
+        assert_eq!(duplicate.status, "active");
+        connection
+            .execute(
+                "UPDATE tool_contracts SET created_at = '2020-01-01 00:00:00' \
+                 WHERE tool_id = 'confluence_reader_internal'",
+                [],
+            )
+            .expect("fixture duplicate should be older in SQLite");
+        let canonical_runner = tool_dir(&paths, "confluence_reader").join("bin/runner");
+        let duplicate_runner = tool_dir(&paths, "confluence_reader_internal").join("bin/runner");
+        let canonical_bytes = fs::read(&canonical_runner).expect("canonical runner should read");
+        let duplicate_bytes = fs::read(&duplicate_runner).expect("duplicate runner should read");
+        assert_eq!(canonical_bytes, duplicate_bytes);
+
+        let plan = plan_tool_deduplication(&paths, &connection)
+            .expect("fixture dedupe plan should succeed");
+        let pair = plan
+            .comparisons
+            .iter()
+            .find(|item| {
+                item.canonical_tool_id == "confluence_reader"
+                    && item.candidate_tool_id == "confluence_reader_internal"
+            })
+            .expect("neutral suffix must outrank the older final tie-break");
+        assert_eq!(
+            pair.class,
+            ToolDuplicateClass::SameImplementationDifferentName
+        );
+        assert!(pair.exact_only_eligible);
+
+        let applied = crate::mutation::mutate_workspace(&paths, |database, effects| {
+            apply_exact_only_deduplication_in_mutation(&paths, database, effects)
+        })
+        .expect("fixture exact-only apply should succeed");
+        assert_eq!(applied.value.canonicalized.len(), 1);
+        assert_eq!(
+            applied.value.canonicalized[0],
+            ToolCanonicalization {
+                canonical_tool_id: "confluence_reader".to_string(),
+                superseded_tool_id: "confluence_reader_internal".to_string(),
+            }
+        );
+        assert_eq!(
+            get_tool_contract(&connection, "confluence_reader_internal")
+                .expect("duplicate contract should read")
+                .expect("duplicate contract should remain")
+                .contract
+                .status,
+            "superseded"
+        );
+        let superseded_manifest = read_tool_json(&paths, "confluence_reader_internal")
+            .expect("superseded fixture manifest should read");
+        assert_eq!(superseded_manifest.status, "superseded");
+        assert_eq!(
+            superseded_manifest,
+            get_tool_contract(&connection, "confluence_reader_internal")
+                .expect("superseded registry contract should read")
+                .expect("superseded registry contract should remain")
+                .contract
+        );
+        assert_eq!(
+            resolve_tool_id(&connection, "confluence_reader_internal")
+                .expect("old ID should resolve")
+                .expect("old ID should have an alias")
+                .canonical_tool_id,
+            "confluence_reader"
+        );
+        let listed = list_canonical_tool_contracts_page(&connection, None, 10)
+            .expect("canonical list should read");
+        assert_eq!(listed.items.len(), 1);
+        assert_eq!(listed.items[0].contract.tool_id, "confluence_reader");
+        let all_contracts = list_tool_contracts(&connection).expect("all contracts should read");
+        assert_eq!(all_contracts.len(), 2);
+        assert_eq!(
+            all_contracts
+                .iter()
+                .map(|record| record.contract.status.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["active", "superseded"])
+        );
+        let alias_resolution = resolve_tool_id(&connection, "confluence_reader_internal")
+            .expect("old ID should resolve")
+            .expect("old ID should resolve to a canonical contract");
+        let validation = validate_tool(&paths, &connection, &alias_resolution.canonical_tool_id)
+            .expect("canonical validation should pass");
+        assert!(validation.tool_json_path.contains("confluence_reader"));
+        assert!(!validation
+            .tool_json_path
+            .contains("confluence_reader_internal"));
+        let run = run_tool(
+            &paths,
+            &connection,
+            &alias_resolution.canonical_tool_id,
+            &[],
+            None,
+        )
+        .expect("canonical runner should run");
+        assert_eq!(run.stdout, "fixture-confluence-reader\n");
+        assert!(tool_dir(&paths, "confluence_reader").is_dir());
+        assert!(tool_dir(&paths, "confluence_reader_internal").is_dir());
+        assert_eq!(
+            fs::read(canonical_runner).expect("canonical runner remains"),
+            canonical_bytes
+        );
+        assert_eq!(
+            fs::read(duplicate_runner).expect("duplicate runner remains"),
+            duplicate_bytes
+        );
+
+        let replay = crate::mutation::mutate_workspace(&paths, |database, effects| {
+            apply_exact_only_deduplication_in_mutation(&paths, database, effects)
+        })
+        .expect("fixture replay should succeed");
+        assert!(!replay.value.writes_performed);
+        assert!(replay.value.canonicalized.is_empty());
+
+        create_stage_012_tool(&paths, &connection, "reader", "Reader", b"same-control");
+        create_stage_012_tool(
+            &paths,
+            &connection,
+            "reader_internal",
+            "Reader Internal",
+            b"same-control",
+        );
+        for tool_id in ["reader", "reader_internal"] {
+            let mut contract =
+                read_tool_json(&paths, tool_id).expect("control manifest should read");
+            contract.status = "active".to_string();
+            persist_test_tool_contract(&paths, &connection, contract);
+        }
+        let control = crate::mutation::mutate_workspace(&paths, |database, effects| {
+            apply_exact_only_deduplication_in_mutation(&paths, database, effects)
+        })
+        .expect("generic non-Confluence control should succeed");
+        assert!(control.value.canonicalized.iter().any(|item| {
+            item.canonical_tool_id == "reader" && item.superseded_tool_id == "reader_internal"
+        }));
+        fs::remove_dir_all(home).expect("Stage 015 fixture home should remove");
+    }
+
+    #[test]
+    fn stage_014_late_failure_restores_every_manifest_and_registry() {
+        let _lock = crate::install::test_env_lock()
+            .lock()
+            .expect("env lock should not be poisoned");
+        let (home, _aopmem_home, _user_home, workspace_paths, connection) =
+            setup_test_workspace("stage-014-rollback");
+        create_stage_012_tool(&workspace_paths, &connection, "reader", "Reader", b"same");
+        create_stage_012_tool(
+            &workspace_paths,
+            &connection,
+            "reader-user",
+            "Reader user",
+            b"same",
+        );
+        create_stage_012_tool(
+            &workspace_paths,
+            &connection,
+            "reader-internal",
+            "Reader internal",
+            b"same",
+        );
+        let mut canonical =
+            read_tool_json(&workspace_paths, "reader").expect("manifest should read");
+        canonical.status = "active".to_string();
+        persist_test_tool_contract(&workspace_paths, &connection, canonical);
+        let ids = ["reader-user", "reader-internal"];
+        let before = ids.map(|id| {
+            fs::read(tool_json_path(&workspace_paths, id)).expect("manifest should read")
+        });
+        let executables = ids.map(|id| tool_dir(&workspace_paths, id).join("bin/runner"));
+        let result = crate::mutation::mutate_workspace(&workspace_paths, |database, effects| {
+            apply_exact_only_deduplication_in_mutation(&workspace_paths, database, effects)?;
+            Err::<(), _>(ToolDedupeApplyError::Serialization)
+        });
+        assert!(matches!(
+            result,
+            Err(crate::mutation::MutationError::Operation(
+                ToolDedupeApplyError::Serialization
+            ))
+        ));
+        for ((id, before), executable) in ids.into_iter().zip(before).zip(executables) {
+            assert_eq!(
+                fs::read(tool_json_path(&workspace_paths, id)).expect("manifest should restore"),
+                before
+            );
+            assert_eq!(
+                get_tool_contract(&connection, id)
+                    .expect("registry should read")
+                    .expect("record should remain")
+                    .contract
+                    .status,
+                "draft"
+            );
+            assert!(get_tool_alias(&connection, id)
+                .expect("aliases should read")
+                .is_none());
+            assert!(tool_dir(&workspace_paths, id).is_dir());
+            assert!(executable.is_file());
+        }
+        fs::remove_dir_all(home).expect("fixture should remove");
+    }
+
+    #[test]
+    fn stage_014_skips_exact_group_without_active_canonical() {
+        let _lock = crate::install::test_env_lock().lock().expect("env lock");
+        let (home, _, _, paths, connection) = setup_test_workspace("stage-014-no-active");
+        create_stage_012_tool(&paths, &connection, "reader", "Reader", b"same");
+        create_stage_012_tool(&paths, &connection, "reader-user", "Reader user", b"same");
+        let before = fs::read(tool_json_path(&paths, "reader-user")).expect("manifest");
+        let report = crate::mutation::mutate_workspace(&paths, |db, effects| {
+            apply_exact_only_deduplication_in_mutation(&paths, db, effects)
+        })
+        .expect("apply");
+        assert!(!report.value.writes_performed);
+        assert_eq!(
+            report.value.skipped_without_active_canonical,
+            vec![vec!["reader".to_string(), "reader-user".to_string()]]
+        );
+        assert_eq!(
+            fs::read(tool_json_path(&paths, "reader-user")).expect("manifest"),
+            before
+        );
+        assert!(get_tool_alias(&connection, "reader-user")
+            .expect("alias")
+            .is_none());
+        fs::remove_dir_all(home).expect("cleanup");
+    }
+
+    #[test]
+    fn stage_014_canonical_key_uses_frozen_five_rules() {
+        let record = |id: &str, status: &str, created_at: &str| ToolContractRecord {
+            contract: ToolContract {
+                tool_id: id.to_string(),
+                status: status.to_string(),
+                ..sample_tool_contract("x")
+            },
+            created_at: created_at.to_string(),
+            updated_at: created_at.to_string(),
+        };
+        assert!(
+            canonical_record_key(&record("reader", "active", "2026-02-01"))
+                < canonical_record_key(&record("reader", "draft", "2026-01-01"))
+        );
+        assert!(
+            canonical_record_key(&record("reader", "active", "2026-02-01"))
+                < canonical_record_key(&record("reader-user", "active", "2026-01-01"))
+        );
+        assert!(
+            canonical_record_key(&record("read", "active", "2026-02-01"))
+                < canonical_record_key(&record("reader", "active", "2026-01-01"))
+        );
+        assert!(
+            canonical_record_key(&record("alpha", "active", "2026-02-01"))
+                < canonical_record_key(&record("bravo", "active", "2026-01-01"))
+        );
+        assert!(
+            canonical_record_key(&record("alpha", "active", "2026-01-01"))
+                < canonical_record_key(&record("alpha", "active", "2026-02-01"))
+        );
+    }
+
+    #[test]
+    fn stage_014_reports_nonexact_overlap_without_mutation() {
+        let _lock = crate::install::test_env_lock().lock().expect("env lock");
+        let (home, _, _, paths, connection) = setup_test_workspace("stage-014-overlap");
+        create_stage_012_tool(&paths, &connection, "reader", "Reader", b"one");
+        create_stage_012_tool(&paths, &connection, "reader-user", "Reader user", b"two");
+        let mut canonical = read_tool_json(&paths, "reader").expect("manifest");
+        canonical.status = "active".to_string();
+        persist_test_tool_contract(&paths, &connection, canonical);
+        let report = crate::mutation::mutate_workspace(&paths, |db, effects| {
+            apply_exact_only_deduplication_in_mutation(&paths, db, effects)
+        })
+        .expect("apply");
+        assert!(!report.value.writes_performed);
+        assert!(!report.value.possible_overlaps.is_empty());
+        assert_eq!(
+            get_tool_contract(&connection, "reader-user")
+                .expect("db")
+                .expect("tool")
+                .contract
+                .status,
+            "draft"
+        );
+        fs::remove_dir_all(home).expect("cleanup");
+    }
+
+    #[test]
+    fn stage_014_retargets_existing_alias_target_before_supersede() {
+        let _lock = crate::install::test_env_lock().lock().expect("env lock");
+        let (home, _, _, paths, connection) = setup_test_workspace("stage-014-retarget");
+        create_stage_012_tool(&paths, &connection, "a", "Reader", b"same");
+        create_stage_012_tool(&paths, &connection, "b", "Reader", b"same");
+        let mut a = read_tool_json(&paths, "a").expect("manifest");
+        a.status = "active".to_string();
+        persist_test_tool_contract(&paths, &connection, a);
+        let mut b = read_tool_json(&paths, "b").expect("manifest");
+        b.status = "active".to_string();
+        persist_test_tool_contract(&paths, &connection, b);
+        add_tool_alias(
+            &connection,
+            &NewToolAlias {
+                alias: "legacy-b".to_string(),
+                canonical_tool_id: "b".to_string(),
+                source: "test".to_string(),
+                status: TOOL_ALIAS_STATUS_ACTIVE.to_string(),
+            },
+        )
+        .expect("alias");
+        let first = crate::mutation::mutate_workspace(&paths, |db, effects| {
+            apply_exact_only_deduplication_in_mutation(&paths, db, effects)
+        })
+        .expect("apply");
+        assert_eq!(first.value.canonicalized.len(), 1);
+        for id in ["b", "legacy-b"] {
+            assert_eq!(
+                resolve_tool_id(&connection, id)
+                    .expect("resolve")
+                    .expect("resolved")
+                    .canonical_tool_id,
+                "a"
+            );
+        }
+        let replay = crate::mutation::mutate_workspace(&paths, |db, effects| {
+            apply_exact_only_deduplication_in_mutation(&paths, db, effects)
+        })
+        .expect("replay");
+        assert!(replay.value.canonicalized.is_empty());
+        fs::remove_dir_all(home).expect("cleanup");
+    }
+
+    #[test]
+    fn stage_014_large_exact_bucket_hashes_once_without_pair_expansion() {
+        let _lock = crate::install::test_env_lock().lock().expect("env lock");
+        let (home, _, _, paths, connection) = setup_test_workspace("stage-014-large-exact");
+        for index in 0..143 {
+            create_stage_012_tool(
+                &paths,
+                &connection,
+                &format!("reader-{index:03}"),
+                "Reader",
+                b"same",
+            );
+        }
+        let mut canonical = read_tool_json(&paths, "reader-000").expect("manifest");
+        canonical.status = "active".to_string();
+        persist_test_tool_contract(&paths, &connection, canonical);
+        let report = crate::mutation::mutate_workspace(&paths, |db, effects| {
+            apply_exact_only_deduplication_in_mutation(&paths, db, effects)
+        })
+        .expect("exact bucket must not hit pair cap");
+        assert_eq!(report.value.hashed_files, 143);
+        assert_eq!(report.value.canonicalized.len(), 142);
+        fs::remove_dir_all(home).expect("cleanup");
+    }
+
+    #[test]
+    fn stage_014_authoritative_apply_ignores_stale_read_only_preflight() {
+        let _lock = crate::install::test_env_lock().lock().expect("env lock");
+        let (home, _, _, paths, connection) = setup_test_workspace("stage-014-rescan");
+        create_stage_012_tool(&paths, &connection, "reader", "Reader", b"same");
+        let mut canonical = read_tool_json(&paths, "reader").expect("manifest");
+        canonical.status = "active".to_string();
+        persist_test_tool_contract(&paths, &connection, canonical);
+        let preflight = plan_tool_deduplication(&paths, &connection).expect("read-only preflight");
+        assert!(preflight.comparisons.is_empty());
+        create_stage_012_tool(&paths, &connection, "reader-user", "Reader user", b"same");
+        let report = crate::mutation::mutate_workspace(&paths, |db, effects| {
+            apply_exact_only_deduplication_in_mutation(&paths, db, effects)
+        })
+        .expect("fresh apply");
+        assert_eq!(report.value.canonicalized.len(), 1);
+        fs::remove_dir_all(home).expect("cleanup");
+    }
+
+    #[test]
+    fn stage_014_snapshot_failure_keeps_committed_canonical_state() {
+        let _lock = crate::install::test_env_lock().lock().expect("env lock");
+        let (home, _, _, paths, connection) = setup_test_workspace("stage-014-snapshot-pending");
+        create_stage_012_tool(&paths, &connection, "reader", "Reader", b"same");
+        create_stage_012_tool(&paths, &connection, "reader-user", "Reader user", b"same");
+        let mut canonical = read_tool_json(&paths, "reader").expect("manifest");
+        canonical.status = "active".to_string();
+        persist_test_tool_contract(&paths, &connection, canonical);
+        fs::write(paths.audit_git().join(".git"), b"not a git directory")
+            .expect("force post-commit snapshot failure");
+        let outcome = crate::mutation::mutate_workspace(&paths, |db, effects| {
+            apply_exact_only_deduplication_in_mutation(&paths, db, effects)
+        })
+        .expect("commit remains successful");
+        assert_eq!(
+            outcome.warning.as_ref().map(|warning| warning.code),
+            Some(crate::mutation::AUDIT_SNAPSHOT_PENDING)
+        );
+        assert_eq!(
+            get_tool_contract(&connection, "reader-user")
+                .expect("db")
+                .expect("tool")
+                .contract
+                .status,
+            "superseded"
+        );
+        assert_eq!(
+            resolve_tool_id(&connection, "reader-user")
+                .expect("resolve")
+                .expect("resolved")
+                .canonical_tool_id,
+            "reader"
+        );
+        assert!(crate::audit::has_pending_snapshot(paths.audit_git()).expect("pending marker"));
+        fs::remove_dir_all(home).expect("cleanup");
+    }
+
+    #[test]
+    fn stage_012_013_014_public_operations_fail_closed_on_targeted_file_swap() {
+        let _lock = crate::install::test_env_lock().lock().expect("env lock");
+        for operation in ["plan", "preflight", "apply"] {
+            let (home, _aopmem_home, _user_home, paths, connection) =
+                setup_test_workspace(&format!("stage-swap-{operation}"));
+            create_stage_012_tool(&paths, &connection, "reader", "Reader", b"same");
+            create_stage_012_tool(&paths, &connection, "reader-user", "Reader user", b"same");
+            let target = tool_dir(&paths, "reader-user").join("bin/runner");
+            let replacement = tool_dir(&paths, "reader-user").join("bin/replacement");
+            fs::write(
+                &replacement,
+                fs::read(&target).expect("target bytes should read"),
+            )
+            .expect("same-byte replacement should write");
+            *IMPLEMENTATION_SWAP_AFTER_HASH.lock().expect("hook") =
+                Some((target.clone(), replacement, target));
+            match operation {
+                "plan" => assert!(matches!(
+                    plan_tool_deduplication(&paths, &connection),
+                    Err(ToolDedupePlanError::ImplementationDrift(_))
+                )),
+                "preflight" => assert!(matches!(
+                    preflight_tool_creation(
+                        &paths,
+                        &connection,
+                        &stage_013_draft_input("new-reader", "New Reader"),
+                        &DraftToolRuntimeInput::default(),
+                        false
+                    ),
+                    Err(ToolCreationGuardError::Plan(
+                        ToolDedupePlanError::ImplementationDrift(_)
+                    ))
+                )),
+                "apply" => {
+                    let ids = ["reader", "reader-user"];
+                    let manifests_before =
+                        ids.map(|id| fs::read(tool_json_path(&paths, id)).expect("manifest"));
+                    let records_before = ids.map(|id| {
+                        get_tool_contract(&connection, id)
+                            .expect("registry should read")
+                            .expect("tool should remain registered")
+                    });
+                    let runners = ids.map(|id| tool_dir(&paths, id).join("bin/runner"));
+                    let runner_bytes_before = runners
+                        .each_ref()
+                        .map(|path| fs::read(path).expect("runner should read"));
+                    let directories_before = ids.map(|id| tool_dir(&paths, id).is_dir());
+                    let result = crate::mutation::mutate_workspace(&paths, |db, effects| {
+                        apply_exact_only_deduplication_in_mutation(&paths, db, effects)
+                    });
+                    assert!(matches!(
+                        result,
+                        Err(crate::mutation::MutationError::Operation(
+                            ToolDedupeApplyError::Plan(ToolDedupePlanError::ImplementationDrift(_))
+                        ))
+                    ));
+                    for (index, id) in ids.into_iter().enumerate() {
+                        assert_eq!(
+                            fs::read(tool_json_path(&paths, id)).expect("manifest"),
+                            manifests_before[index]
+                        );
+                        assert_eq!(
+                            get_tool_contract(&connection, id)
+                                .expect("registry should read")
+                                .expect("tool should remain registered"),
+                            records_before[index]
+                        );
+                        assert!(get_tool_alias(&connection, id).expect("alias").is_none());
+                        assert_eq!(
+                            fs::read(&runners[index]).expect("runner should remain"),
+                            runner_bytes_before[index]
+                        );
+                        assert_eq!(tool_dir(&paths, id).is_dir(), directories_before[index]);
+                    }
+                }
+                _ => unreachable!(),
+            }
+            fs::remove_dir_all(home).expect("cleanup");
+        }
+    }
+
+    #[test]
+    fn stage_012_fingerprint_canonicalizes_schema_keys_and_excludes_identity_state_and_cosmetics() {
+        let _lock = crate::install::test_env_lock()
+            .lock()
+            .expect("env lock should not be poisoned");
+        let (home, _aopmem_home, _user_home, workspace_paths, connection) =
+            setup_test_workspace("stage-012-canonical");
+        create_stage_012_tool(
+            &workspace_paths,
+            &connection,
+            "neutral-reader",
+            "Neutral Reader",
+            b"same bytes",
+        );
+        create_stage_012_tool(
+            &workspace_paths,
+            &connection,
+            "reader-user",
+            "Reader for user",
+            b"same bytes",
+        );
+        let mut left =
+            read_tool_json(&workspace_paths, "neutral-reader").expect("left manifest should read");
+        left.status = "active".to_string();
+        left.args_schema =
+            serde_json::from_str(r#"{"b":2,"a":{"y":2,"x":1}}"#).expect("left schema should parse");
+        left.examples[0].description = Some("cosmetic left".to_string());
+        persist_test_tool_contract(&workspace_paths, &connection, left);
+        let mut right =
+            read_tool_json(&workspace_paths, "reader-user").expect("right manifest should read");
+        right.args_schema = serde_json::from_str(r#"{"a":{"x":1,"y":2},"b":2}"#)
+            .expect("right schema should parse");
+        right.examples[0].description = Some("cosmetic right".to_string());
+        persist_test_tool_contract(&workspace_paths, &connection, right);
+
+        let plan = plan_tool_deduplication(&workspace_paths, &connection)
+            .expect("canonical duplicate plan should pass");
+        let comparison = plan
+            .comparisons
+            .iter()
+            .find(|item| {
+                item.canonical_tool_id == "neutral-reader"
+                    && item.candidate_tool_id == "reader-user"
+            })
+            .expect("canonical pair should be present");
+        assert!(comparison.exact_only_eligible);
+        assert_eq!(
+            comparison.class,
+            ToolDuplicateClass::SameImplementationDifferentName
+        );
+
+        let mut changed =
+            read_tool_json(&workspace_paths, "reader-user").expect("changed manifest should read");
+        changed
+            .platform_launchers
+            .insert("windows".to_string(), "bin/windows-runner.exe".to_string());
+        fs::write(
+            tool_dir(&workspace_paths, "reader-user")
+                .join("bin")
+                .join("windows-runner.exe"),
+            b"windows launcher",
+        )
+        .expect("platform launcher fixture should write");
+        persist_test_tool_contract(&workspace_paths, &connection, changed);
+        let changed_plan = plan_tool_deduplication(&workspace_paths, &connection)
+            .expect("changed launcher plan should pass");
+        let changed_comparison = changed_plan
+            .comparisons
+            .iter()
+            .find(|item| item.candidate_tool_id == "reader-user")
+            .expect("changed pair should be present");
+        assert!(!changed_comparison.exact_only_eligible);
+
+        drop(connection);
+        fs::remove_dir_all(home).expect("Stage 012 fixture home should remove");
+    }
+
+    #[test]
+    fn stage_012_shortlist_is_bounded_before_any_implementation_hash() {
+        let _lock = crate::install::test_env_lock()
+            .lock()
+            .expect("env lock should not be poisoned");
+        let (home, _aopmem_home, _user_home, workspace_paths, connection) =
+            setup_test_workspace("stage-012-pair-bound");
+        for index in 0..143 {
+            let contract = ToolContract {
+                tool_id: format!("same-capability-{index:03}"),
+                name: "Same capability".to_string(),
+                ..sample_tool_contract("template")
+            };
+            create_tool_contract(&connection, &contract).expect("bounded fixture should register");
+        }
+        assert!(matches!(
+            plan_tool_deduplication(&workspace_paths, &connection),
+            Err(ToolDedupePlanError::TooManyPairs {
+                max_pairs: MAX_TOOL_DEDUPE_PAIRS
+            })
+        ));
+        drop(connection);
+        fs::remove_dir_all(home).expect("Stage 012 fixture home should remove");
+    }
+
+    #[test]
+    fn stage_012_legacy_contract_defaults_platform_launchers() {
+        let value = serde_json::to_value(sample_tool_contract("legacy"))
+            .expect("sample contract should serialize");
+        let mut object = value
+            .as_object()
+            .expect("contract should be object")
+            .clone();
+        object.remove("platform_launchers");
+        let decoded: ToolContract =
+            serde_json::from_value(Value::Object(object)).expect("legacy contract should decode");
+        assert!(decoded.platform_launchers.is_empty());
+
+        let mut unsafe_launcher = sample_tool_contract("unsafe-launcher");
+        unsafe_launcher
+            .platform_launchers
+            .insert("windows".to_string(), "../outside.exe".to_string());
+        assert!(matches!(
+            validate_tool_contract(&unsafe_launcher),
+            Err(ToolContractValidationError::PlatformLauncherOutsideToolDir(
+                _
+            ))
+        ));
+    }
+
+    #[test]
+    fn stage_012_all_five_classes_keep_exact_eligibility_separate() {
+        fn candidate(
+            tool_id: &str,
+            name: &str,
+            full: &str,
+            implementation: &str,
+            capability: &str,
+            label: &str,
+        ) -> FingerprintedTool {
+            let mut contract = sample_tool_contract(tool_id);
+            contract.name = name.to_string();
+            FingerprintedTool {
+                record: ToolContractRecord {
+                    contract,
+                    created_at: "2026-07-18T00:00:00Z".to_string(),
+                    updated_at: "2026-07-18T00:00:00Z".to_string(),
+                },
+                capability_fingerprint: capability.to_string(),
+                canonical_fingerprint: full.to_string(),
+                implementation_fingerprint: implementation.to_string(),
+                normalized_label: label.to_string(),
+            }
+        }
+
+        let base = candidate("reader", "Reader", "full", "impl", "cap", "reader");
+        let exact = candidate("reader-v2", "Reader", "full", "impl", "cap", "reader");
+        let renamed = candidate(
+            "reader-internal",
+            "Internal Reader",
+            "full",
+            "impl",
+            "cap",
+            "reader",
+        );
+        let same_impl = candidate("reader-copy", "Copy", "other", "impl", "other", "copy");
+        let wrapper = candidate(
+            "reader-wrapper",
+            "Reader wrapper",
+            "other",
+            "other",
+            "cap",
+            "reader",
+        );
+        let overlap = candidate(
+            "reader-overlap",
+            "Reader overlap",
+            "other",
+            "other",
+            "other",
+            "reader",
+        );
+        let distinct = candidate("writer", "Writer", "other", "other", "other", "writer");
+
+        let cases = [
+            (&exact, ToolDuplicateClass::ExactDuplicate, true),
+            (
+                &renamed,
+                ToolDuplicateClass::SameImplementationDifferentName,
+                true,
+            ),
+            (
+                &same_impl,
+                ToolDuplicateClass::SameImplementationDifferentName,
+                false,
+            ),
+            (
+                &wrapper,
+                ToolDuplicateClass::SameCapabilityDifferentWrapper,
+                false,
+            ),
+            (&overlap, ToolDuplicateClass::PossibleOverlap, false),
+            (&distinct, ToolDuplicateClass::Distinct, false),
+        ];
+        for (candidate, expected_class, expected_exact) in cases {
+            let comparison = compare_fingerprinted_tools(&base, candidate);
+            assert_eq!(comparison.class, expected_class);
+            assert_eq!(comparison.exact_only_eligible, expected_exact);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stage_012_rejects_symlinked_implementation_before_hashing() {
+        use std::os::unix::fs::symlink;
+
+        let _lock = crate::install::test_env_lock()
+            .lock()
+            .expect("env lock should not be poisoned");
+        let (home, _aopmem_home, _user_home, workspace_paths, connection) =
+            setup_test_workspace("stage-012-symlink");
+        create_stage_012_tool(
+            &workspace_paths,
+            &connection,
+            "linked-reader",
+            "Reader",
+            b"reader",
+        );
+        create_stage_012_tool(
+            &workspace_paths,
+            &connection,
+            "other-reader",
+            "Reader",
+            b"reader",
+        );
+        let outside = home.join("outside");
+        fs::write(&outside, b"outside secret").expect("outside file should write");
+        symlink(
+            &outside,
+            tool_dir(&workspace_paths, "linked-reader")
+                .join("runtime")
+                .join("escape"),
+        )
+        .expect("unsafe fixture symlink should create");
+
+        assert!(matches!(
+            plan_tool_deduplication(&workspace_paths, &connection),
+            Err(ToolDedupePlanError::UnsafeImplementationPath(_))
+        ));
+        fs::remove_dir_all(home).expect("Stage 012 fixture home should remove");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stage_012_rejects_symlinked_manifest_before_reading_it() {
+        use std::os::unix::fs::symlink;
+
+        let _lock = crate::install::test_env_lock()
+            .lock()
+            .expect("env lock should not be poisoned");
+        let (home, _aopmem_home, _user_home, workspace_paths, connection) =
+            setup_test_workspace("stage-012-manifest-link");
+        create_stage_012_tool(
+            &workspace_paths,
+            &connection,
+            "linked-reader",
+            "Reader",
+            b"reader",
+        );
+        create_stage_012_tool(
+            &workspace_paths,
+            &connection,
+            "other-reader",
+            "Reader",
+            b"reader",
+        );
+        let manifest = tool_json_path(&workspace_paths, "linked-reader");
+        let outside = home.join("outside-tool.json");
+        fs::rename(&manifest, &outside).expect("manifest should move outside");
+        symlink(&outside, &manifest).expect("unsafe manifest symlink should create");
+
+        assert!(matches!(
+            plan_tool_deduplication(&workspace_paths, &connection),
+            Err(ToolDedupePlanError::UnsafeImplementationPath(_))
+        ));
+        fs::remove_dir_all(home).expect("Stage 012 fixture home should remove");
+    }
+
+    #[test]
+    fn stage_012_anchored_tool_identity_rejects_directory_swap() {
+        let _lock = crate::install::test_env_lock()
+            .lock()
+            .expect("env lock should not be poisoned");
+        let (home, _aopmem_home, _user_home, workspace_paths, connection) =
+            setup_test_workspace("stage-012-directory-swap");
+        create_stage_012_tool(&workspace_paths, &connection, "reader", "Reader", b"reader");
+        let anchor = anchored_tool_directory(&workspace_paths, "reader")
+            .expect("tool directory should anchor");
+        let original = tool_dir(&workspace_paths, "reader");
+        let moved = workspace_paths.tools().join("reader-moved");
+        fs::rename(&original, &moved).expect("original directory should move");
+        fs::create_dir(&original).expect("replacement directory should create");
+
+        assert!(
+            anchor.verify_logical_identity().is_err(),
+            "anchored identity must reject a same-path replacement"
+        );
+        drop(anchor);
+        drop(connection);
+        fs::remove_dir_all(home).expect("Stage 012 fixture home should remove");
+    }
+
+    #[test]
+    fn stage_012_rejects_same_path_regular_file_swap_after_hash() {
+        let _lock = crate::install::test_env_lock()
+            .lock()
+            .expect("env lock should not be poisoned");
+        let (home, _aopmem_home, _user_home, workspace_paths, connection) =
+            setup_test_workspace("stage-012-file-swap");
+        create_stage_012_tool(&workspace_paths, &connection, "reader", "Reader", b"same");
+        let root = anchored_tool_directory(&workspace_paths, "reader").expect("tool should anchor");
+        let destination = tool_dir(&workspace_paths, "reader").join("bin/runner");
+        let replacement = tool_dir(&workspace_paths, "reader").join("bin/replacement");
+        fs::write(&replacement, b"swap").expect("same-size replacement should write");
+        *IMPLEMENTATION_SWAP_AFTER_HASH.lock().expect("hook lock") =
+            Some((destination.clone(), replacement, destination));
+        assert!(matches!(
+            fingerprint_tool_implementation(&root, "reader", vec!["bin/runner".to_string()]),
+            Err(ToolDedupePlanError::ImplementationDrift(_))
+        ));
+        fs::remove_dir_all(home).expect("fixture home should remove");
+    }
+
+    #[test]
+    fn stage_012_rejects_over_limit_empty_descendant_tree_before_hashing() {
+        let _lock = crate::install::test_env_lock().lock().expect("env lock");
+        let (home, _aopmem_home, _user_home, workspace_paths, connection) =
+            setup_test_workspace("stage-012-entry-limit");
+        create_stage_012_tool(&workspace_paths, &connection, "reader", "Reader", b"same");
+        create_stage_012_tool(
+            &workspace_paths,
+            &connection,
+            "reader-user",
+            "Reader",
+            b"same",
+        );
+        for index in 0..=MAX_TOOL_IMPLEMENTATION_ENTRIES {
+            fs::create_dir(tool_dir(&workspace_paths, "reader").join(format!("empty-{index}")))
+                .expect("empty descendant should create");
+        }
+        assert!(matches!(
+            plan_tool_deduplication(&workspace_paths, &connection),
+            Err(ToolDedupePlanError::TooManyImplementationEntries { .. })
+        ));
+        fs::remove_dir_all(home).expect("fixture home should remove");
+    }
+
+    #[test]
+    fn stage_011_alias_crud_keyset_bulk_and_resolver_precedence() {
+        let mut connection =
+            Connection::open_in_memory().expect("in-memory DB should open for alias test");
+        schema::apply_migrations(&mut connection).expect("migrations should apply");
+        register_tool_with_status(&connection, "canonical", "active");
+        register_tool_with_status(&connection, "old-id", "superseded");
+        register_tool_with_status(&connection, "fallback-id", "superseded");
+
+        let created = add_tool_aliases(
+            &connection,
+            &[
+                alias_input("zulu", "canonical"),
+                alias_input("alpha", "canonical"),
+                alias_input("old-id", "canonical"),
+            ],
+        )
+        .expect("bounded alias batch should insert");
+        assert_eq!(created.len(), 3);
+        assert_eq!(
+            get_tool_alias(&connection, "alpha")
+                .expect("alias lookup should pass")
+                .expect("alias should exist")
+                .canonical_tool_id,
+            "canonical"
+        );
+        assert_eq!(
+            list_tool_aliases(&connection)
+                .expect("alias list should pass")
+                .into_iter()
+                .map(|record| record.alias)
+                .collect::<Vec<_>>(),
+            ["alpha", "old-id", "zulu"]
+        );
+
+        let first =
+            list_tool_aliases_page(&connection, None, 2).expect("first alias page should pass");
+        assert_eq!(
+            first
+                .items
+                .iter()
+                .map(|record| record.alias.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha", "old-id"]
+        );
+        assert!(first.more_results);
+        assert_eq!(first.next_after_alias.as_deref(), Some("old-id"));
+        let second = list_tool_aliases_page(&connection, first.next_after_alias.as_deref(), 2)
+            .expect("second alias page should pass");
+        assert_eq!(
+            second
+                .items
+                .iter()
+                .map(|record| record.alias.as_str())
+                .collect::<Vec<_>>(),
+            ["zulu"]
+        );
+        assert!(!second.more_results);
+
+        let direct = resolve_tool_id(&connection, "canonical")
+            .expect("direct resolution should pass")
+            .expect("direct tool should resolve");
+        assert_eq!(direct.kind, ToolIdResolutionKind::DirectCanonical);
+        assert_eq!(direct.canonical_tool_id, "canonical");
+        assert_eq!(direct.matched_alias, None);
+
+        let alias = resolve_tool_id(&connection, "alpha")
+            .expect("alias resolution should pass")
+            .expect("alias should resolve");
+        assert_eq!(alias.kind, ToolIdResolutionKind::Alias);
+        assert_eq!(alias.canonical_tool_id, "canonical");
+        assert_eq!(alias.matched_alias.as_deref(), Some("alpha"));
+
+        let superseded_alias = resolve_tool_id(&connection, "old-id")
+            .expect("superseded alias resolution should pass")
+            .expect("superseded old id should resolve");
+        assert_eq!(superseded_alias.kind, ToolIdResolutionKind::Alias);
+        assert_eq!(superseded_alias.canonical_tool_id, "canonical");
+
+        let fallback = resolve_tool_id(&connection, "fallback-id")
+            .expect("superseded fallback should pass")
+            .expect("superseded direct tool should remain discoverable");
+        assert_eq!(fallback.kind, ToolIdResolutionKind::SupersededFallback);
+        assert_eq!(fallback.canonical_tool_id, "fallback-id");
+        assert!(resolve_tool_id(&connection, "missing")
+            .expect("missing resolution should pass")
+            .is_none());
+
+        let removed = remove_tool_alias(&connection, "alpha")
+            .expect("alias removal should pass")
+            .expect("alias should be removed");
+        assert_eq!(removed.alias, "alpha");
+        assert!(remove_tool_alias(&connection, "alpha")
+            .expect("repeated removal should be idempotent")
+            .is_none());
+    }
+
+    #[test]
+    fn stage_011_alias_invariants_reject_shadow_chain_cycle_and_inactive_target() {
+        let mut connection =
+            Connection::open_in_memory().expect("in-memory DB should open for alias test");
+        schema::apply_migrations(&mut connection).expect("migrations should apply");
+        register_tool_with_status(&connection, "canonical", "active");
+        register_tool_with_status(&connection, "draft-target", "draft");
+        register_tool_with_status(&connection, "occupied", "active");
+
+        let inactive = add_tool_alias(&connection, &alias_input("inactive-alias", "draft-target"))
+            .expect_err("inactive targets must be rejected");
+        assert!(matches!(
+            inactive,
+            ToolAliasStorageError::CanonicalToolNotActive {
+                tool_id,
+                status
+            } if tool_id == "draft-target" && status == "draft"
+        ));
+
+        let shadow = add_tool_alias(&connection, &alias_input("occupied", "canonical"))
+            .expect_err("non-superseded tool ids must not be shadowed");
+        assert!(matches!(
+            shadow,
+            ToolAliasStorageError::AliasShadowsTool {
+                tool_id,
+                status
+            } if tool_id == "occupied" && status == "active"
+        ));
+
+        add_tool_alias(&connection, &alias_input("first-alias", "canonical"))
+            .expect("first direct alias should insert");
+        let chained = add_tool_alias(&connection, &alias_input("second-alias", "first-alias"))
+            .expect_err("alias-to-alias target must be rejected");
+        assert!(matches!(
+            chained,
+            ToolAliasStorageError::AliasTargetIsAlias(target)
+                if target == "first-alias"
+        ));
+        let self_cycle = add_tool_alias(&connection, &alias_input("canonical", "canonical"))
+            .expect_err("self cycle must be rejected");
+        assert!(matches!(
+            self_cycle,
+            ToolAliasStorageError::AliasShadowsTool { .. }
+        ));
+        assert_eq!(
+            list_tool_aliases(&connection)
+                .expect("aliases should list")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn stage_011_alias_bulk_rolls_back_and_validates_bounds_before_write() {
+        let mut connection =
+            Connection::open_in_memory().expect("in-memory DB should open for alias test");
+        schema::apply_migrations(&mut connection).expect("migrations should apply");
+        register_tool_with_status(&connection, "canonical", "active");
+
+        let error = add_tool_aliases(
+            &connection,
+            &[
+                alias_input("kept-only-on-success", "canonical"),
+                alias_input("invalid-target", "missing"),
+            ],
+        )
+        .expect_err("late batch failure must roll back earlier aliases");
+        assert!(matches!(
+            error,
+            ToolAliasStorageError::CanonicalToolNotFound(target) if target == "missing"
+        ));
+        assert!(list_tool_aliases(&connection)
+            .expect("aliases should list")
+            .is_empty());
+
+        let duplicate = add_tool_aliases(
+            &connection,
+            &[
+                alias_input("duplicate", "canonical"),
+                alias_input("duplicate", "canonical"),
+            ],
+        )
+        .expect_err("duplicate batch input must fail before writing");
+        assert!(matches!(
+            duplicate,
+            ToolAliasStorageError::Validation(
+                ToolAliasValidationError::DuplicateBatchAlias(alias)
+            ) if alias == "duplicate"
+        ));
+        assert!(list_tool_aliases(&connection)
+            .expect("aliases should remain empty")
+            .is_empty());
+
+        let mut oversized = alias_input("oversized", "canonical");
+        oversized.source = "s".repeat(MAX_TOOL_ALIAS_SOURCE_BYTES + 1);
+        assert!(matches!(
+            add_tool_alias(&connection, &oversized),
+            Err(ToolAliasStorageError::Validation(
+                ToolAliasValidationError::FieldTooLong {
+                    field: "source",
+                    max_bytes: MAX_TOOL_ALIAS_SOURCE_BYTES
+                }
+            ))
+        ));
+        assert!(matches!(
+            list_tool_aliases_page(&connection, None, MAX_TOOL_ALIAS_PAGE_SIZE + 1),
+            Err(ToolAliasStorageError::Validation(
+                ToolAliasValidationError::PageTooLarge {
+                    max_items: MAX_TOOL_ALIAS_PAGE_SIZE
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn stage_011_database_constraints_preserve_direct_active_targets() {
+        let mut connection =
+            Connection::open_in_memory().expect("in-memory DB should open for alias test");
+        connection
+            .execute_batch("PRAGMA foreign_keys = ON")
+            .expect("foreign keys should enable");
+        schema::apply_migrations(&mut connection).expect("migrations should apply");
+        register_tool_with_status(&connection, "canonical", "active");
+        add_tool_alias(&connection, &alias_input("old-id", "canonical"))
+            .expect("valid direct alias should insert");
+
+        assert!(connection
+            .execute(
+                "INSERT INTO tool_aliases (
+                    alias, canonical_tool_id, source, status
+                 ) VALUES ('missing-target', 'missing', 'test', 'active')",
+                [],
+            )
+            .is_err());
+        assert!(connection
+            .execute(
+                "INSERT INTO tool_aliases (
+                    alias, canonical_tool_id, source, status
+                 ) VALUES ('bad-status', 'canonical', 'test', 'disabled')",
+                [],
+            )
+            .is_err());
+        assert!(connection
+            .execute(
+                "UPDATE tool_contracts SET status = 'superseded'
+                 WHERE tool_id = 'canonical'",
+                [],
+            )
+            .is_err());
+        assert!(connection
+            .execute(
+                "INSERT INTO tool_contracts (
+                    tool_id, name, status, side_effects,
+                    approval_requirement, contract_json
+                 ) VALUES ('old-id', 'Shadow', 'active', 'none', 'none', '{}')",
+                [],
+            )
+            .is_err());
+
+        let violations: i64 = connection
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .expect("foreign key check should run");
+        assert_eq!(violations, 0);
+    }
+
+    #[test]
+    fn stage_011_alias_mutations_change_operational_revision_without_files() {
+        let _lock = crate::install::test_env_lock()
+            .lock()
+            .expect("environment lock should not be poisoned");
+        let (override_home, _aopmem_home, _home, workspace_paths, connection) =
+            setup_test_workspace("stage-011-alias-revision");
+        register_tool_with_status(&connection, "canonical", "active");
+        let tools_before = fs::read_dir(workspace_paths.tools())
+            .expect("tools directory should list")
+            .count();
+        let before = storage::operational_recall_revision(&connection)
+            .expect("baseline revision should build");
+
+        add_tool_alias(&connection, &alias_input("old-id", "canonical"))
+            .expect("alias should insert");
+        let after_add =
+            storage::operational_recall_revision(&connection).expect("alias revision should build");
+        remove_tool_alias(&connection, "old-id")
+            .expect("alias should remove")
+            .expect("alias should exist");
+        let after_remove = storage::operational_recall_revision(&connection)
+            .expect("removed alias revision should build");
+
+        assert_ne!(before, after_add);
+        assert_eq!(before, after_remove);
+        assert_eq!(
+            fs::read_dir(workspace_paths.tools())
+                .expect("tools directory should relist")
+                .count(),
+            tools_before
+        );
+        fs::remove_dir_all(override_home).expect("alias fixture should remove");
+    }
+
+    #[test]
+    fn stage_011_alias_keyset_query_uses_primary_key_index() {
+        let mut connection =
+            Connection::open_in_memory().expect("in-memory DB should open for alias test");
+        schema::apply_migrations(&mut connection).expect("migrations should apply");
+        let detail: String = connection
+            .query_row(
+                "EXPLAIN QUERY PLAN
+                 SELECT alias, canonical_tool_id, created_at, source, status
+                 FROM tool_aliases
+                 WHERE alias > 'cursor'
+                 ORDER BY alias ASC
+                 LIMIT 101",
+                [],
+                |row| row.get(3),
+            )
+            .expect("keyset query plan should read");
+        assert!(detail.contains("SEARCH tool_aliases USING INDEX"));
+        assert!(detail.contains("alias>?"));
     }
 
     #[test]
@@ -6478,36 +10676,6 @@ mod tests {
             .expect("reused pid with a new start time should replace identity"));
         let second = DarwinProcessIdentity { pid: 102, ..root };
         assert!(tracker.insert_with_ceiling(second, 1).is_err());
-        assert!(darwin_completed_process_group_error_is_benign(
-            Some(libc::EPERM),
-            true,
-            false
-        ));
-        assert!(!darwin_completed_process_group_error_is_benign(
-            Some(libc::EPERM),
-            false,
-            false
-        ));
-        assert!(!darwin_completed_process_group_error_is_benign(
-            Some(libc::EPERM),
-            true,
-            true
-        ));
-        assert!(darwin_empty_group_eperm_needs_completion_retry(
-            Some(libc::EPERM),
-            false,
-            false
-        ));
-        assert!(!darwin_empty_group_eperm_needs_completion_retry(
-            Some(libc::EPERM),
-            false,
-            true
-        ));
-        assert!(!darwin_empty_group_eperm_needs_completion_retry(
-            Some(libc::EPERM),
-            true,
-            false
-        ));
     }
 
     #[cfg(target_os = "macos")]
@@ -6638,6 +10806,138 @@ mod tests {
             .expect("an absent parent child-list should be benign");
             assert!(children.is_empty());
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_fast_same_group_orphan_is_killed_after_parent_success() {
+        let _lock = crate::install::test_env_lock()
+            .lock()
+            .expect("env lock should not be poisoned");
+        let (override_home, _aopmem_home, _home, workspace_paths, connection) =
+            setup_test_workspace("macos-fast-same-group-orphan");
+        create_runnable_test_tool(
+            &workspace_paths,
+            &connection,
+            "macos-fast-same-group-orphan-tool",
+            "#!/bin/sh\n(trap '' HUP; exec >/dev/null 2>&1; sleep 2; printf escaped > \"$1\") &\nprintf '%s' \"$!\" > \"$2\"\nexit 0\n",
+        );
+        let tool_root = tool_dir(&workspace_paths, "macos-fast-same-group-orphan-tool");
+        let marker = tool_root.join("runtime/escaped");
+        let pid_path = tool_root.join("runtime/child.pid");
+        let record = run_tool(
+            &workspace_paths,
+            &connection,
+            "macos-fast-same-group-orphan-tool",
+            &[marker.display().to_string(), pid_path.display().to_string()],
+            None,
+        )
+        .expect("successful parent should still clean up its same-group orphan");
+        assert_eq!(record.exit_code, 0);
+        let pid = fs::read_to_string(pid_path)
+            .expect("orphan pid should be recorded")
+            .parse()
+            .expect("orphan pid should parse");
+        assert_process_stops(pid);
+        thread::sleep(Duration::from_millis(50));
+        assert!(!marker.exists());
+        fs::remove_dir_all(override_home).expect("same-group fixture should be removed");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_repeated_short_tool_runs_do_not_receive_stale_cleanup_signal() {
+        let _lock = crate::install::test_env_lock()
+            .lock()
+            .expect("env lock should not be poisoned");
+        let (override_home, _aopmem_home, _home, workspace_paths, connection) =
+            setup_test_workspace("macos-repeated-short-runs");
+        create_runnable_test_tool(
+            &workspace_paths,
+            &connection,
+            "macos-repeated-short-runs-tool",
+            "#!/bin/sh\nprintf '%s\\n' \"$1\"\n",
+        );
+
+        for invocation in 0..100 {
+            let expected = invocation.to_string();
+            let record = run_tool(
+                &workspace_paths,
+                &connection,
+                "macos-repeated-short-runs-tool",
+                std::slice::from_ref(&expected),
+                None,
+            )
+            .unwrap_or_else(|error| {
+                panic!("short tool invocation {invocation} should succeed: {error:?}")
+            });
+            assert_eq!(record.exit_code, 0);
+            assert_eq!(record.stdout, format!("{expected}\n"));
+        }
+
+        fs::remove_dir_all(override_home).expect("repeated-run fixture should be removed");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_executable_snapshot_fallback_is_bounded_and_runnable() {
+        let _lock = crate::install::test_env_lock()
+            .lock()
+            .expect("env lock should not be poisoned");
+        let _snapshot_hook = DarwinSnapshotHookGuard::set(true, false);
+        let (override_home, _aopmem_home, _home, workspace_paths, connection) =
+            setup_test_workspace("macos-snapshot-fallback");
+        create_runnable_test_tool(
+            &workspace_paths,
+            &connection,
+            "macos-snapshot-fallback-tool",
+            "#!/bin/sh\nprintf fallback\n",
+        );
+        let record = run_tool(
+            &workspace_paths,
+            &connection,
+            "macos-snapshot-fallback-tool",
+            &[],
+            None,
+        )
+        .expect("bounded fd-copy fallback should remain runnable");
+        assert_eq!(record.stdout, "fallback");
+        fs::remove_dir_all(override_home).expect("fallback fixture should be removed");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_executable_snapshot_fails_closed_on_in_place_source_mutation() {
+        let _lock = crate::install::test_env_lock()
+            .lock()
+            .expect("env lock should not be poisoned");
+        let _snapshot_hook = DarwinSnapshotHookGuard::set(true, true);
+        let (override_home, _aopmem_home, _home, workspace_paths, connection) =
+            setup_test_workspace("macos-snapshot-mutation");
+        create_runnable_test_tool(
+            &workspace_paths,
+            &connection,
+            "macos-snapshot-mutation-tool",
+            "#!/bin/sh\nprintf original\n",
+        );
+        let error = run_tool(
+            &workspace_paths,
+            &connection,
+            "macos-snapshot-mutation-tool",
+            &[],
+            None,
+        )
+        .expect_err("in-place source mutation must fail closed");
+        assert!(matches!(error, RunToolError::Io(_)));
+        let tool_root = tool_dir(&workspace_paths, "macos-snapshot-mutation-tool");
+        assert!(fs::read_dir(tool_root)
+            .expect("tool root should remain readable")
+            .all(|entry| !entry
+                .expect("tool root entry should be readable")
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".aopmem-exec-")));
+        fs::remove_dir_all(override_home).expect("mutation fixture should be removed");
     }
 
     #[cfg(target_os = "macos")]

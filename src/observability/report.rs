@@ -6,8 +6,9 @@ use super::{
     ObservabilityReader, WorkspacePaths, OBSERVABILITY_RETENTION_DAYS,
     OBSERVABILITY_RETENTION_MAX_BYTES, OBSERVABILITY_SCHEMA_VERSION,
 };
+use crate::redaction::{TaggedValueRedactor, TEST_SECRET_REDACTION_MARKER};
 use crate::storage;
-use rusqlite::{Connection, Transaction};
+use rusqlite::{Connection, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
@@ -109,6 +110,7 @@ pub(crate) struct ReportPeriod {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct EffectivenessFacts {
+    pub tasks: TaskFacts,
     pub recall: RecallFacts,
     pub nodes_selected_by_type: Vec<NamedCount>,
     pub most_selected: MostSelectedFacts,
@@ -118,9 +120,29 @@ pub(crate) struct EffectivenessFacts {
     pub reflection: ReflectionFacts,
     pub adapter_drift_events: AdapterDriftFacts,
     pub pending_audit_events: u64,
+    pub tool_duplicate_blocks: u64,
+    pub alias_resolutions: u64,
+    pub unresolved_tool_overlaps: u64,
+    pub last_successful_audit_repair_at: Option<String>,
     pub doctor_verify_failures: HealthFailureFacts,
     pub artifact_cleanup_deletions: ArtifactCleanupFacts,
     pub mcp: McpFacts,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
+pub(crate) struct TaskFacts {
+    pub starts: u64,
+    pub context_applications: u64,
+    pub started_without_apply: u64,
+    pub completed: u64,
+    pub failed: u64,
+    pub applied_gates: u64,
+    pub applied_rules: u64,
+    pub selected_workflows: u64,
+    pub selected_tools: u64,
+    pub corrections_applied: u64,
+    pub failure_modes_applied: u64,
+    pub applied_context_by_type: Vec<NamedCount>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
@@ -264,26 +286,31 @@ pub(crate) fn effectiveness_report(
     workspace_paths: &WorkspacePaths,
     workspace_key: &str,
 ) -> Result<EffectivenessReport, ObserveReadError> {
+    let redactor = report_redactor(workspace_paths)?;
     let Some(reader) = open_optional_reader(workspace_paths)? else {
         let captured_at = capture_report_timestamp()?;
-        return not_collected_report(workspace_key, &captured_at);
+        let mut report = not_collected_report(workspace_key, &captured_at)?;
+        redact_report_identity(&mut report.workspace, &redactor)?;
+        return Ok(report);
     };
     let transaction = reader
         .connection
         .unchecked_transaction()
         .map_err(|_| ObserveReadError::ReadFailed)?;
     let captured_at = capture_snapshot_timestamp(&transaction)?;
-    ready_report_from_snapshot(transaction, workspace_key, &captured_at)
+    ready_report_from_snapshot(transaction, workspace_key, &captured_at, &redactor)
 }
 
 pub(crate) fn observe_status(
     workspace_paths: &WorkspacePaths,
     workspace_key: &str,
 ) -> Result<ObserveStatusResponse, ObserveReadError> {
+    let redactor = report_redactor(workspace_paths)?;
     let Some(reader) = open_optional_reader(workspace_paths)? else {
+        let workspace = redact_report_text(workspace_key, &redactor, 512)?;
         return Ok(ObserveStatusResponse {
             product_version: PRODUCT_VERSION.to_string(),
-            workspace: workspace_key.to_string(),
+            workspace,
             collection_status: CollectionStatus::NotCollected,
             complete: false,
             observability_schema_version: None,
@@ -298,9 +325,10 @@ pub(crate) fn observe_status(
     transaction
         .commit()
         .map_err(|_| ObserveReadError::ReadFailed)?;
+    let workspace = redact_report_text(workspace_key, &redactor, 512)?;
     Ok(ObserveStatusResponse {
         product_version: PRODUCT_VERSION.to_string(),
-        workspace: workspace_key.to_string(),
+        workspace,
         collection_status: CollectionStatus::Ready,
         complete: true,
         observability_schema_version: Some(schema_version_u64()?),
@@ -314,15 +342,18 @@ pub(crate) fn effectiveness_report_at(
     workspace_key: &str,
     captured_at: &ReportTimestamp,
 ) -> Result<EffectivenessReport, ObserveReadError> {
+    let redactor = report_redactor(workspace_paths)?;
     let Some(reader) = open_optional_reader(workspace_paths)? else {
-        return not_collected_report(workspace_key, captured_at);
+        let mut report = not_collected_report(workspace_key, captured_at)?;
+        redact_report_identity(&mut report.workspace, &redactor)?;
+        return Ok(report);
     };
     let transaction = reader
         .connection
         .unchecked_transaction()
         .map_err(|_| ObserveReadError::ReadFailed)?;
     establish_read_snapshot(&transaction)?;
-    ready_report_from_snapshot(transaction, workspace_key, captured_at)
+    ready_report_from_snapshot(transaction, workspace_key, captured_at, &redactor)
 }
 
 pub(super) fn not_collected_report(
@@ -344,8 +375,10 @@ fn ready_report_from_snapshot(
     transaction: Transaction<'_>,
     workspace_key: &str,
     captured_at: &ReportTimestamp,
+    redactor: &TaggedValueRedactor,
 ) -> Result<EffectivenessReport, ObserveReadError> {
-    let report = effectiveness_report_in_snapshot(&transaction, workspace_key, captured_at)?;
+    let report =
+        effectiveness_report_in_snapshot(&transaction, workspace_key, captured_at, redactor)?;
     transaction
         .commit()
         .map_err(|_| ObserveReadError::ReadFailed)?;
@@ -356,6 +389,7 @@ pub(super) fn effectiveness_report_in_snapshot(
     transaction: &Transaction<'_>,
     workspace_key: &str,
     captured_at: &ReportTimestamp,
+    redactor: &TaggedValueRedactor,
 ) -> Result<EffectivenessReport, ObserveReadError> {
     let start_at = period_start(captured_at)?;
     let base_period = base_period(captured_at)?;
@@ -364,6 +398,7 @@ pub(super) fn effectiveness_report_in_snapshot(
         workspace_key,
         start_at.as_str(),
         captured_at.as_str(),
+        redactor,
     )?;
     let retention_truncated = retention_floor_at
         .as_deref()
@@ -375,7 +410,7 @@ pub(super) fn effectiveness_report_in_snapshot(
     };
     Ok(EffectivenessReport {
         product_version: PRODUCT_VERSION.to_string(),
-        workspace: workspace_key.to_string(),
+        workspace: redact_report_text(workspace_key, redactor, 512)?,
         collection_status: CollectionStatus::Ready,
         complete: !retention_truncated,
         observability_schema_version: Some(schema_version_u64()?),
@@ -446,6 +481,48 @@ fn open_optional_reader(
             Err(ObserveReadError::InvalidStore)
         }
     }
+}
+
+fn report_redactor(
+    workspace_paths: &WorkspacePaths,
+) -> Result<TaggedValueRedactor, ObserveReadError> {
+    let mut connection = match storage::open_workspace_db_read_only(workspace_paths) {
+        Ok(connection) => connection,
+        Err(storage::OpenWorkspaceReadOnlyError::Missing(_)) => {
+            return Ok(TaggedValueRedactor::default());
+        }
+        Err(
+            storage::OpenWorkspaceReadOnlyError::UnsafePath(_)
+            | storage::OpenWorkspaceReadOnlyError::Db(_),
+        ) => return Err(ObserveReadError::ReadFailed),
+    };
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Deferred)
+        .map_err(|_| ObserveReadError::ReadFailed)?;
+    let redactor =
+        TaggedValueRedactor::load(&transaction).map_err(|_| ObserveReadError::ReadFailed)?;
+    transaction
+        .commit()
+        .map_err(|_| ObserveReadError::ReadFailed)?;
+    Ok(redactor)
+}
+
+fn redact_report_text(
+    value: &str,
+    redactor: &TaggedValueRedactor,
+    maximum_bytes: usize,
+) -> Result<String, ObserveReadError> {
+    redactor
+        .redact_str_bounded(value, maximum_bytes)
+        .map_err(|_| ObserveReadError::ReadFailed)
+}
+
+fn redact_report_identity(
+    value: &mut String,
+    redactor: &TaggedValueRedactor,
+) -> Result<(), ObserveReadError> {
+    *value = redact_report_text(value, redactor, 512)?;
+    Ok(())
 }
 
 fn schema_version_u64() -> Result<u64, ObserveReadError> {
@@ -593,7 +670,9 @@ fn load_effectiveness_facts(
     workspace_key: &str,
     start_at: &str,
     end_at: &str,
+    redactor: &TaggedValueRedactor,
 ) -> Result<(EffectivenessFacts, Option<String>), ObserveReadError> {
+    let tasks = load_task_facts(transaction, workspace_key, start_at, end_at)?;
     let mut event_facts = EventFacts::default();
     load_events(
         transaction,
@@ -601,6 +680,7 @@ fn load_effectiveness_facts(
         start_at,
         end_at,
         &mut event_facts,
+        redactor,
     )?;
     let recall = RecallFacts {
         count: event_facts.recall_started,
@@ -644,7 +724,7 @@ fn load_effectiveness_facts(
                 .count(),
         )?,
     };
-    let selections = load_bundle_nodes(transaction, workspace_key, start_at, end_at)?;
+    let selections = load_bundle_nodes(transaction, workspace_key, start_at, end_at, redactor)?;
     let feedback = load_feedback(transaction, workspace_key, start_at, end_at)?;
     let retention_floor_at: Option<String> = transaction
         .query_row(
@@ -659,6 +739,7 @@ fn load_effectiveness_facts(
 
     Ok((
         EffectivenessFacts {
+            tasks,
             recall,
             nodes_selected_by_type: selections.by_type,
             most_selected: selections.most_selected,
@@ -673,12 +754,129 @@ fn load_effectiveness_facts(
             reflection: event_facts.reflection,
             adapter_drift_events: event_facts.adapter_drift,
             pending_audit_events: event_facts.pending_audit_events,
+            tool_duplicate_blocks: event_facts.tool_duplicate_blocks,
+            alias_resolutions: event_facts.alias_resolutions,
+            unresolved_tool_overlaps: event_facts.unresolved_tool_overlaps,
+            last_successful_audit_repair_at: event_facts.last_successful_audit_repair_at,
             doctor_verify_failures: event_facts.health_failures,
             artifact_cleanup_deletions: event_facts.artifact_cleanup,
             mcp: event_facts.mcp,
         },
         retention_floor_at,
     ))
+}
+
+const TASK_LIFECYCLE_FACTS_SQL: &str = r#"
+SELECT
+    (SELECT COUNT(*) FROM tasks INDEXED BY idx_tasks_started_at
+     WHERE workspace_key = ?1 AND started_at >= ?2 AND started_at <= ?3),
+    (SELECT COUNT(*) FROM tasks INDEXED BY idx_tasks_workspace_status
+     WHERE workspace_key = ?1
+       AND status IN ('applied', 'completed', 'failed')
+       AND applied_at >= ?2 AND applied_at <= ?3),
+    (SELECT COUNT(*) FROM tasks INDEXED BY idx_tasks_started_at
+     WHERE workspace_key = ?1
+       AND started_at >= ?2 AND started_at <= ?3
+       AND (applied_at IS NULL OR applied_at > ?3)),
+    (SELECT COUNT(*) FROM tasks INDEXED BY idx_tasks_workspace_status
+     WHERE workspace_key = ?1 AND status = 'completed'
+       AND finished_at >= ?2 AND finished_at <= ?3),
+    (SELECT COUNT(*) FROM tasks INDEXED BY idx_tasks_workspace_status
+     WHERE workspace_key = ?1 AND status = 'failed'
+       AND finished_at >= ?2 AND finished_at <= ?3)
+"#;
+
+const TASK_APPLIED_FACTS_SQL: &str = r#"
+SELECT applied.application_kind, bundled.context_kind, COUNT(*)
+FROM tasks AS task INDEXED BY idx_tasks_workspace_status
+JOIN task_applied_nodes AS applied USING (task_id)
+JOIN task_bundle_nodes AS bundled USING (task_id, node_id)
+WHERE task.workspace_key = ?1
+  AND task.status IN ('applied', 'completed', 'failed')
+  AND task.applied_at >= ?2
+  AND task.applied_at <= ?3
+GROUP BY applied.application_kind, bundled.context_kind
+ORDER BY applied.application_kind, bundled.context_kind
+"#;
+
+fn load_task_facts(
+    transaction: &Transaction<'_>,
+    workspace_key: &str,
+    start_at: &str,
+    end_at: &str,
+) -> Result<TaskFacts, ObserveReadError> {
+    let foreign_tasks: i64 = transaction
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM tasks WHERE workspace_key <> ?1 LIMIT 1
+             )",
+            [workspace_key],
+            |row| row.get(0),
+        )
+        .map_err(|_| ObserveReadError::ReadFailed)?;
+    if foreign_tasks != 0 {
+        return Err(ObserveReadError::InvalidStore);
+    }
+    let lifecycle: (i64, i64, i64, i64, i64) = transaction
+        .query_row(
+            TASK_LIFECYCLE_FACTS_SQL,
+            rusqlite::params![workspace_key, start_at, end_at],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .map_err(|_| ObserveReadError::ReadFailed)?;
+    let mut facts = TaskFacts {
+        starts: nonnegative(lifecycle.0)?,
+        context_applications: nonnegative(lifecycle.1)?,
+        started_without_apply: nonnegative(lifecycle.2)?,
+        completed: nonnegative(lifecycle.3)?,
+        failed: nonnegative(lifecycle.4)?,
+        ..TaskFacts::default()
+    };
+    let mut context_counts = BTreeMap::<String, u64>::new();
+    let mut statement = transaction
+        .prepare(TASK_APPLIED_FACTS_SQL)
+        .map_err(|_| ObserveReadError::ReadFailed)?;
+    let mut rows = statement
+        .query(rusqlite::params![workspace_key, start_at, end_at])
+        .map_err(|_| ObserveReadError::ReadFailed)?;
+    while let Some(row) = rows.next().map_err(|_| ObserveReadError::ReadFailed)? {
+        let application_kind: String = row.get(0).map_err(|_| ObserveReadError::InvalidStore)?;
+        let context_kind: String = row.get(1).map_err(|_| ObserveReadError::InvalidStore)?;
+        let count = nonnegative(row.get(2).map_err(|_| ObserveReadError::InvalidStore)?)?;
+        match application_kind.as_str() {
+            "gate" => facts.applied_gates = checked_add(facts.applied_gates, count)?,
+            "rule" => facts.applied_rules = checked_add(facts.applied_rules, count)?,
+            "workflow" => {
+                facts.selected_workflows = checked_add(facts.selected_workflows, count)?;
+            }
+            "tool" => facts.selected_tools = checked_add(facts.selected_tools, count)?,
+            "correction" => {
+                facts.corrections_applied = checked_add(facts.corrections_applied, count)?;
+            }
+            "failure_mode" => {
+                facts.failure_modes_applied = checked_add(facts.failure_modes_applied, count)?;
+            }
+            _ => return Err(ObserveReadError::InvalidStore),
+        }
+        if !matches!(context_kind.as_str(), "mandatory" | "task") {
+            return Err(ObserveReadError::InvalidStore);
+        }
+        let aggregate = context_counts.entry(context_kind).or_default();
+        *aggregate = checked_add(*aggregate, count)?;
+    }
+    facts.applied_context_by_type = context_counts
+        .into_iter()
+        .map(|(name, count)| NamedCount { name, count })
+        .collect();
+    Ok(facts)
 }
 
 #[derive(Debug, Default)]
@@ -697,6 +895,10 @@ struct EventFacts {
     reflection: ReflectionFacts,
     adapter_drift: AdapterDriftFacts,
     pending_audit_events: u64,
+    tool_duplicate_blocks: u64,
+    alias_resolutions: u64,
+    unresolved_tool_overlaps: u64,
+    last_successful_audit_repair_at: Option<String>,
     health_failures: HealthFailureFacts,
     artifact_cleanup: ArtifactCleanupFacts,
     mcp: McpFacts,
@@ -723,6 +925,7 @@ fn load_events(
     start_at: &str,
     end_at: &str,
     facts: &mut EventFacts,
+    redactor: &TaggedValueRedactor,
 ) -> Result<(), ObserveReadError> {
     let mut statement = transaction
         .prepare(
@@ -740,7 +943,7 @@ fn load_events(
     while let Some(row) = rows.next().map_err(|_| ObserveReadError::ReadFailed)? {
         let event = StoredEvent::from_row(row, workspace_key)?;
         validate_event_contract(&event)?;
-        accumulate_event(event, facts)?;
+        accumulate_event(event, facts, redactor)?;
     }
     Ok(())
 }
@@ -784,7 +987,7 @@ impl StoredEvent {
             || duration_ms.is_some_and(|value| value < 0)
             || error_code
                 .as_deref()
-                .is_some_and(|value| !is_identifier(value))
+                .is_some_and(|value| value != TEST_SECRET_REDACTION_MARKER && !is_identifier(value))
         {
             return Err(ObserveReadError::InvalidStore);
         }
@@ -895,6 +1098,25 @@ fn validate_event_contract(event: &StoredEvent) -> Result<(), ObserveReadError> 
                 P::Counts(_)
             )
             | (T::FeedbackRecorded, O::Recorded, P::Empty)
+            | (T::TaskStarted, O::Started, P::Task(_))
+            | (T::TaskContextApplied, O::Applied, P::Task(_))
+            | (T::TaskCompleted, O::Success, P::Task(_))
+            | (T::TaskFailed, O::Failure, P::Task(_))
+            | (
+                T::ToolDuplicateDetected,
+                O::Recorded | O::Warning,
+                P::Tool(_)
+            )
+            | (T::ToolDuplicateBlocked, O::Blocked, P::Tool(_))
+            | (
+                T::ToolAliasCreated | T::ToolAliasResolved | T::ToolCanonicalized,
+                O::Recorded | O::Success,
+                P::Tool(_)
+            )
+            | (T::AuditRepairStarted, O::Started, P::Empty)
+            | (T::AuditRepairCompleted, O::Success, P::Empty)
+            | (T::AuditRepairFailed, O::Failure, P::Empty)
+            | (T::PlatformCheckCompleted, O::Success | O::Failure, P::Empty)
     );
     if !valid_shape {
         return Err(ObserveReadError::InvalidStore);
@@ -903,6 +1125,9 @@ fn validate_event_contract(event: &StoredEvent) -> Result<(), ObserveReadError> 
         return Err(ObserveReadError::InvalidStore);
     }
     if event.event_type == EventType::FeedbackRecorded && event.bundle_id.is_none() {
+        return Err(ObserveReadError::InvalidStore);
+    }
+    if event.event_type.is_task() && event.bundle_id.is_none() {
         return Err(ObserveReadError::InvalidStore);
     }
     let error_required = event.outcome == EventOutcome::Failure
@@ -987,7 +1212,11 @@ fn validate_count_contract(event: &StoredEvent) -> Result<(), ObserveReadError> 
     Ok(())
 }
 
-fn accumulate_event(event: StoredEvent, facts: &mut EventFacts) -> Result<(), ObserveReadError> {
+fn accumulate_event(
+    event: StoredEvent,
+    facts: &mut EventFacts,
+    redactor: &TaggedValueRedactor,
+) -> Result<(), ObserveReadError> {
     let StoredEvent {
         timestamp,
         event_type,
@@ -1034,12 +1263,12 @@ fn accumulate_event(event: StoredEvent, facts: &mut EventFacts) -> Result<(), Ob
         (EventType::ToolRunFailed, EventOutcome::Failure, StoredPayload::Tool(payload)) => {
             record_tool_terminal(&correlation_id, &mut facts.tool_terminals)?;
             facts.tool_failure = checked_increment(facts.tool_failure)?;
-            record_tool_error(timestamp, error_code, payload, facts)?;
+            record_tool_error(timestamp, error_code, payload, facts, redactor)?;
         }
         (EventType::ToolRunTimeout, EventOutcome::Timeout, StoredPayload::Tool(payload)) => {
             record_tool_terminal(&correlation_id, &mut facts.tool_terminals)?;
             facts.tool_timeout = checked_increment(facts.tool_timeout)?;
-            record_tool_error(timestamp, error_code, payload, facts)?;
+            record_tool_error(timestamp, error_code, payload, facts, redactor)?;
         }
         (EventType::ReflectionProposal, EventOutcome::Proposed, StoredPayload::Counts(counts)) => {
             record_event_items(&mut facts.reflection.proposed, counts)?;
@@ -1061,6 +1290,23 @@ fn accumulate_event(event: StoredEvent, facts: &mut EventFacts) -> Result<(), Ob
         }
         (EventType::AuditSnapshotPending, EventOutcome::Pending, StoredPayload::Counts(_)) => {
             facts.pending_audit_events = checked_increment(facts.pending_audit_events)?;
+        }
+        (EventType::ToolDuplicateBlocked, EventOutcome::Blocked, StoredPayload::Tool(_)) => {
+            facts.tool_duplicate_blocks = checked_increment(facts.tool_duplicate_blocks)?;
+            if error_code.as_deref() == Some("TOOL_OVERLAP_REVIEW_REQUIRED") {
+                facts.unresolved_tool_overlaps = checked_increment(facts.unresolved_tool_overlaps)?;
+            }
+        }
+        (EventType::ToolAliasResolved, _, StoredPayload::Tool(_)) => {
+            facts.alias_resolutions = checked_increment(facts.alias_resolutions)?;
+        }
+        (EventType::AuditRepairCompleted, EventOutcome::Success, StoredPayload::Empty)
+            if facts
+                .last_successful_audit_repair_at
+                .as_deref()
+                .is_none_or(|current| current < timestamp.as_str()) =>
+        {
+            facts.last_successful_audit_repair_at = Some(timestamp);
         }
         (EventType::Doctor, EventOutcome::Failure, StoredPayload::Counts(_)) => {
             facts.health_failures.doctor = checked_increment(facts.health_failures.doctor)?;
@@ -1119,9 +1365,10 @@ fn record_tool_error(
     error_code: Option<String>,
     payload: StoredTool,
     facts: &mut EventFacts,
+    redactor: &TaggedValueRedactor,
 ) -> Result<(), ObserveReadError> {
-    let error_code = safe_title(&error_code.ok_or(ObserveReadError::InvalidStore)?)?;
-    let key = (safe_title(&payload.tool_id)?, error_code);
+    let error_code = safe_title(&error_code.ok_or(ObserveReadError::InvalidStore)?, redactor)?;
+    let key = (safe_title(&payload.tool_id, redactor)?, error_code);
     let aggregate = facts.tool_errors.entry(key).or_insert(ToolErrorAggregate {
         invocations: 0,
         last_seen_at: timestamp.clone(),
@@ -1214,6 +1461,7 @@ fn load_bundle_nodes(
     workspace_key: &str,
     start_at: &str,
     end_at: &str,
+    redactor: &TaggedValueRedactor,
 ) -> Result<SelectionFacts, ObserveReadError> {
     let mut statement = transaction
         .prepare(
@@ -1277,7 +1525,7 @@ fn load_bundle_nodes(
         if reasons.is_empty() || reasons.len() > 64 || unique_reasons.len() != reasons.len() {
             return Err(ObserveReadError::InvalidStore);
         }
-        let title = safe_title(&node_title)?;
+        let title = safe_title(&node_title, redactor)?;
         let count = by_type.entry(node_type.clone()).or_default();
         *count = checked_increment(*count)?;
         if matches!(
@@ -1453,6 +1701,7 @@ enum StoredPayload {
     Mcp(StoredMcp),
     Artifact(StoredArtifact),
     Counts(StoredCounts),
+    Task(StoredTask),
 }
 
 impl StoredPayload {
@@ -1466,7 +1715,21 @@ impl StoredPayload {
             Self::Mcp(value) => value.validate(),
             Self::Artifact(value) => value.validate(),
             Self::Counts(value) => value.validate(),
+            Self::Task(value) => value.validate(),
         }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredTask {
+    task_id: String,
+}
+
+impl StoredTask {
+    fn validate(&self) -> Result<(), ObserveReadError> {
+        validate_uuid_v4(&self.task_id).map_err(|_| ObserveReadError::InvalidStore)?;
+        Ok(())
     }
 }
 
@@ -1755,11 +2018,14 @@ fn required_count(values: &BTreeMap<String, u64>, key: &str) -> Result<u64, Obse
         .ok_or(ObserveReadError::InvalidStore)
 }
 
-fn safe_title(value: &str) -> Result<String, ObserveReadError> {
+fn safe_title(value: &str, redactor: &TaggedValueRedactor) -> Result<String, ObserveReadError> {
     if value.as_bytes().contains(&0) || value.trim().is_empty() || value.len() > 65_536 {
         return Err(ObserveReadError::InvalidStore);
     }
-    Ok(truncate_utf8(redact_sensitive_text(value), 512))
+    let exact = redactor
+        .redact_str_bounded(value, 512)
+        .map_err(|_| ObserveReadError::ReadFailed)?;
+    Ok(truncate_utf8(redact_sensitive_text(&exact), 512))
 }
 
 fn is_identifier(value: &str) -> bool {
@@ -1768,6 +2034,11 @@ fn is_identifier(value: &str) -> bool {
 
 fn checked_increment(value: u64) -> Result<u64, ObserveReadError> {
     value.checked_add(1).ok_or(ObserveReadError::InvalidStore)
+}
+
+fn checked_add(left: u64, right: u64) -> Result<u64, ObserveReadError> {
+    left.checked_add(right)
+        .ok_or(ObserveReadError::InvalidStore)
 }
 
 fn nonnegative(value: i64) -> Result<u64, ObserveReadError> {
@@ -1860,6 +2131,18 @@ mod tests {
         format!("00000000-0000-4000-8000-{value:012x}")
     }
 
+    fn query_plan(connection: &Connection, sql: &str, parameters: impl rusqlite::Params) -> String {
+        let mut statement = connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .expect("query plan should prepare");
+        statement
+            .query_map(parameters, |row| row.get::<_, String>(3))
+            .expect("query plan should run")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("query plan should collect")
+            .join("\n")
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn insert_bundle(
         connection: &Connection,
@@ -1949,6 +2232,85 @@ mod tests {
             "kind": "tool",
             "data": { "tool_id": tool_id, "approval_present": false }
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_task(
+        connection: &Connection,
+        value: u64,
+        status: &str,
+        started_at: &str,
+        applied_at: Option<&str>,
+        finished_at: Option<&str>,
+    ) -> String {
+        let task_id = fixed_uuid(value);
+        let terminal = matches!(status, "completed" | "failed");
+        connection
+            .execute(
+                "INSERT INTO tasks (
+                    task_id, bundle_id, product_version, workspace_key,
+                    memory_revision, query_fingerprint, status, started_at,
+                    applied_at, finished_at, mandatory_context_complete,
+                    retrieval_complete, budget_exhausted, none_relevant,
+                    apply_fingerprint, completion_fingerprint,
+                    completion_result, duration_ms, error_code
+                 ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                    1, 1, 0, 0, ?11, ?12, ?13, ?14, ?15
+                 )",
+                params![
+                    task_id,
+                    fixed_uuid(value + 10_000),
+                    PRODUCT_VERSION,
+                    WORKSPACE_KEY,
+                    "a".repeat(32),
+                    "b".repeat(32),
+                    status,
+                    started_at,
+                    applied_at,
+                    finished_at,
+                    applied_at.map(|_| "c".repeat(32)),
+                    terminal.then(|| "d".repeat(32)),
+                    terminal.then_some(if status == "failed" {
+                        "failed"
+                    } else {
+                        "success"
+                    }),
+                    terminal.then_some(5_i64),
+                    (status == "failed").then_some("TASK_FAILED"),
+                ],
+            )
+            .expect("task fixture should insert");
+        task_id
+    }
+
+    fn insert_applied_task_node(
+        connection: &Connection,
+        task_id: &str,
+        node_id: i64,
+        context_kind: &str,
+        application_kind: &str,
+    ) {
+        let node_type = match application_kind {
+            "tool" => "tool_contract",
+            other => other,
+        };
+        connection
+            .execute(
+                "INSERT INTO task_bundle_nodes (
+                    task_id, node_id, node_type, context_kind
+                 ) VALUES (?1, ?2, ?3, ?4)",
+                params![task_id, node_id, node_type, context_kind],
+            )
+            .expect("task bundle node fixture should insert");
+        connection
+            .execute(
+                "INSERT INTO task_applied_nodes (
+                    task_id, node_id, application_kind
+                 ) VALUES (?1, ?2, ?3)",
+                params![task_id, node_id, application_kind],
+            )
+            .expect("applied task node fixture should insert");
     }
 
     fn recall_json(
@@ -2097,14 +2459,14 @@ mod tests {
         let status_facts = status.facts.expect("ready status should contain facts");
         assert_eq!(status.collection_status, CollectionStatus::Ready);
         assert!(status.complete);
-        assert_eq!(status.observability_schema_version, Some(1));
+        assert_eq!(status.observability_schema_version, Some(2));
         assert_eq!(status_facts.observability_events, 0);
         assert_eq!(status_facts.recall_bundles, 0);
         assert_eq!(status_facts.bundle_nodes, 0);
         assert_eq!(status_facts.feedback, 0);
         assert_eq!(report.collection_status, CollectionStatus::Ready);
         assert!(report.complete);
-        assert_eq!(report.observability_schema_version, Some(1));
+        assert_eq!(report.observability_schema_version, Some(2));
         assert_eq!(
             report
                 .facts
@@ -2660,6 +3022,185 @@ mod tests {
     }
 
     #[test]
+    fn task_and_rc5_compliance_facts_are_factual_bounded_and_read_only() {
+        let workspace = TestWorkspace::new("task-compliance-facts");
+        workspace.initialize();
+        let start = "2026-06-15T12:00:00.000Z";
+        let end = "2026-07-15T12:00:00.000Z";
+        workspace.mutate_fixture(|connection| {
+            insert_task(connection, 4_000, "started", start, None, None);
+            let completed = insert_task(
+                connection,
+                4_001,
+                "completed",
+                start,
+                Some(start),
+                Some(end),
+            );
+            insert_task(connection, 4_002, "failed", start, None, Some(end));
+            let prior = insert_task(
+                connection,
+                4_003,
+                "applied",
+                "2026-05-01T00:00:00.000Z",
+                Some(start),
+                None,
+            );
+            let future = "2026-07-15T12:00:00.001Z";
+            insert_task(connection, 4_004, "applied", start, Some(future), None);
+            for (node_id, context, application) in [
+                (1, "mandatory", "gate"),
+                (2, "task", "workflow"),
+                (3, "task", "tool"),
+                (4, "task", "correction"),
+                (5, "task", "failure_mode"),
+            ] {
+                insert_applied_task_node(connection, &completed, node_id, context, application);
+            }
+            insert_applied_task_node(connection, &prior, 6, "mandatory", "rule");
+
+            insert_event(
+                connection,
+                4_100,
+                end,
+                EventType::ToolDuplicateBlocked,
+                EventOutcome::Blocked,
+                tool_json("safe-tool"),
+                None,
+                Some("TOOL_OVERLAP_REVIEW_REQUIRED"),
+            );
+            insert_event(
+                connection,
+                4_101,
+                end,
+                EventType::ToolAliasResolved,
+                EventOutcome::Success,
+                tool_json("safe-alias"),
+                None,
+                None,
+            );
+            insert_event(
+                connection,
+                4_102,
+                end,
+                EventType::AuditRepairCompleted,
+                EventOutcome::Success,
+                empty_json(),
+                None,
+                None,
+            );
+        });
+        let before = database_snapshot(workspace.paths.observability_db());
+        let captured_at = ReportTimestamp::parse(end).expect("fixture timestamp should parse");
+        let facts = effectiveness_report_at(&workspace.paths, WORKSPACE_KEY, &captured_at)
+            .expect("task facts should read")
+            .facts
+            .expect("ready report should contain facts");
+        let after = database_snapshot(workspace.paths.observability_db());
+
+        assert_eq!(facts.tasks.starts, 4);
+        assert_eq!(facts.tasks.context_applications, 2);
+        assert_eq!(facts.tasks.started_without_apply, 3);
+        assert_eq!(facts.tasks.completed, 1);
+        assert_eq!(facts.tasks.failed, 1);
+        assert_eq!(facts.tasks.applied_gates, 1);
+        assert_eq!(facts.tasks.applied_rules, 1);
+        assert_eq!(facts.tasks.selected_workflows, 1);
+        assert_eq!(facts.tasks.selected_tools, 1);
+        assert_eq!(facts.tasks.corrections_applied, 1);
+        assert_eq!(facts.tasks.failure_modes_applied, 1);
+        assert_eq!(
+            facts.tasks.applied_context_by_type,
+            vec![
+                NamedCount {
+                    name: "mandatory".to_string(),
+                    count: 2,
+                },
+                NamedCount {
+                    name: "task".to_string(),
+                    count: 4,
+                },
+            ]
+        );
+        assert_eq!(facts.tool_duplicate_blocks, 1);
+        assert_eq!(facts.alias_resolutions, 1);
+        assert_eq!(facts.unresolved_tool_overlaps, 1);
+        assert_eq!(facts.last_successful_audit_repair_at.as_deref(), Some(end));
+        assert_eq!(after.0, before.0, "task report changed database bytes");
+        assert_eq!(after.1, before.1, "task report changed database mtime");
+    }
+
+    #[test]
+    fn task_aggregates_use_bounded_lifecycle_and_child_indexes() {
+        let workspace = TestWorkspace::new("task-query-plan");
+        workspace.initialize();
+        workspace.mutate_fixture(|connection| {
+            let lifecycle_plan = query_plan(
+                connection,
+                TASK_LIFECYCLE_FACTS_SQL,
+                rusqlite::params![
+                    WORKSPACE_KEY,
+                    "2026-06-15T12:00:00.000Z",
+                    "2026-07-15T12:00:00.000Z"
+                ],
+            );
+            for index in ["idx_tasks_started_at", "idx_tasks_workspace_status"] {
+                assert!(
+                    lifecycle_plan.contains(index),
+                    "task lifecycle query must use {index}: {lifecycle_plan}"
+                );
+            }
+
+            let applied_plan = query_plan(
+                connection,
+                TASK_APPLIED_FACTS_SQL,
+                rusqlite::params![
+                    WORKSPACE_KEY,
+                    "2026-06-15T12:00:00.000Z",
+                    "2026-07-15T12:00:00.000Z"
+                ],
+            );
+            assert!(
+                applied_plan.contains("idx_tasks_workspace_status"),
+                "task applied query must use the existing workspace/status index: {applied_plan}"
+            );
+            assert!(
+                applied_plan.contains("sqlite_autoindex_task_applied_nodes_1"),
+                "task applied query must use the bounded child key: {applied_plan}"
+            );
+        });
+    }
+
+    #[test]
+    fn foreign_task_history_fails_closed() {
+        let workspace = TestWorkspace::new("foreign-task");
+        workspace.initialize();
+        workspace.mutate_fixture(|connection| {
+            let task_id = insert_task(
+                connection,
+                4_200,
+                "started",
+                "2026-07-15T12:00:00.000Z",
+                None,
+                None,
+            );
+            connection
+                .execute(
+                    "UPDATE tasks SET workspace_key = 'foreign-workspace'
+                     WHERE task_id = ?1",
+                    [task_id],
+                )
+                .expect("foreign task fixture should update");
+        });
+        let captured_at = ReportTimestamp::parse("2026-07-15T12:00:00.000Z")
+            .expect("fixture timestamp should parse");
+        assert!(matches!(
+            effectiveness_report_at(&workspace.paths, WORKSPACE_KEY, &captured_at),
+            Err(ObserveReadError::InvalidStore)
+        ));
+    }
+
+    #[test]
     fn report_top_lists_are_bounded_and_mark_more_results() {
         let workspace = TestWorkspace::new("top-list");
         workspace.initialize();
@@ -3016,7 +3557,7 @@ mod tests {
         workspace.initialize();
         workspace.mutate_fixture(|connection| {
             connection
-                .execute_batch("PRAGMA user_version = 2;")
+                .execute_batch("PRAGMA user_version = 3;")
                 .expect("fixture version should change");
         });
         let before = database_snapshot(workspace.paths.observability_db());
@@ -3098,8 +3639,14 @@ mod tests {
         );
         drop(writer);
 
-        let (facts, _) = load_effectiveness_facts(&transaction, WORKSPACE_KEY, start, end)
-            .expect("original snapshot should remain readable");
+        let (facts, _) = load_effectiveness_facts(
+            &transaction,
+            WORKSPACE_KEY,
+            start,
+            end,
+            &TaggedValueRedactor::default(),
+        )
+        .expect("original snapshot should remain readable");
         assert_eq!(facts.recall.continuation_invocations, 0);
         assert_eq!(facts.recall.terminal_more_results_bundles, 0);
         assert!(facts.most_selected.workflows.items.is_empty());
@@ -3118,7 +3665,7 @@ mod tests {
             timestamp: "2026-07-15T12:00:00.000Z".to_string(),
             event_type,
             correlation_id: fixed_uuid(1),
-            bundle_id: event_type.is_recall().then(|| fixed_uuid(2)),
+            bundle_id: (event_type.is_recall() || event_type.is_task()).then(|| fixed_uuid(2)),
             outcome,
             error_code: error_code.map(str::to_string),
             payload,
@@ -3202,9 +3749,9 @@ mod tests {
     }
 
     #[test]
-    fn event_catalog_remains_exactly_42() {
-        assert_eq!(EventType::ALL.len(), 42);
-        assert_eq!(OBSERVABILITY_SCHEMA_VERSION, 1);
+    fn event_catalog_remains_exactly_55() {
+        assert_eq!(EventType::ALL.len(), 55);
+        assert_eq!(OBSERVABILITY_SCHEMA_VERSION, 2);
     }
 
     #[test]
@@ -3253,13 +3800,76 @@ mod tests {
                 counts_payload(&doctor_keys),
                 None,
             ),
+            stored_event(
+                EventType::ToolDuplicateDetected,
+                EventOutcome::Warning,
+                StoredPayload::Tool(StoredTool {
+                    tool_id: "overlap-tool".to_string(),
+                    approval_present: false,
+                }),
+                None,
+            ),
+            stored_event(
+                EventType::ToolAliasResolved,
+                EventOutcome::Success,
+                StoredPayload::Tool(StoredTool {
+                    tool_id: "tool-alias".to_string(),
+                    approval_present: false,
+                }),
+                None,
+            ),
         ];
         let mut facts = EventFacts::default();
         for event in events {
             validate_event_contract(&event).expect("producer event should be valid");
-            accumulate_event(event, &mut facts).expect("valid event should aggregate safely");
+            accumulate_event(event, &mut facts, &TaggedValueRedactor::default())
+                .expect("valid event should aggregate safely");
         }
         assert_eq!(facts.adapter_drift.failed, 1);
+    }
+
+    #[test]
+    fn task_event_contract_accepts_only_factual_lifecycle_shapes() {
+        let task = || {
+            StoredPayload::Task(StoredTask {
+                task_id: fixed_uuid(9),
+            })
+        };
+        for event in [
+            stored_event(EventType::TaskStarted, EventOutcome::Started, task(), None),
+            stored_event(
+                EventType::TaskContextApplied,
+                EventOutcome::Applied,
+                task(),
+                None,
+            ),
+            stored_event(
+                EventType::TaskCompleted,
+                EventOutcome::Success,
+                task(),
+                None,
+            ),
+            stored_event(
+                EventType::TaskFailed,
+                EventOutcome::Failure,
+                task(),
+                Some("TASK_FAILED"),
+            ),
+        ] {
+            validate_event_contract(&event).expect("task lifecycle event should validate");
+        }
+
+        let mut missing_bundle =
+            stored_event(EventType::TaskStarted, EventOutcome::Started, task(), None);
+        missing_bundle.bundle_id = None;
+        assert!(validate_event_contract(&missing_bundle).is_err());
+        assert!(validate_event_contract(&stored_event(
+            EventType::TaskCompleted,
+            EventOutcome::Failure,
+            task(),
+            Some("TASK_FAILED"),
+        ))
+        .is_err());
     }
 
     #[test]
@@ -3322,6 +3932,7 @@ mod tests {
                     approval_present: false,
                 },
                 &mut facts,
+                &TaggedValueRedactor::default(),
             )
             .expect("bounded tool facts should aggregate");
         }

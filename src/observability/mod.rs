@@ -1,11 +1,14 @@
 //! Strict, workspace-local storage for Local Observability.
 //!
 //! The store is deliberately separate from operational memory. This module
-//! owns the version-1 schema, safe reader/writer opening rules, and the typed,
+//! owns the version-2 schema, safe reader/writer opening rules, and the typed,
 //! privacy-bounded best-effort collector. Product lifecycle wiring and
 //! product-facing commands are added by later stages.
 
 use crate::output::{OutputWarning, OBSERVABILITY_WRITE_FAILED};
+use crate::redaction::{
+    TaggedValueRedactionError, TaggedValueRedactor, TEST_SECRET_REDACTION_MARKER,
+};
 use crate::storage::{self, WorkspacePaths};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
@@ -18,9 +21,10 @@ use thiserror::Error;
 
 pub(crate) mod export;
 pub(crate) mod report;
+pub(crate) mod task_state;
 pub(crate) mod ui;
 
-pub const OBSERVABILITY_SCHEMA_VERSION: i64 = 1;
+pub const OBSERVABILITY_SCHEMA_VERSION: i64 = 2;
 pub const OBSERVABILITY_APPLICATION_ID: i64 = 0x414F_504D;
 pub const OBSERVABILITY_RETENTION_DAYS: i64 = 30;
 pub const OBSERVABILITY_RETENTION_MAX_BYTES: u64 = 100_000_000;
@@ -87,10 +91,23 @@ pub enum EventType {
     AuditSnapshotFailed,
     ArtifactsCleanup,
     FeedbackRecorded,
+    TaskStarted,
+    TaskContextApplied,
+    TaskCompleted,
+    TaskFailed,
+    ToolDuplicateDetected,
+    ToolDuplicateBlocked,
+    ToolAliasCreated,
+    ToolAliasResolved,
+    ToolCanonicalized,
+    AuditRepairStarted,
+    AuditRepairCompleted,
+    AuditRepairFailed,
+    PlatformCheckCompleted,
 }
 
 impl EventType {
-    pub const ALL: [Self; 42] = [
+    pub const ALL: [Self; 55] = [
         Self::InstallStarted,
         Self::InstallCompleted,
         Self::InstallFailed,
@@ -133,6 +150,19 @@ impl EventType {
         Self::AuditSnapshotFailed,
         Self::ArtifactsCleanup,
         Self::FeedbackRecorded,
+        Self::TaskStarted,
+        Self::TaskContextApplied,
+        Self::TaskCompleted,
+        Self::TaskFailed,
+        Self::ToolDuplicateDetected,
+        Self::ToolDuplicateBlocked,
+        Self::ToolAliasCreated,
+        Self::ToolAliasResolved,
+        Self::ToolCanonicalized,
+        Self::AuditRepairStarted,
+        Self::AuditRepairCompleted,
+        Self::AuditRepairFailed,
+        Self::PlatformCheckCompleted,
     ];
 
     #[must_use]
@@ -180,6 +210,19 @@ impl EventType {
             Self::AuditSnapshotFailed => "audit.snapshot.failed",
             Self::ArtifactsCleanup => "artifacts.cleanup",
             Self::FeedbackRecorded => "feedback.recorded",
+            Self::TaskStarted => "task.started",
+            Self::TaskContextApplied => "task.context_applied",
+            Self::TaskCompleted => "task.completed",
+            Self::TaskFailed => "task.failed",
+            Self::ToolDuplicateDetected => "tool.duplicate_detected",
+            Self::ToolDuplicateBlocked => "tool.duplicate_blocked",
+            Self::ToolAliasCreated => "tool.alias_created",
+            Self::ToolAliasResolved => "tool.alias_resolved",
+            Self::ToolCanonicalized => "tool.canonicalized",
+            Self::AuditRepairStarted => "audit.repair.started",
+            Self::AuditRepairCompleted => "audit.repair.completed",
+            Self::AuditRepairFailed => "audit.repair.failed",
+            Self::PlatformCheckCompleted => "platform.check.completed",
         }
     }
 
@@ -194,6 +237,14 @@ impl EventType {
                 | Self::RecallEmpty
                 | Self::RecallTruncated
                 | Self::RecallMandatoryOverflow
+        )
+    }
+
+    #[must_use]
+    const fn is_task(self) -> bool {
+        matches!(
+            self,
+            Self::TaskStarted | Self::TaskContextApplied | Self::TaskCompleted | Self::TaskFailed
         )
     }
 }
@@ -250,9 +301,21 @@ const MAX_SELECTION_REASONS_BYTES: usize = 4_096;
 const MAX_MANAGED_WORKSPACE_KEY_BYTES: usize = 255;
 const REDACTED: &str = "[REDACTED]";
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(transparent)]
-struct SafeText(String);
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SafeText {
+    rendered: String,
+    raw: String,
+    maximum_bytes: usize,
+}
+
+impl Serialize for SafeText {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.rendered)
+    }
+}
 
 impl SafeText {
     fn new(
@@ -267,7 +330,11 @@ impl SafeText {
             return Err(CollectorInputError::TextTooLarge { field });
         }
         let redacted = redact_sensitive_text(value);
-        Ok(Self(truncate_utf8(redacted, maximum_bytes)))
+        Ok(Self {
+            rendered: truncate_utf8(redacted, maximum_bytes),
+            raw: value.to_string(),
+            maximum_bytes,
+        })
     }
 
     fn product_id(
@@ -282,6 +349,31 @@ impl SafeText {
             return Err(CollectorInputError::TextTooLarge { field });
         }
         Self::new(field, value, maximum_bytes)
+    }
+
+    fn tagged_redacted(
+        &self,
+        redactor: &TaggedValueRedactor,
+    ) -> Result<String, TaggedValueRedactionError> {
+        let exact = redactor.redact_str(&self.raw)?;
+        Ok(truncate_utf8(
+            redact_sensitive_text(&exact),
+            self.maximum_bytes,
+        ))
+    }
+
+    fn apply_tagged_redaction(
+        &mut self,
+        redactor: &TaggedValueRedactor,
+    ) -> Result<(), TaggedValueRedactionError> {
+        let rendered = self.tagged_redacted(redactor)?;
+        self.raw.clone_from(&rendered);
+        self.rendered = rendered;
+        Ok(())
+    }
+
+    fn rendered(&self) -> &str {
+        &self.rendered
     }
 }
 
@@ -805,6 +897,19 @@ impl CountsPayload {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TaskPayload {
+    task_id: String,
+}
+
+impl TaskPayload {
+    pub fn new(task_id: &crate::task::TaskId) -> Self {
+        Self {
+            task_id: task_id.as_str().to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum EventPayload {
@@ -816,6 +921,39 @@ pub enum EventPayload {
     Mcp(McpPayload),
     Artifact(ArtifactPayload),
     Counts(CountsPayload),
+    Task(TaskPayload),
+}
+
+impl EventPayload {
+    fn tagged_redacted(
+        &self,
+        redactor: &TaggedValueRedactor,
+    ) -> Result<Self, TaggedValueRedactionError> {
+        let mut payload = self.clone();
+        match &mut payload {
+            Self::Node(node) => {
+                node.title.apply_tagged_redaction(redactor)?;
+                apply_optional_safe_text(&mut node.summary, redactor)?;
+                apply_optional_safe_text(&mut node.source_ref, redactor)?;
+            }
+            Self::Link(link) => link.link_type.apply_tagged_redaction(redactor)?,
+            Self::Tool(tool) => tool.tool_id.apply_tagged_redaction(redactor)?,
+            Self::Mcp(mcp) => mcp.mcp_id.apply_tagged_redaction(redactor)?,
+            Self::Artifact(artifact) => artifact.path.apply_tagged_redaction(redactor)?,
+            Self::Empty | Self::Recall(_) | Self::Counts(_) | Self::Task(_) => {}
+        }
+        Ok(payload)
+    }
+}
+
+fn apply_optional_safe_text(
+    value: &mut Option<SafeText>,
+    redactor: &TaggedValueRedactor,
+) -> Result<(), TaggedValueRedactionError> {
+    if let Some(value) = value {
+        value.apply_tagged_redaction(redactor)?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -858,7 +996,9 @@ impl CollectorEvent {
     }
 
     pub fn with_error_code(mut self, error_code: &str) -> Result<Self, CollectorInputError> {
-        validate_ascii_identifier("error_code", error_code, 96)?;
+        if error_code != TEST_SECRET_REDACTION_MARKER {
+            validate_ascii_identifier("error_code", error_code, 96)?;
+        }
         self.error_code = Some(error_code.to_string());
         Ok(self)
     }
@@ -933,6 +1073,7 @@ pub struct LocalCollector {
     command: String,
     correlation_id: String,
     writer: Option<ObservabilityWriter>,
+    redactor: Option<TaggedValueRedactor>,
     disabled: bool,
     warning_emitted: bool,
     retention_policy: RetentionPolicy,
@@ -963,6 +1104,7 @@ impl LocalCollector {
             command,
             correlation_id: random_uuid_v4()?,
             writer: None,
+            redactor: None,
             disabled: false,
             warning_emitted: false,
             retention_policy: RetentionPolicy::default(),
@@ -978,6 +1120,9 @@ impl LocalCollector {
         if self.disabled {
             return None;
         }
+        if !self.ensure_redactor() {
+            return self.disable_with_warning();
+        }
         let event_id = match random_uuid_v4() {
             Ok(event_id) => event_id,
             Err(_) => return self.disable_with_warning(),
@@ -992,6 +1137,9 @@ impl LocalCollector {
         let Some(writer) = self.writer.as_mut() else {
             return self.disable_with_warning();
         };
+        let Some(redactor) = self.redactor.as_ref() else {
+            return self.disable_with_warning();
+        };
         let write_and_retention = writer
             .insert_event(
                 &event_id,
@@ -999,6 +1147,7 @@ impl LocalCollector {
                 &self.command,
                 &self.correlation_id,
                 event,
+                redactor,
             )
             .and_then(|()| writer.apply_retention(self.retention_policy));
         if write_and_retention.is_err() {
@@ -1020,6 +1169,9 @@ impl LocalCollector {
         if self.disabled {
             return None;
         }
+        if !self.ensure_redactor() {
+            return self.disable_with_warning();
+        }
         if self.writer.is_none() {
             match open_writer(&self.workspace_paths) {
                 Ok(writer) => self.writer = Some(writer),
@@ -1029,6 +1181,9 @@ impl LocalCollector {
         let Some(writer) = self.writer.as_mut() else {
             return self.disable_with_warning();
         };
+        let Some(redactor) = self.redactor.as_ref() else {
+            return self.disable_with_warning();
+        };
         let result = writer
             .insert_recall_bundle(
                 &self.workspace_key,
@@ -1036,6 +1191,7 @@ impl LocalCollector {
                 &self.correlation_id,
                 record,
                 events,
+                redactor,
             )
             .and_then(|()| writer.apply_retention(self.retention_policy));
         if result.is_err() {
@@ -1053,6 +1209,10 @@ impl LocalCollector {
         input: FeedbackRecordInput,
     ) -> Result<FeedbackWriteOutcome, FeedbackWriteError> {
         if self.disabled {
+            return Err(FeedbackWriteError::StoreUnavailable);
+        }
+        if !self.ensure_redactor() {
+            self.disabled = true;
             return Err(FeedbackWriteError::StoreUnavailable);
         }
         if self.writer.is_none() {
@@ -1076,6 +1236,9 @@ impl LocalCollector {
         let Some(writer) = self.writer.as_mut() else {
             return Err(FeedbackWriteError::StoreUnavailable);
         };
+        let Some(redactor) = self.redactor.as_ref() else {
+            return Err(FeedbackWriteError::StoreUnavailable);
+        };
         let receipt = match writer.insert_feedback(
             &feedback_id,
             &event_id,
@@ -1084,6 +1247,7 @@ impl LocalCollector {
             &self.correlation_id,
             &input,
             &event,
+            redactor,
         ) {
             Ok(receipt) => receipt,
             Err(FeedbackPersistError::BundleNotFound) => {
@@ -1125,6 +1289,26 @@ impl LocalCollector {
             message: "local observability write failed; core command result is unchanged"
                 .to_string(),
         })
+    }
+
+    fn ensure_redactor(&mut self) -> bool {
+        if self.redactor.is_some() {
+            return true;
+        }
+        match fs::symlink_metadata(self.workspace_paths.db()) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                self.redactor = Some(TaggedValueRedactor::default());
+                return true;
+            }
+            Err(_) | Ok(_) => {}
+        }
+        match TaggedValueRedactor::load_workspace(&self.workspace_paths) {
+            Ok(redactor) => {
+                self.redactor = Some(redactor);
+                true
+            }
+            Err(_) => false,
+        }
     }
 
     #[cfg(test)]
@@ -1184,6 +1368,21 @@ fn validate_uuid_v4(value: &str) -> Result<String, CollectorInputError> {
 }
 
 fn redact_sensitive_text(value: &str) -> String {
+    if !value.contains(TEST_SECRET_REDACTION_MARKER) {
+        return redact_sensitive_text_unprotected(value);
+    }
+    let mut output = String::with_capacity(value.len());
+    let mut remaining = value;
+    while let Some(index) = remaining.find(TEST_SECRET_REDACTION_MARKER) {
+        output.push_str(&redact_sensitive_text_unprotected(&remaining[..index]));
+        output.push_str(TEST_SECRET_REDACTION_MARKER);
+        remaining = &remaining[index + TEST_SECRET_REDACTION_MARKER.len()..];
+    }
+    output.push_str(&redact_sensitive_text_unprotected(remaining));
+    output
+}
+
+fn redact_sensitive_text_unprotected(value: &str) -> String {
     let mut output = String::with_capacity(value.len());
     let mut inside_private_key = false;
     for line in value.split_inclusive('\n') {
@@ -1715,7 +1914,7 @@ CREATE TABLE feedback (
 )
 "#;
 
-const COLLECTOR_STATE_TABLE_SQL: &str = r#"
+const COLLECTOR_STATE_V1_TABLE_SQL: &str = r#"
 CREATE TABLE collector_state (
     singleton_id INTEGER PRIMARY KEY CHECK(singleton_id = 1),
     schema_version INTEGER NOT NULL CHECK(schema_version = 1),
@@ -1725,7 +1924,92 @@ CREATE TABLE collector_state (
 )
 "#;
 
-const INDEX_DEFINITIONS: &[(&str, &str)] = &[
+const COLLECTOR_STATE_TABLE_SQL: &str = r#"
+CREATE TABLE collector_state (
+    singleton_id INTEGER PRIMARY KEY CHECK(singleton_id = 1),
+    schema_version INTEGER NOT NULL CHECK(schema_version = 2),
+    last_retention_at TEXT,
+    retention_floor_at TEXT,
+    last_error_code TEXT CHECK(last_error_code IS NULL OR length(last_error_code) > 0)
+)
+"#;
+
+const TASKS_TABLE_SQL: &str = r#"
+CREATE TABLE tasks (
+    task_id TEXT PRIMARY KEY NOT NULL CHECK(length(task_id) = 36),
+    bundle_id TEXT UNIQUE NOT NULL CHECK(length(bundle_id) = 36),
+    product_version TEXT NOT NULL CHECK(length(product_version) > 0),
+    workspace_key TEXT NOT NULL CHECK(length(workspace_key) BETWEEN 1 AND 255),
+    memory_revision TEXT NOT NULL CHECK(length(memory_revision) = 32),
+    query_fingerprint TEXT NOT NULL CHECK(length(query_fingerprint) = 32),
+    status TEXT NOT NULL CHECK(status IN ('started', 'applied', 'completed', 'failed')),
+    started_at TEXT NOT NULL CHECK(length(started_at) > 0),
+    applied_at TEXT,
+    finished_at TEXT,
+    mandatory_context_complete INTEGER NOT NULL
+        CHECK(mandatory_context_complete IN (0, 1)),
+    retrieval_complete INTEGER NOT NULL CHECK(retrieval_complete IN (0, 1)),
+    budget_exhausted INTEGER NOT NULL CHECK(budget_exhausted IN (0, 1)),
+    none_relevant INTEGER NOT NULL DEFAULT 0 CHECK(none_relevant IN (0, 1)),
+    apply_fingerprint TEXT CHECK(
+        apply_fingerprint IS NULL OR length(apply_fingerprint) = 32
+    ),
+    completion_fingerprint TEXT CHECK(
+        completion_fingerprint IS NULL OR length(completion_fingerprint) = 32
+    ),
+    completion_result TEXT CHECK(
+        completion_result IS NULL
+        OR completion_result IN ('success', 'partial', 'failed')
+    ),
+    duration_ms INTEGER CHECK(duration_ms IS NULL OR duration_ms >= 0),
+    error_code TEXT CHECK(
+        error_code IS NULL OR length(error_code) BETWEEN 1 AND 96
+    ),
+    reason TEXT CHECK(reason IS NULL OR length(reason) BETWEEN 1 AND 1024),
+    CHECK(mandatory_context_complete = 1),
+    CHECK(retrieval_complete + budget_exhausted = 1),
+    CHECK((status = 'started') = (applied_at IS NULL AND finished_at IS NULL)),
+    CHECK((status IN ('completed', 'failed')) = (finished_at IS NOT NULL)),
+    CHECK((applied_at IS NOT NULL) = (apply_fingerprint IS NOT NULL)),
+    CHECK((finished_at IS NOT NULL) = (
+        completion_fingerprint IS NOT NULL
+        AND completion_result IS NOT NULL
+        AND duration_ms IS NOT NULL
+    )),
+    CHECK((status = 'failed') = (completion_result = 'failed')),
+    CHECK(status = 'failed' OR error_code IS NULL),
+    CHECK(status = 'failed' OR reason IS NULL)
+)
+"#;
+
+const TASK_BUNDLE_NODES_TABLE_SQL: &str = r#"
+CREATE TABLE task_bundle_nodes (
+    task_id TEXT NOT NULL CHECK(length(task_id) = 36),
+    node_id INTEGER NOT NULL CHECK(node_id > 0),
+    node_type TEXT NOT NULL CHECK(length(node_type) BETWEEN 1 AND 64),
+    context_kind TEXT NOT NULL CHECK(context_kind IN ('mandatory', 'task')),
+    PRIMARY KEY (task_id, node_id),
+    FOREIGN KEY (task_id) REFERENCES tasks(task_id)
+        ON UPDATE RESTRICT ON DELETE CASCADE
+)
+"#;
+
+const TASK_APPLIED_NODES_TABLE_SQL: &str = r#"
+CREATE TABLE task_applied_nodes (
+    task_id TEXT NOT NULL CHECK(length(task_id) = 36),
+    node_id INTEGER NOT NULL CHECK(node_id > 0),
+    application_kind TEXT NOT NULL CHECK(
+        application_kind IN (
+            'gate', 'rule', 'workflow', 'tool', 'correction', 'failure_mode'
+        )
+    ),
+    PRIMARY KEY (task_id, node_id),
+    FOREIGN KEY (task_id, node_id) REFERENCES task_bundle_nodes(task_id, node_id)
+        ON UPDATE RESTRICT ON DELETE CASCADE
+)
+"#;
+
+const INDEX_DEFINITIONS_V1: &[(&str, &str)] = &[
     (
         "idx_observability_events_timestamp",
         "CREATE INDEX idx_observability_events_timestamp ON observability_events(timestamp)",
@@ -1788,15 +2072,60 @@ const INDEX_DEFINITIONS: &[(&str, &str)] = &[
     ),
 ];
 
+const INDEX_DEFINITIONS: &[(&str, &str)] = &[
+    INDEX_DEFINITIONS_V1[0],
+    INDEX_DEFINITIONS_V1[1],
+    INDEX_DEFINITIONS_V1[2],
+    INDEX_DEFINITIONS_V1[3],
+    INDEX_DEFINITIONS_V1[4],
+    INDEX_DEFINITIONS_V1[5],
+    INDEX_DEFINITIONS_V1[6],
+    INDEX_DEFINITIONS_V1[7],
+    INDEX_DEFINITIONS_V1[8],
+    INDEX_DEFINITIONS_V1[9],
+    INDEX_DEFINITIONS_V1[10],
+    INDEX_DEFINITIONS_V1[11],
+    INDEX_DEFINITIONS_V1[12],
+    INDEX_DEFINITIONS_V1[13],
+    INDEX_DEFINITIONS_V1[14],
+    (
+        "idx_tasks_started_at",
+        "CREATE INDEX idx_tasks_started_at ON tasks(started_at)",
+    ),
+    (
+        "idx_tasks_workspace_status",
+        "CREATE INDEX idx_tasks_workspace_status ON tasks(workspace_key, status, started_at)",
+    ),
+    (
+        "idx_task_bundle_nodes_context",
+        "CREATE INDEX idx_task_bundle_nodes_context ON task_bundle_nodes(task_id, context_kind)",
+    ),
+    (
+        "idx_task_applied_nodes_kind",
+        "CREATE INDEX idx_task_applied_nodes_kind ON task_applied_nodes(application_kind, task_id)",
+    ),
+];
+
+const TABLE_DEFINITIONS_V1: &[(&str, &str)] = &[
+    ("recall_bundles", RECALL_BUNDLES_TABLE_SQL),
+    ("observability_events", EVENTS_TABLE_SQL),
+    ("bundle_nodes", BUNDLE_NODES_TABLE_SQL),
+    ("feedback", FEEDBACK_TABLE_SQL),
+    ("collector_state", COLLECTOR_STATE_V1_TABLE_SQL),
+];
+
 const TABLE_DEFINITIONS: &[(&str, &str)] = &[
     ("recall_bundles", RECALL_BUNDLES_TABLE_SQL),
     ("observability_events", EVENTS_TABLE_SQL),
     ("bundle_nodes", BUNDLE_NODES_TABLE_SQL),
     ("feedback", FEEDBACK_TABLE_SQL),
     ("collector_state", COLLECTOR_STATE_TABLE_SQL),
+    ("tasks", TASKS_TABLE_SQL),
+    ("task_bundle_nodes", TASK_BUNDLE_NODES_TABLE_SQL),
+    ("task_applied_nodes", TASK_APPLIED_NODES_TABLE_SQL),
 ];
 
-const INTERNAL_AUTOINDEXES: &[(&str, &str)] = &[
+const INTERNAL_AUTOINDEXES_V1: &[(&str, &str)] = &[
     (
         "sqlite_autoindex_observability_events_1",
         "observability_events",
@@ -1804,6 +2133,20 @@ const INTERNAL_AUTOINDEXES: &[(&str, &str)] = &[
     ("sqlite_autoindex_recall_bundles_1", "recall_bundles"),
     ("sqlite_autoindex_bundle_nodes_1", "bundle_nodes"),
     ("sqlite_autoindex_feedback_1", "feedback"),
+];
+
+const INTERNAL_AUTOINDEXES: &[(&str, &str)] = &[
+    INTERNAL_AUTOINDEXES_V1[0],
+    INTERNAL_AUTOINDEXES_V1[1],
+    INTERNAL_AUTOINDEXES_V1[2],
+    INTERNAL_AUTOINDEXES_V1[3],
+    ("sqlite_autoindex_tasks_1", "tasks"),
+    ("sqlite_autoindex_tasks_2", "tasks"),
+    ("sqlite_autoindex_task_bundle_nodes_1", "task_bundle_nodes"),
+    (
+        "sqlite_autoindex_task_applied_nodes_1",
+        "task_applied_nodes",
+    ),
 ];
 
 type InternalSchemaObject = (String, String, Option<String>);
@@ -1855,6 +2198,38 @@ fn current_timestamp(connection: &Connection) -> Result<String, ObservabilityOpe
     )
 }
 
+fn ensure_redaction_safe_identities(
+    path: &Path,
+    redactor: &TaggedValueRedactor,
+    values: &[&str],
+) -> Result<(), ObservabilityOpenError> {
+    if values
+        .iter()
+        .any(|value| redactor.contains_exact_value(value.as_bytes()))
+    {
+        return Err(invalid_store(
+            path,
+            "tagged-value redaction rejected an identity field",
+        ));
+    }
+    Ok(())
+}
+
+fn redact_store_text(
+    path: &Path,
+    redactor: &TaggedValueRedactor,
+    value: &str,
+    maximum_bytes: usize,
+) -> Result<String, ObservabilityOpenError> {
+    redactor
+        .redact_str_bounded(value, maximum_bytes)
+        .map_err(|error| redaction_store_error(path, error))
+}
+
+fn redaction_store_error(path: &Path, _error: TaggedValueRedactionError) -> ObservabilityOpenError {
+    invalid_store(path, "tagged-value redaction failed")
+}
+
 #[allow(clippy::too_many_arguments)]
 fn insert_event_at(
     connection: &Connection,
@@ -1865,8 +2240,34 @@ fn insert_event_at(
     command: &str,
     correlation_id: &str,
     event: &CollectorEvent,
+    redactor: &TaggedValueRedactor,
 ) -> Result<(), ObservabilityOpenError> {
-    let payload_json = serde_json::to_string(&event.payload)?;
+    ensure_redaction_safe_identities(
+        path,
+        redactor,
+        &[
+            event_id,
+            timestamp,
+            workspace_key,
+            command,
+            correlation_id,
+            env!("CARGO_PKG_VERSION"),
+        ],
+    )?;
+    if let Some(bundle_id) = event.bundle_id.as_deref() {
+        ensure_redaction_safe_identities(path, redactor, &[bundle_id])?;
+    }
+    let payload = event
+        .payload
+        .tagged_redacted(redactor)
+        .map_err(|error| redaction_store_error(path, error))?;
+    let payload_json = serde_json::to_string(&payload)?;
+    let payload_json = redact_store_text(path, redactor, &payload_json, MAX_EVENT_PAYLOAD_BYTES)?;
+    let error_code = event
+        .error_code
+        .as_deref()
+        .map(|value| redact_store_text(path, redactor, value, 96))
+        .transpose()?;
     let duration_ms = event
         .duration_ms
         .map(i64::try_from)
@@ -1889,7 +2290,7 @@ fn insert_event_at(
             event.bundle_id.as_deref(),
             duration_ms,
             event.outcome.as_str(),
-            event.error_code.as_deref(),
+            error_code.as_deref(),
             payload_json,
         ],
     )?;
@@ -1915,6 +2316,7 @@ impl ObservabilityWriter {
         command: &str,
         correlation_id: &str,
         event: &CollectorEvent,
+        redactor: &TaggedValueRedactor,
     ) -> Result<(), ObservabilityOpenError> {
         let timestamp = current_timestamp(&self.connection)?;
         insert_event_at(
@@ -1926,6 +2328,7 @@ impl ObservabilityWriter {
             command,
             correlation_id,
             event,
+            redactor,
         )?;
         Ok(())
     }
@@ -1937,7 +2340,24 @@ impl ObservabilityWriter {
         correlation_id: &str,
         record: &RecallBundleRecord,
         events: &[CollectorEvent],
+        redactor: &TaggedValueRedactor,
     ) -> Result<(), ObservabilityOpenError> {
+        ensure_redaction_safe_identities(
+            &self.path,
+            redactor,
+            &[
+                workspace_key,
+                command,
+                correlation_id,
+                &record.bundle_id,
+                env!("CARGO_PKG_VERSION"),
+            ],
+        )?;
+        let error_code = record
+            .error_code
+            .as_deref()
+            .map(|value| redact_store_text(&self.path, redactor, value, 96))
+            .transpose()?;
         let mut event_ids = Vec::with_capacity(events.len());
         let mut correlated_events = Vec::with_capacity(events.len());
         for event in events {
@@ -2006,7 +2426,7 @@ impl ObservabilityWriter {
                 rusqlite::params![
                     record.bundle_id,
                     record.outcome.as_str(),
-                    record.error_code.as_deref(),
+                    error_code.as_deref(),
                     duration_ms,
                     more_results,
                     continuation_count,
@@ -2026,7 +2446,7 @@ impl ObservabilityWriter {
                     workspace_key,
                     correlation_id,
                     record.outcome.as_str(),
-                    record.error_code.as_deref(),
+                    error_code.as_deref(),
                     duration_ms,
                     i64::from(record.more_results.unwrap_or(false)),
                     continuation_increment,
@@ -2035,7 +2455,30 @@ impl ObservabilityWriter {
         }
 
         for node in &record.nodes {
+            ensure_redaction_safe_identities(&self.path, redactor, &[&node.node_type])?;
             let selection_reasons_json = serde_json::to_string(&node.selection_reasons)?;
+            let node_title = node
+                .node_title
+                .tagged_redacted(redactor)
+                .map_err(|error| redaction_store_error(&self.path, error))?;
+            let bounded_summary = node
+                .bounded_summary
+                .as_ref()
+                .map(|value| value.tagged_redacted(redactor))
+                .transpose()
+                .map_err(|error| redaction_store_error(&self.path, error))?;
+            let source_ref = node
+                .source_ref
+                .as_ref()
+                .map(|value| value.tagged_redacted(redactor))
+                .transpose()
+                .map_err(|error| redaction_store_error(&self.path, error))?;
+            let trust_level = node
+                .trust_level
+                .as_ref()
+                .map(|value| value.tagged_redacted(redactor))
+                .transpose()
+                .map_err(|error| redaction_store_error(&self.path, error))?;
             transaction.execute(
                 "INSERT INTO bundle_nodes (
                     bundle_id, node_id, first_seen_at, node_type, node_title,
@@ -2048,10 +2491,10 @@ impl ObservabilityWriter {
                     node.node_id,
                     timestamp,
                     node.node_type,
-                    node.node_title.0,
-                    node.bounded_summary.as_ref().map(|value| value.0.as_str()),
-                    node.source_ref.as_ref().map(|value| value.0.as_str()),
-                    node.trust_level.as_ref().map(|value| value.0.as_str()),
+                    node_title,
+                    bounded_summary.as_deref(),
+                    source_ref.as_deref(),
+                    trust_level.as_deref(),
                     node.confidence,
                     node.score,
                     selection_reasons_json,
@@ -2068,6 +2511,7 @@ impl ObservabilityWriter {
                 command,
                 correlation_id,
                 event,
+                redactor,
             )?;
         }
         transaction.commit()?;
@@ -2084,7 +2528,29 @@ impl ObservabilityWriter {
         correlation_id: &str,
         input: &FeedbackRecordInput,
         event: &CollectorEvent,
+        redactor: &TaggedValueRedactor,
     ) -> Result<FeedbackReceipt, FeedbackPersistError> {
+        ensure_redaction_safe_identities(
+            &self.path,
+            redactor,
+            &[
+                feedback_id,
+                event_id,
+                workspace_key,
+                command,
+                correlation_id,
+                &input.bundle_id,
+            ],
+        )
+        .map_err(FeedbackPersistError::Store)?;
+        let reason = input
+            .reason
+            .as_ref()
+            .map(|value| value.tagged_redacted(redactor))
+            .transpose()
+            .map_err(|error| {
+                FeedbackPersistError::Store(redaction_store_error(&self.path, error))
+            })?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -2112,7 +2578,7 @@ impl ObservabilityWriter {
                     timestamp,
                     input.bundle_id,
                     input.outcome.as_str(),
-                    input.reason.as_ref().map(|value| value.0.as_str()),
+                    reason.as_deref(),
                 ],
             )
             .map_err(ObservabilityOpenError::from)?;
@@ -2125,6 +2591,7 @@ impl ObservabilityWriter {
             command,
             correlation_id,
             event,
+            redactor,
         )?;
         transaction.commit().map_err(ObservabilityOpenError::from)?;
         Ok(FeedbackReceipt {
@@ -2259,6 +2726,7 @@ enum RetentionRootKind {
     Event,
     Feedback,
     Bundle,
+    Task,
 }
 
 #[derive(Debug)]
@@ -2334,6 +2802,10 @@ const RETENTION_ROOTS_BEFORE_SQL: &str = "SELECT kind, id, timestamp FROM (
           AND NOT EXISTS (
               SELECT 1 FROM feedback WHERE feedback.bundle_id = bundle.bundle_id
           )
+        UNION ALL
+        SELECT 3, 'task', task_id, started_at
+        FROM tasks
+        WHERE started_at < ?1
      )
      ORDER BY timestamp, kind_order, id
      LIMIT ?2";
@@ -2350,6 +2822,9 @@ const RETENTION_ROOTS_ALL_SQL: &str = "SELECT kind, id, timestamp FROM (
         WHERE NOT EXISTS (
             SELECT 1 FROM feedback WHERE feedback.bundle_id = bundle.bundle_id
         )
+        UNION ALL
+        SELECT 3, 'task', task_id, started_at
+        FROM tasks
      )
      ORDER BY timestamp, kind_order, id
      LIMIT ?1";
@@ -2380,6 +2855,7 @@ fn query_retention_roots(
             "event" => RetentionRootKind::Event,
             "feedback" => RetentionRootKind::Feedback,
             "bundle" => RetentionRootKind::Bundle,
+            "task" => RetentionRootKind::Task,
             _ => return Err(rusqlite::Error::InvalidQuery),
         };
         Ok(RetentionRoot {
@@ -2412,6 +2888,9 @@ fn delete_retention_roots(
                    )",
                 [&root.id],
             )?,
+            RetentionRootKind::Task => {
+                connection.execute("DELETE FROM tasks WHERE task_id = ?1", [&root.id])?
+            }
         };
         deletion.record(&root.timestamp, changed)?;
     }
@@ -2453,6 +2932,7 @@ impl ObservabilityReader {
 enum StoreKind {
     EmptyV0,
     InitializedV1,
+    InitializedV2,
 }
 
 /// Lazily creates and initializes the separate observability store.
@@ -2490,10 +2970,21 @@ pub fn open_writer(
     let mut connection = Connection::open_with_flags(&database_path, flags)?;
     configure_writer_connection(&connection)?;
 
-    if store_kind == StoreKind::EmptyV0 {
-        initialize_v1(&mut connection, workspace_paths.observability_db())?;
+    match store_kind {
+        StoreKind::EmptyV0 => {
+            initialize_v2(&mut connection, workspace_paths.observability_db())?;
+        }
+        StoreKind::InitializedV1 => {
+            migrate_v1_to_v2(&mut connection, workspace_paths.observability_db())?;
+        }
+        StoreKind::InitializedV2 => {}
     }
-    inspect_store(&connection, workspace_paths.observability_db())?;
+    if inspect_store(&connection, workspace_paths.observability_db())? != StoreKind::InitializedV2 {
+        return Err(invalid_store(
+            workspace_paths.observability_db(),
+            "writer requires an initialized version-2 observability store",
+        ));
+    }
 
     Ok(ObservabilityWriter {
         connection,
@@ -2518,9 +3009,11 @@ fn open_existing_writer(
     }
     validate_layout(workspace_paths, true)?;
     let validation_connection = open_read_only_connection(workspace_paths)?;
-    if inspect_store(&validation_connection, workspace_paths.observability_db())?
-        != StoreKind::InitializedV1
-    {
+    let store_kind = inspect_store(&validation_connection, workspace_paths.observability_db())?;
+    if !matches!(
+        store_kind,
+        StoreKind::InitializedV1 | StoreKind::InitializedV2
+    ) {
         return Err(invalid_store(
             workspace_paths.observability_db(),
             "feedback requires an initialized observability store",
@@ -2529,12 +3022,15 @@ fn open_existing_writer(
     drop(validation_connection);
 
     let database_path = canonical_database_open_path(workspace_paths)?;
-    let connection = Connection::open_with_flags(
+    let mut connection = Connection::open_with_flags(
         database_path,
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )?;
     configure_writer_connection(&connection)?;
-    if inspect_store(&connection, workspace_paths.observability_db())? != StoreKind::InitializedV1 {
+    if store_kind == StoreKind::InitializedV1 {
+        migrate_v1_to_v2(&mut connection, workspace_paths.observability_db())?;
+    }
+    if inspect_store(&connection, workspace_paths.observability_db())? != StoreKind::InitializedV2 {
         return Err(invalid_store(
             workspace_paths.observability_db(),
             "feedback requires an initialized observability store",
@@ -2567,10 +3063,10 @@ pub fn open_reader(
     }
 
     let connection = open_read_only_connection(workspace_paths)?;
-    if inspect_store(&connection, workspace_paths.observability_db())? != StoreKind::InitializedV1 {
+    if inspect_store(&connection, workspace_paths.observability_db())? != StoreKind::InitializedV2 {
         return Err(invalid_store(
             workspace_paths.observability_db(),
-            "empty version-0 store cannot be opened for reading",
+            "reader requires an initialized version-2 observability store",
         ));
     }
 
@@ -2580,7 +3076,7 @@ pub fn open_reader(
     })
 }
 
-fn initialize_v1(connection: &mut Connection, path: &Path) -> Result<(), ObservabilityOpenError> {
+fn initialize_v2(connection: &mut Connection, path: &Path) -> Result<(), ObservabilityOpenError> {
     connection.execute_batch(
         "PRAGMA auto_vacuum = INCREMENTAL;
          VACUUM;",
@@ -2623,6 +3119,91 @@ fn initialize_v1(connection: &mut Connection, path: &Path) -> Result<(), Observa
     Ok(())
 }
 
+#[cfg(test)]
+pub(crate) fn initialize_v1_fixture(
+    connection: &mut Connection,
+    path: &Path,
+) -> Result<(), ObservabilityOpenError> {
+    connection.execute_batch(
+        "PRAGMA auto_vacuum = INCREMENTAL;
+         VACUUM;",
+    )?;
+    let journal_mode: String =
+        connection.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
+    if !journal_mode.eq_ignore_ascii_case("wal") {
+        return Err(invalid_store(path, "test fixture could not enable WAL"));
+    }
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    for (_, sql) in TABLE_DEFINITIONS_V1 {
+        transaction.execute_batch(sql)?;
+    }
+    for (_, sql) in INDEX_DEFINITIONS_V1 {
+        transaction.execute_batch(sql)?;
+    }
+    transaction.execute(
+        "INSERT INTO collector_state (
+            singleton_id, schema_version, last_retention_at,
+            retention_floor_at, last_error_code
+         ) VALUES (1, 1, NULL, NULL, NULL)",
+        [],
+    )?;
+    transaction.execute_batch(&format!(
+        "PRAGMA application_id = {OBSERVABILITY_APPLICATION_ID};
+         PRAGMA user_version = 1;"
+    ))?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_v1_to_v2(
+    connection: &mut Connection,
+    path: &Path,
+) -> Result<(), ObservabilityOpenError> {
+    if inspect_store(connection, path)? != StoreKind::InitializedV1 {
+        return Err(invalid_store(
+            path,
+            "version-1 migration requires an exact version-1 store",
+        ));
+    }
+    let state: (Option<String>, Option<String>, Option<String>) = connection.query_row(
+        "SELECT last_retention_at, retention_floor_at, last_error_code
+         FROM collector_state WHERE singleton_id = 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch("DROP TABLE collector_state;")?;
+    transaction.execute_batch(COLLECTOR_STATE_TABLE_SQL)?;
+    transaction.execute(
+        "INSERT INTO collector_state (
+            singleton_id, schema_version, last_retention_at,
+            retention_floor_at, last_error_code
+         ) VALUES (1, ?1, ?2, ?3, ?4)",
+        rusqlite::params![OBSERVABILITY_SCHEMA_VERSION, state.0, state.1, state.2],
+    )?;
+    for (_, sql) in [
+        ("tasks", TASKS_TABLE_SQL),
+        ("task_bundle_nodes", TASK_BUNDLE_NODES_TABLE_SQL),
+        ("task_applied_nodes", TASK_APPLIED_NODES_TABLE_SQL),
+    ] {
+        transaction.execute_batch(sql)?;
+    }
+    for (_, sql) in INDEX_DEFINITIONS.iter().skip(INDEX_DEFINITIONS_V1.len()) {
+        transaction.execute_batch(sql)?;
+    }
+    transaction.execute_batch(&format!(
+        "PRAGMA user_version = {OBSERVABILITY_SCHEMA_VERSION};"
+    ))?;
+    transaction.commit()?;
+    if inspect_store(connection, path)? != StoreKind::InitializedV2 {
+        return Err(invalid_store(
+            path,
+            "version-1 to version-2 migration did not produce the exact schema",
+        ));
+    }
+    Ok(())
+}
+
 fn inspect_store(
     connection: &Connection,
     path: &Path,
@@ -2662,10 +3243,10 @@ fn inspect_store(
             format!("application_id is {application_id}, expected {OBSERVABILITY_APPLICATION_ID}"),
         ));
     }
-    if user_version != OBSERVABILITY_SCHEMA_VERSION {
+    if !matches!(user_version, 1 | OBSERVABILITY_SCHEMA_VERSION) {
         return Err(invalid_store(
             path,
-            format!("user_version is {user_version}, expected {OBSERVABILITY_SCHEMA_VERSION}"),
+            format!("user_version is {user_version}, expected 1 or {OBSERVABILITY_SCHEMA_VERSION}"),
         ));
     }
 
@@ -2682,14 +3263,27 @@ fn inspect_store(
         ));
     }
 
-    let expected = expected_schema_objects();
+    let (expected, expected_internal, expected_state_version, kind) = if user_version == 1 {
+        (
+            expected_schema_objects_for(TABLE_DEFINITIONS_V1, INDEX_DEFINITIONS_V1),
+            expected_internal_schema_objects_for(INTERNAL_AUTOINDEXES_V1),
+            1,
+            StoreKind::InitializedV1,
+        )
+    } else {
+        (
+            expected_schema_objects(),
+            expected_internal_schema_objects(),
+            OBSERVABILITY_SCHEMA_VERSION,
+            StoreKind::InitializedV2,
+        )
+    };
     if objects != expected {
         return Err(invalid_store(
             path,
             describe_schema_difference(&expected, &objects),
         ));
     }
-    let expected_internal = expected_internal_schema_objects();
     if internal_objects != expected_internal {
         return Err(invalid_store(
             path,
@@ -2709,10 +3303,12 @@ fn inspect_store(
             |row| row.get(0),
         )
         .optional()?;
-    if state_count != 1 || state_version != Some(OBSERVABILITY_SCHEMA_VERSION) {
+    if state_count != 1 || state_version != Some(expected_state_version) {
         return Err(invalid_store(
             path,
-            "collector_state must contain exactly the version-1 singleton",
+            format!(
+                "collector_state must contain exactly the version-{expected_state_version} singleton"
+            ),
         ));
     }
 
@@ -2721,7 +3317,7 @@ fn inspect_store(
         return Err(invalid_store(path, "foreign_key_check failed"));
     }
 
-    Ok(StoreKind::InitializedV1)
+    Ok(kind)
 }
 
 fn valid_empty_v0_pragmas(auto_vacuum: i64, journal_mode: &str) -> bool {
@@ -2781,14 +3377,21 @@ fn read_internal_schema_objects(
 }
 
 fn expected_schema_objects() -> BTreeMap<(String, String), String> {
+    expected_schema_objects_for(TABLE_DEFINITIONS, INDEX_DEFINITIONS)
+}
+
+fn expected_schema_objects_for(
+    tables: &[(&str, &str)],
+    indexes: &[(&str, &str)],
+) -> BTreeMap<(String, String), String> {
     let mut objects = BTreeMap::new();
-    for (name, sql) in TABLE_DEFINITIONS {
+    for (name, sql) in tables {
         objects.insert(
             ("table".to_string(), (*name).to_string()),
             normalize_sql(sql),
         );
     }
-    for (name, sql) in INDEX_DEFINITIONS {
+    for (name, sql) in indexes {
         objects.insert(
             ("index".to_string(), (*name).to_string()),
             normalize_sql(sql),
@@ -2798,7 +3401,11 @@ fn expected_schema_objects() -> BTreeMap<(String, String), String> {
 }
 
 fn expected_internal_schema_objects() -> InternalSchemaManifest {
-    INTERNAL_AUTOINDEXES
+    expected_internal_schema_objects_for(INTERNAL_AUTOINDEXES)
+}
+
+fn expected_internal_schema_objects_for(indexes: &[(&str, &str)]) -> InternalSchemaManifest {
+    indexes
         .iter()
         .map(|(name, table)| {
             (
@@ -3003,6 +3610,10 @@ mod tests {
             storage::ensure_global_dirs(&global_paths).expect("global directories should create");
             let paths = storage::ensure_workspace_dirs(&global_paths, format!("{name}-workspace"))
                 .expect("workspace directories should create");
+            drop(
+                storage::open_workspace_db(&paths)
+                    .expect("operational test database should initialize"),
+            );
             Self {
                 paths,
                 home,
@@ -3144,6 +3755,7 @@ mod tests {
                     RetentionRootKind::Event => 0,
                     RetentionRootKind::Feedback => 1,
                     RetentionRootKind::Bundle => 2,
+                    RetentionRootKind::Task => 3,
                 };
                 (kind_order, root.id.as_str(), root.timestamp.as_str())
             })
@@ -3247,6 +3859,19 @@ mod tests {
                 "audit.snapshot.failed",
                 "artifacts.cleanup",
                 "feedback.recorded",
+                "task.started",
+                "task.context_applied",
+                "task.completed",
+                "task.failed",
+                "tool.duplicate_detected",
+                "tool.duplicate_blocked",
+                "tool.alias_created",
+                "tool.alias_resolved",
+                "tool.canonicalized",
+                "audit.repair.started",
+                "audit.repair.completed",
+                "audit.repair.failed",
+                "platform.check.completed",
             ]
         );
     }
@@ -3264,6 +3889,167 @@ mod tests {
     }
 
     #[test]
+    fn stage_010_collector_redacts_tagged_payload_error_and_feedback_copies() {
+        const BUNDLE_ID: &str = "6ba7b810-9dad-41d1-80b4-00c04fd43100";
+        let workspace = TestWorkspace::new("stage-010-redaction");
+        let secret = "TEST_ONLY_STAGE010_OBS_\"quote\"\\slash\nline";
+        let error_secret = "TEST_ONLY_STAGE010_ERROR_CODE";
+        let operational =
+            storage::open_workspace_db(&workspace.paths).expect("operational database should open");
+        for (title, value) in [
+            ("Authorized test credential", secret),
+            ("Authorized test error code", error_secret),
+        ] {
+            operational
+                .execute(
+                    "INSERT INTO nodes (
+                        node_type, status, title, body, source_ref,
+                        confidence, trust_level
+                     ) VALUES (
+                        'raw_note', 'active', ?1, ?2,
+                        'source=user_instruction', 1.0, 'high'
+                     )",
+                    rusqlite::params![title, value],
+                )
+                .expect("tagged node should insert");
+            operational
+                .execute(
+                    "INSERT INTO tags (node_id, tag) VALUES (?1, ?2)",
+                    rusqlite::params![
+                        operational.last_insert_rowid(),
+                        crate::redaction::TEST_SECRET_TAG
+                    ],
+                )
+                .expect("tagged value should attach");
+        }
+        drop(operational);
+
+        let event = CollectorEvent::new(
+            EventType::NodeUpdated,
+            EventOutcome::Recorded,
+            EventPayload::Node(
+                NodePayload::new(
+                    1,
+                    "raw_note",
+                    &format!("title copy: {secret}"),
+                    Some(secret),
+                    Some(&format!("source copy: {secret}")),
+                )
+                .expect("tagged node payload should validate"),
+            ),
+        )
+        .expect("tagged event should validate");
+        let mut collector = LocalCollector::new(&workspace.paths, "node_update")
+            .expect("collector should construct");
+        assert_eq!(collector.record(&event), None);
+
+        let failure = CollectorEvent::new(
+            EventType::ToolRunFailed,
+            EventOutcome::Failure,
+            EventPayload::Tool(
+                ToolPayload::new("stage-010-tool", false).expect("tool payload should validate"),
+            ),
+        )
+        .expect("failure event should validate")
+        .with_error_code(error_secret)
+        .expect("tagged error code should validate");
+        assert_eq!(collector.record(&failure), None);
+
+        let parent = RecallBundleRecord::success(BUNDLE_ID, 1, false, false, Vec::new())
+            .expect("feedback parent should validate");
+        assert_eq!(
+            collector.record_recall_bundle(&parent, &recall_lifecycle_events()),
+            None
+        );
+        let feedback = FeedbackRecordInput::new(
+            BUNDLE_ID,
+            FeedbackOutcome::Partial,
+            Some(&format!("feedback copy: {secret}")),
+        )
+        .expect("tagged feedback should validate");
+        let outcome = collector
+            .record_feedback(feedback)
+            .expect("tagged feedback should persist safely");
+        assert!(outcome.warning.is_none());
+        drop(collector);
+
+        let observability = Connection::open(workspace.paths.observability_db())
+            .expect("observability database should open");
+        checkpoint(&observability);
+        let combined: String = observability
+            .query_row(
+                "SELECT COALESCE(group_concat(value, '\n'), '')
+                 FROM (
+                    SELECT payload_json AS value FROM observability_events
+                    UNION ALL
+                    SELECT COALESCE(error_code, '') FROM observability_events
+                    UNION ALL
+                    SELECT COALESCE(reason, '') FROM feedback
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .expect("observability text should query");
+        assert!(!combined.contains(secret));
+        assert!(!combined.contains(error_secret));
+        assert!(combined.contains(crate::redaction::TEST_SECRET_REDACTION_MARKER));
+        drop(observability);
+
+        for path in managed_database_paths(workspace.paths.observability_db()) {
+            if !path.exists() {
+                continue;
+            }
+            let bytes = fs::read(&path).expect("observability file should read");
+            for value in [secret, error_secret] {
+                assert!(
+                    !bytes
+                        .windows(value.len())
+                        .any(|window| window == value.as_bytes()),
+                    "tagged value leaked to {}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stage_010_collector_disables_before_write_when_tag_lookup_fails() {
+        let workspace = TestWorkspace::new("stage-010-redaction-source-failure");
+        let operational =
+            storage::open_workspace_db(&workspace.paths).expect("operational database should open");
+        operational
+            .execute(
+                "INSERT INTO nodes (node_type, status, title, body)
+                 VALUES ('raw_note', 'active', 'invalid tagged source', NULL)",
+                [],
+            )
+            .expect("invalid tagged source node should insert");
+        operational
+            .execute(
+                "INSERT INTO tags (node_id, tag) VALUES (?1, ?2)",
+                rusqlite::params![
+                    operational.last_insert_rowid(),
+                    crate::redaction::TEST_SECRET_TAG
+                ],
+            )
+            .expect("invalid tagged source tag should insert");
+        drop(operational);
+
+        let mut collector =
+            LocalCollector::new(&workspace.paths, "doctor").expect("collector should construct");
+        let warning = collector
+            .record(&empty_collector_event())
+            .expect("first failure should emit one safe warning");
+        assert_eq!(warning.code, OBSERVABILITY_WRITE_FAILED);
+        assert!(!warning.message.contains("invalid tagged source"));
+        assert_eq!(collector.record(&empty_collector_event()), None);
+        assert!(
+            !workspace.paths.observability_db().exists(),
+            "collector must fail before observability publication"
+        );
+    }
+
+    #[test]
     fn collector_accepts_long_valid_managed_workspace_key() {
         let _workspace = TestWorkspace::new("collector-long-key");
         let global_paths = storage::resolve_paths().expect("test AOPMEM_HOME should resolve");
@@ -3272,6 +4058,10 @@ mod tests {
         assert!(workspace_key.len() <= MAX_MANAGED_WORKSPACE_KEY_BYTES);
         let paths = storage::ensure_workspace_dirs(&global_paths, &workspace_key)
             .expect("long managed workspace should create");
+        drop(
+            storage::open_workspace_db(&paths)
+                .expect("long managed workspace database should initialize"),
+        );
 
         let mut collector =
             LocalCollector::new(&paths, "doctor").expect("long workspace key should be valid");
@@ -3407,13 +4197,16 @@ mod tests {
             "eyJhbGciOiJIUzI1NiJ9",
             "sk-1234567890abcdef",
         ] {
-            assert!(!first.0.contains(secret), "secret survived: {secret}");
+            assert!(
+                !first.rendered.contains(secret),
+                "secret survived: {secret}"
+            );
         }
 
         let unicode = "Ж".repeat(600);
         let bounded = SafeText::new("title", &unicode, 512).expect("unicode should bound");
-        assert!(bounded.0.len() <= 512);
-        assert!(bounded.0.ends_with('…'));
+        assert!(bounded.rendered.len() <= 512);
+        assert!(bounded.rendered.ends_with('…'));
         assert!(matches!(
             SafeText::new("summary", "bad\0value", 2_048),
             Err(CollectorInputError::Nul { .. })
@@ -3529,7 +4322,10 @@ mod tests {
             "END RSA PRIVATE KEY",
             "standalone-bearer-secret",
         ] {
-            assert!(!first.0.contains(secret), "secret survived: {secret}");
+            assert!(
+                !first.rendered.contains(secret),
+                "secret survived: {secret}"
+            );
         }
         for public in [
             "keep-escaped-unicode-Ж",
@@ -3541,9 +4337,12 @@ mod tests {
             "--public keep-cli-public",
             "token budget is benign",
         ] {
-            assert!(first.0.contains(public), "public text was lost: {public}");
+            assert!(
+                first.rendered.contains(public),
+                "public text was lost: {public}"
+            );
         }
-        assert!(first.0.matches(REDACTED).count() >= 11);
+        assert!(first.rendered.matches(REDACTED).count() >= 11);
     }
 
     #[test]
@@ -3573,7 +4372,10 @@ mod tests {
             "NOHOST_URI_CANARY_SECRET",
             "TRUNCATED_URI_CANARY_SECRET",
         ] {
-            assert!(!first.0.contains(secret), "secret survived: {secret}");
+            assert!(
+                !first.rendered.contains(secret),
+                "secret survived: {secret}"
+            );
         }
         for public in [
             "https://build-user:[REDACTED]@packages.example.com/v1?public=Привет",
@@ -3584,7 +4386,10 @@ mod tests {
             "truncated custom://truncated-user:[REDACTED]@ tail=видимый",
             "benign glpattern-safe sk_lively_public sk_testimony_public",
         ] {
-            assert!(first.0.contains(public), "public text was lost: {public}");
+            assert!(
+                first.rendered.contains(public),
+                "public text was lost: {public}"
+            );
         }
     }
 
@@ -4155,11 +4960,11 @@ mod tests {
     }
 
     #[test]
-    fn initializes_exact_v1_schema_pragmas_columns_and_indexes() {
+    fn initializes_exact_v2_schema_pragmas_columns_and_indexes() {
         let workspace = TestWorkspace::new("exact-schema");
         let writer = open_writer(&workspace.paths).expect("writer should initialize");
 
-        assert_eq!(writer.schema_version().expect("version should read"), 1);
+        assert_eq!(writer.schema_version().expect("version should read"), 2);
         assert_eq!(writer.path(), workspace.paths.observability_db());
         assert_eq!(
             writer
@@ -4215,6 +5020,31 @@ mod tests {
                 "last_error_code",
             ]
         );
+        assert_eq!(
+            schema_columns(&writer.connection, "tasks"),
+            [
+                "task_id",
+                "bundle_id",
+                "product_version",
+                "workspace_key",
+                "memory_revision",
+                "query_fingerprint",
+                "status",
+                "started_at",
+                "applied_at",
+                "finished_at",
+                "mandatory_context_complete",
+                "retrieval_complete",
+                "budget_exhausted",
+                "none_relevant",
+                "apply_fingerprint",
+                "completion_fingerprint",
+                "completion_result",
+                "duration_ms",
+                "error_code",
+                "reason",
+            ]
+        );
         let state: (i64, i64) = writer
             .connection
             .query_row(
@@ -4223,7 +5053,89 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .expect("collector state should read");
-        assert_eq!(state, (1, 1));
+        assert_eq!(state, (1, 2));
+        for (suffix, retrieval_complete, budget_exhausted) in [(1, 1_i64, 1_i64), (2, 0_i64, 0_i64)]
+        {
+            let result = writer.connection.execute(
+                "INSERT INTO tasks (
+                    task_id, bundle_id, product_version, workspace_key,
+                    memory_revision, query_fingerprint, status, started_at,
+                    mandatory_context_complete, retrieval_complete,
+                    budget_exhausted
+                 ) VALUES (?1, ?2, 'test', 'workspace',
+                    '11111111111111111111111111111111',
+                    '22222222222222222222222222222222',
+                    'started', '2026-07-17T00:00:00Z', 1, ?3, ?4)",
+                rusqlite::params![
+                    format!("00000000-0000-4000-8000-{suffix:012}"),
+                    format!("00000000-0000-4000-9000-{suffix:012}"),
+                    retrieval_complete,
+                    budget_exhausted,
+                ],
+            );
+            assert!(
+                result.is_err(),
+                "schema must reject inconsistent retrieval and budget facts"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_v1_store_migrates_transactionally_to_v2_and_preserves_rows() {
+        let workspace = TestWorkspace::new("v1-to-v2");
+        fs::create_dir(workspace.paths.observability())
+            .expect("observability directory should create");
+        let mut connection = Connection::open(workspace.paths.observability_db())
+            .expect("version-1 fixture database should create");
+        configure_writer_connection(&connection).expect("fixture connection should configure");
+        initialize_v1_fixture(&mut connection, workspace.paths.observability_db())
+            .expect("exact version-1 fixture should initialize");
+        insert_event(&connection, "event-v1");
+        insert_bundle(&connection, "00000000-0000-4000-8000-000000000001");
+        insert_feedback_at(
+            &connection,
+            "feedback-v1",
+            "2026-07-15T00:00:00Z",
+            "00000000-0000-4000-8000-000000000001",
+        );
+        assert_eq!(
+            inspect_store(&connection, workspace.paths.observability_db())
+                .expect("version-1 fixture should inspect"),
+            StoreKind::InitializedV1
+        );
+        drop(connection);
+
+        let writer = open_writer(&workspace.paths).expect("version-1 store should migrate");
+        assert_eq!(writer.schema_version().expect("version should read"), 2);
+        assert_eq!(
+            inspect_store(&writer.connection, workspace.paths.observability_db())
+                .expect("migrated store should inspect"),
+            StoreKind::InitializedV2
+        );
+        let counts: (i64, i64, i64) = writer
+            .connection
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM observability_events),
+                    (SELECT COUNT(*) FROM recall_bundles),
+                    (SELECT COUNT(*) FROM feedback)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("preserved row counts should read");
+        assert_eq!(counts, (1, 1, 1));
+        for table in ["tasks", "task_bundle_nodes", "task_applied_nodes"] {
+            let count: i64 = writer
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema
+                     WHERE type = 'table' AND name = ?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .expect("version-2 table should inspect");
+            assert_eq!(count, 1, "missing migrated table {table}");
+        }
     }
 
     #[test]
@@ -4235,7 +5147,7 @@ mod tests {
             .expect("zero-byte database should create");
 
         let writer = open_writer(&workspace.paths).expect("zero-byte store should initialize");
-        assert_eq!(writer.schema_version().expect("version should read"), 1);
+        assert_eq!(writer.schema_version().expect("version should read"), 2);
         assert!(
             fs::metadata(workspace.paths.observability_db())
                 .expect("database metadata should read")
@@ -4263,7 +5175,7 @@ mod tests {
         );
 
         let writer = open_writer(&workspace.paths).expect("empty v0 store should initialize");
-        assert_eq!(writer.schema_version().expect("version should read"), 1);
+        assert_eq!(writer.schema_version().expect("version should read"), 2);
     }
 
     #[test]
@@ -4317,7 +5229,7 @@ mod tests {
         assert!(!with_database_suffix(workspace.paths.observability_db(), "-shm").exists());
         let database_before = database_snapshot(workspace.paths.observability_db());
         let reader = open_reader(&workspace.paths).expect("reader should open");
-        assert_eq!(reader.schema_version().expect("version should read"), 1);
+        assert_eq!(reader.schema_version().expect("version should read"), 2);
         assert_eq!(reader.path(), workspace.paths.observability_db());
         assert_eq!(
             reader
@@ -4406,7 +5318,7 @@ mod tests {
         for (name, pragma) in [
             ("wrong-app", "PRAGMA application_id = 123456;"),
             ("wrong-version", "PRAGMA user_version = 0;"),
-            ("future-version", "PRAGMA user_version = 2;"),
+            ("future-version", "PRAGMA user_version = 3;"),
         ] {
             let workspace = create_initialized_workspace(name);
             with_test_connection(&workspace, |connection| {
@@ -5090,5 +6002,554 @@ mod tests {
             )
             .expect("postcommit counts should query");
         assert_eq!(counts, (1, 1));
+    }
+
+    fn task_start_fixture(
+        workspace_key: &str,
+        task_id: &str,
+        bundle_id: &str,
+        nodes: Vec<crate::task::TaskBundleNode>,
+        retrieval_complete: bool,
+        budget_exhausted: bool,
+    ) -> crate::task::TaskStartInput {
+        crate::task::TaskStartInput::new(
+            crate::task::TaskId::parse(task_id).expect("task id should validate"),
+            crate::task::TaskBundleId::parse(bundle_id).expect("bundle id should validate"),
+            workspace_key,
+            crate::task::TaskFingerprint::parse("11111111111111111111111111111111")
+                .expect("memory revision should validate"),
+            crate::task::TaskFingerprint::parse("22222222222222222222222222222222")
+                .expect("query fingerprint should validate"),
+            true,
+            retrieval_complete,
+            budget_exhausted,
+            nodes,
+        )
+        .expect("task start input should validate")
+    }
+
+    #[test]
+    fn task_load_rejects_corrupt_retrieval_budget_pairs() {
+        const TASK_ID: &str = "00000000-0000-4000-8000-000000000009";
+        const BUNDLE_ID: &str = "00000000-0000-4000-8000-000000000010";
+        let workspace = TestWorkspace::new("task-corrupt-retrieval");
+        let start = task_start_fixture(
+            "task-corrupt-retrieval-workspace",
+            TASK_ID,
+            BUNDLE_ID,
+            Vec::new(),
+            true,
+            false,
+        );
+        crate::task::record_started(&workspace.paths, &start).expect("start should persist");
+        let connection = Connection::open(workspace.paths.observability_db())
+            .expect("task store should open directly");
+        connection
+            .execute_batch("PRAGMA ignore_check_constraints = ON;")
+            .expect("corruption fixture should bypass CHECK constraints");
+        let task_id = crate::task::TaskId::parse(TASK_ID).expect("fixture task id should parse");
+
+        for (retrieval_complete, budget_exhausted) in [(1_i64, 1_i64), (0_i64, 0_i64)] {
+            connection
+                .execute(
+                    "UPDATE tasks
+                     SET retrieval_complete = ?1, budget_exhausted = ?2
+                     WHERE task_id = ?3",
+                    rusqlite::params![retrieval_complete, budget_exhausted, TASK_ID],
+                )
+                .expect("corrupt retrieval facts should inject");
+            assert!(matches!(
+                crate::task::load(&workspace.paths, &task_id),
+                Err(crate::task::TaskStateError::StoreUnavailable)
+            ));
+        }
+    }
+
+    #[test]
+    fn task_lifecycle_enforces_identity_transitions_membership_and_exact_replay() {
+        use crate::task::{
+            AppliedNodeKind, AppliedTaskNode, TaskApplyInput, TaskBundleNode, TaskCompletionInput,
+            TaskContextKind, TaskFingerprint, TaskResult, TaskStateError, TaskStatus,
+        };
+
+        const TASK_ID: &str = "00000000-0000-4000-8000-000000000011";
+        const BUNDLE_ID: &str = "00000000-0000-4000-8000-000000000012";
+        let workspace = TestWorkspace::new("task-lifecycle");
+        let workspace_key = "task-lifecycle-workspace";
+        let nodes = vec![
+            TaskBundleNode::new(7, "gate", TaskContextKind::Mandatory)
+                .expect("gate should validate"),
+            TaskBundleNode::new(9, "workflow", TaskContextKind::Task)
+                .expect("workflow should validate"),
+        ];
+        let start = task_start_fixture(workspace_key, TASK_ID, BUNDLE_ID, nodes, true, false);
+        let started =
+            crate::task::record_started(&workspace.paths, &start).expect("start should persist");
+        assert_eq!(started.status, TaskStatus::Started);
+        assert_eq!(
+            crate::task::record_started(&workspace.paths, &start)
+                .expect("exact start replay should succeed")
+                .task_id,
+            started.task_id
+        );
+
+        let outside = TaskApplyInput::new(
+            started.task_id.clone(),
+            started.bundle_id.clone(),
+            workspace_key,
+            started.memory_revision.clone(),
+            TaskFingerprint::parse("33333333333333333333333333333333")
+                .expect("apply fingerprint should validate"),
+            false,
+            vec![AppliedTaskNode::new(99, AppliedNodeKind::Gate)
+                .expect("applied node should validate")],
+        )
+        .expect("outside apply input should validate");
+        assert_eq!(
+            crate::task::record_context_applied(&workspace.paths, &outside),
+            Err(TaskStateError::NodeOutsideBundle)
+        );
+        assert_eq!(
+            crate::task::load(&workspace.paths, &started.task_id)
+                .expect("state should remain readable")
+                .status,
+            TaskStatus::Started
+        );
+
+        let apply = TaskApplyInput::new(
+            started.task_id.clone(),
+            started.bundle_id.clone(),
+            workspace_key,
+            started.memory_revision.clone(),
+            TaskFingerprint::parse("44444444444444444444444444444444")
+                .expect("apply fingerprint should validate"),
+            false,
+            vec![
+                AppliedTaskNode::new(7, AppliedNodeKind::Gate)
+                    .expect("gate application should validate"),
+                AppliedTaskNode::new(9, AppliedNodeKind::Workflow)
+                    .expect("workflow application should validate"),
+            ],
+        )
+        .expect("apply input should validate");
+        let applied = crate::task::record_context_applied(&workspace.paths, &apply)
+            .expect("apply should persist");
+        assert_eq!(applied.status, TaskStatus::Applied);
+        assert_eq!(applied.applied_nodes.len(), 2);
+        assert_eq!(
+            crate::task::record_context_applied(&workspace.paths, &apply)
+                .expect("exact apply replay should succeed")
+                .status,
+            TaskStatus::Applied
+        );
+
+        let complete = TaskCompletionInput::new(
+            applied.task_id.clone(),
+            applied.bundle_id.clone(),
+            workspace_key,
+            applied.memory_revision.clone(),
+            TaskFingerprint::parse("55555555555555555555555555555555")
+                .expect("completion fingerprint should validate"),
+            TaskResult::Partial,
+            None,
+            None,
+        )
+        .expect("completion input should validate");
+        let completed = crate::task::record_completed(&workspace.paths, &complete)
+            .expect("complete should work");
+        assert_eq!(completed.status, TaskStatus::Completed);
+        assert_eq!(completed.result, Some(TaskResult::Partial));
+        assert!(completed.duration_ms.is_some());
+        assert_eq!(
+            crate::task::record_completed(&workspace.paths, &complete)
+                .expect("exact completion replay should succeed")
+                .finished_at,
+            completed.finished_at
+        );
+        assert_eq!(
+            crate::task::record_context_applied(&workspace.paths, &apply)
+                .expect("exact apply replay remains idempotent after completion")
+                .status,
+            TaskStatus::Completed
+        );
+
+        let conflict = TaskCompletionInput::new(
+            completed.task_id.clone(),
+            completed.bundle_id.clone(),
+            workspace_key,
+            completed.memory_revision.clone(),
+            TaskFingerprint::parse("66666666666666666666666666666666")
+                .expect("conflict fingerprint should validate"),
+            TaskResult::Success,
+            None,
+            None,
+        )
+        .expect("conflicting completion input should validate");
+        assert_eq!(
+            crate::task::record_completed(&workspace.paths, &conflict),
+            Err(TaskStateError::ConflictingReplay)
+        );
+    }
+
+    #[test]
+    fn task_none_relevant_requires_complete_zero_task_retrieval() {
+        use crate::task::{
+            TaskApplyInput, TaskBundleNode, TaskContextKind, TaskFingerprint, TaskStateError,
+        };
+
+        const TASK_ID: &str = "00000000-0000-4000-8000-000000000021";
+        const BUNDLE_ID: &str = "00000000-0000-4000-8000-000000000022";
+        let workspace = TestWorkspace::new("task-none-relevant");
+        let workspace_key = "task-none-relevant-workspace";
+        let start = task_start_fixture(
+            workspace_key,
+            TASK_ID,
+            BUNDLE_ID,
+            vec![TaskBundleNode::new(10, "workflow", TaskContextKind::Task)
+                .expect("task node should validate")],
+            true,
+            false,
+        );
+        let state =
+            crate::task::record_started(&workspace.paths, &start).expect("start should persist");
+        let apply = TaskApplyInput::new(
+            state.task_id,
+            state.bundle_id,
+            workspace_key,
+            state.memory_revision,
+            TaskFingerprint::parse("77777777777777777777777777777777")
+                .expect("apply fingerprint should validate"),
+            true,
+            Vec::new(),
+        )
+        .expect("apply should validate");
+        assert_eq!(
+            crate::task::record_context_applied(&workspace.paths, &apply),
+            Err(TaskStateError::NoneRelevantConflict)
+        );
+    }
+
+    #[test]
+    fn task_state_never_persists_raw_query_or_unredacted_failure_reason() {
+        use crate::task::{
+            AppliedNodeKind, AppliedTaskNode, TaskApplyInput, TaskBundleNode, TaskCompletionInput,
+            TaskContextKind, TaskFingerprint, TaskResult, TaskStatus,
+        };
+
+        const TASK_ID: &str = "00000000-0000-4000-8000-000000000031";
+        const BUNDLE_ID: &str = "00000000-0000-4000-8000-000000000032";
+        const RAW_QUERY: &str = "raw-query-canary-4f13386b-do-not-store";
+        const SECRET: &str = "sk-abcdefghijklmnopqrstuvwxyz123456";
+        let workspace = TestWorkspace::new("task-privacy");
+        let workspace_key = "task-privacy-workspace";
+        let start = task_start_fixture(
+            workspace_key,
+            TASK_ID,
+            BUNDLE_ID,
+            vec![TaskBundleNode::new(17, "gate", TaskContextKind::Mandatory)
+                .expect("gate should validate")],
+            true,
+            false,
+        );
+        let started =
+            crate::task::record_started(&workspace.paths, &start).expect("start should persist");
+        let apply = TaskApplyInput::new(
+            started.task_id,
+            started.bundle_id,
+            workspace_key,
+            started.memory_revision,
+            TaskFingerprint::parse("88888888888888888888888888888888")
+                .expect("apply fingerprint should validate"),
+            true,
+            vec![AppliedTaskNode::new(17, AppliedNodeKind::Gate)
+                .expect("gate application should validate")],
+        )
+        .expect("apply should validate");
+        let applied = crate::task::record_context_applied(&workspace.paths, &apply)
+            .expect("apply should persist");
+        let reason = format!("provider rejected token {SECRET}");
+        let complete = TaskCompletionInput::new(
+            applied.task_id,
+            applied.bundle_id,
+            workspace_key,
+            applied.memory_revision,
+            TaskFingerprint::parse("99999999999999999999999999999999")
+                .expect("completion fingerprint should validate"),
+            TaskResult::Failed,
+            Some("TOOL_FAILED"),
+            Some(&reason),
+        )
+        .expect("failure input should validate");
+        let failed = crate::task::record_completed(&workspace.paths, &complete)
+            .expect("failure should store");
+        assert_eq!(failed.status, TaskStatus::Failed);
+        let stored_reason = failed.reason.expect("redacted reason should be stored");
+        assert!(stored_reason.contains(REDACTED));
+        assert!(!stored_reason.contains(SECRET));
+
+        let connection = Connection::open(workspace.paths.observability_db())
+            .expect("privacy fixture should open");
+        checkpoint(&connection);
+        let columns = schema_columns(&connection, "tasks");
+        for forbidden in ["query", "chat", "output", "reasoning"] {
+            assert!(!columns.iter().any(|column| column == forbidden));
+        }
+        drop(connection);
+        for path in managed_database_paths(workspace.paths.observability_db()) {
+            if !path.exists() {
+                continue;
+            }
+            let bytes = fs::read(&path).expect("managed database file should read");
+            for forbidden in [RAW_QUERY, SECRET] {
+                assert!(
+                    !bytes
+                        .windows(forbidden.len())
+                        .any(|window| window == forbidden.as_bytes()),
+                    "private text leaked to {}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stage_010_task_state_redacts_tagged_reason_code_and_managed_files() {
+        use crate::task::{TaskCompletionInput, TaskFingerprint, TaskResult, TaskStatus};
+
+        const TASK_ID: &str = "00000000-0000-4000-8000-000000000091";
+        const BUNDLE_ID: &str = "00000000-0000-4000-8000-000000000092";
+        let workspace = TestWorkspace::new("stage-010-task-redaction");
+        let workspace_key = "stage-010-task-redaction-workspace";
+        let reason_secret = "TEST_ONLY_STAGE010_TASK_\"quote\"\\slash\nline";
+        let code_secret = "TEST_ONLY_STAGE010_TASK_CODE";
+        let operational =
+            storage::open_workspace_db(&workspace.paths).expect("operational database should open");
+        for value in [reason_secret, code_secret] {
+            operational
+                .execute(
+                    "INSERT INTO nodes (
+                        node_type, status, title, body
+                     ) VALUES (
+                        'raw_note', 'active', 'Authorized test credential', ?1
+                     )",
+                    [value],
+                )
+                .expect("task tagged node should insert");
+            operational
+                .execute(
+                    "INSERT INTO tags (node_id, tag) VALUES (?1, ?2)",
+                    rusqlite::params![
+                        operational.last_insert_rowid(),
+                        crate::redaction::TEST_SECRET_TAG
+                    ],
+                )
+                .expect("task tagged value should attach");
+        }
+        drop(operational);
+
+        let start = task_start_fixture(workspace_key, TASK_ID, BUNDLE_ID, Vec::new(), true, false);
+        let started =
+            crate::task::record_started(&workspace.paths, &start).expect("task should start");
+        let reason = format!("task failed with {reason_secret}");
+        let complete = TaskCompletionInput::new(
+            started.task_id,
+            started.bundle_id,
+            workspace_key,
+            started.memory_revision,
+            TaskFingerprint::parse("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                .expect("completion fingerprint should validate"),
+            TaskResult::Failed,
+            Some(code_secret),
+            Some(&reason),
+        )
+        .expect("tagged failure input should validate");
+        let failed = crate::task::record_completed(&workspace.paths, &complete)
+            .expect("tagged task completion should persist");
+        assert_eq!(failed.status, TaskStatus::Failed);
+        assert_eq!(
+            failed.error_code.as_deref(),
+            Some(crate::redaction::TEST_SECRET_REDACTION_MARKER)
+        );
+        assert!(failed
+            .reason
+            .as_deref()
+            .is_some_and(|value| value.contains(crate::redaction::TEST_SECRET_REDACTION_MARKER)));
+        let serialized = serde_json::to_string(&failed).expect("safe task state should serialize");
+        assert!(!serialized.contains(reason_secret));
+        assert!(!serialized.contains(code_secret));
+
+        let observability = Connection::open(workspace.paths.observability_db())
+            .expect("task observability database should open");
+        checkpoint(&observability);
+        let stored: (Option<String>, Option<String>) = observability
+            .query_row(
+                "SELECT error_code, reason FROM tasks WHERE task_id = ?1",
+                [TASK_ID],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("task terminal details should query");
+        assert_eq!(
+            stored.0.as_deref(),
+            Some(crate::redaction::TEST_SECRET_REDACTION_MARKER)
+        );
+        assert!(stored
+            .1
+            .as_deref()
+            .is_some_and(|value| value.contains(crate::redaction::TEST_SECRET_REDACTION_MARKER)));
+        drop(observability);
+        for path in managed_database_paths(workspace.paths.observability_db()) {
+            if !path.exists() {
+                continue;
+            }
+            let bytes = fs::read(&path).expect("task managed file should read");
+            for value in [reason_secret, code_secret] {
+                assert!(!bytes
+                    .windows(value.len())
+                    .any(|window| window == value.as_bytes()));
+            }
+        }
+    }
+
+    #[test]
+    fn stage_010_task_completion_persists_safe_terminal_fallback_on_lookup_failure() {
+        use crate::task::{TaskCompletionInput, TaskFingerprint, TaskResult};
+
+        const TASK_ID: &str = "00000000-0000-4000-8000-000000000093";
+        const BUNDLE_ID: &str = "00000000-0000-4000-8000-000000000094";
+        let workspace = TestWorkspace::new("stage-010-task-redaction-fallback");
+        let workspace_key = "stage-010-task-redaction-fallback-workspace";
+        let start = task_start_fixture(workspace_key, TASK_ID, BUNDLE_ID, Vec::new(), true, false);
+        let started =
+            crate::task::record_started(&workspace.paths, &start).expect("task should start");
+
+        let operational =
+            storage::open_workspace_db(&workspace.paths).expect("operational database should open");
+        operational
+            .execute(
+                "INSERT INTO nodes (node_type, status, title, body)
+                 VALUES ('raw_note', 'active', 'invalid tagged source', NULL)",
+                [],
+            )
+            .expect("invalid tagged source node should insert");
+        operational
+            .execute(
+                "INSERT INTO tags (node_id, tag) VALUES (?1, ?2)",
+                rusqlite::params![
+                    operational.last_insert_rowid(),
+                    crate::redaction::TEST_SECRET_TAG
+                ],
+            )
+            .expect("invalid tagged source tag should insert");
+        drop(operational);
+
+        let raw_reason = "TEST_ONLY_STAGE010_FALLBACK_REASON";
+        let complete = TaskCompletionInput::new(
+            started.task_id,
+            started.bundle_id,
+            workspace_key,
+            started.memory_revision,
+            TaskFingerprint::parse("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+                .expect("completion fingerprint should validate"),
+            TaskResult::Failed,
+            Some("RAW_FAILURE_CODE"),
+            Some(raw_reason),
+        )
+        .expect("fallback completion input should validate");
+        let failed = crate::task::record_completed(&workspace.paths, &complete)
+            .expect("safe fallback terminal transition should persist");
+        assert_eq!(
+            failed.error_code.as_deref(),
+            Some("TASK_REDACTION_UNAVAILABLE")
+        );
+        assert!(failed.reason.is_none());
+
+        let observability = Connection::open(workspace.paths.observability_db())
+            .expect("task observability database should open");
+        let stored: (Option<String>, Option<String>) = observability
+            .query_row(
+                "SELECT error_code, reason FROM tasks WHERE task_id = ?1",
+                [TASK_ID],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("fallback terminal details should query");
+        assert_eq!(stored.0.as_deref(), Some("TASK_REDACTION_UNAVAILABLE"));
+        assert!(stored.1.is_none());
+        checkpoint(&observability);
+        drop(observability);
+        for path in managed_database_paths(workspace.paths.observability_db()) {
+            if path.exists() {
+                let bytes = fs::read(&path).expect("task managed file should read");
+                assert!(!bytes
+                    .windows(raw_reason.len())
+                    .any(|window| window == raw_reason.as_bytes()));
+            }
+        }
+    }
+
+    #[test]
+    fn task_retention_expires_state_and_cascades_task_children_only() {
+        use crate::task::{TaskBundleNode, TaskContextKind, TaskStateError};
+
+        const TASK_ID: &str = "00000000-0000-4000-8000-000000000041";
+        const BUNDLE_ID: &str = "00000000-0000-4000-8000-000000000042";
+        let workspace = TestWorkspace::new("task-retention");
+        let workspace_key = "task-retention-workspace";
+        let operational = storage::open_workspace_db(&workspace.paths)
+            .expect("operational store should initialize");
+        let operational_migrations: i64 = operational
+            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .expect("operational migrations should read");
+        drop(operational);
+        let start = task_start_fixture(
+            workspace_key,
+            TASK_ID,
+            BUNDLE_ID,
+            vec![TaskBundleNode::new(23, "gate", TaskContextKind::Mandatory)
+                .expect("gate should validate")],
+            true,
+            false,
+        );
+        let state =
+            crate::task::record_started(&workspace.paths, &start).expect("start should persist");
+        with_test_connection(&workspace, |connection| {
+            connection
+                .execute(
+                    "UPDATE tasks SET started_at = '2020-01-01T00:00:00.000Z'
+                     WHERE task_id = ?1",
+                    [state.task_id.as_str()],
+                )
+                .expect("task timestamp should age");
+        });
+        let mut writer = open_writer(&workspace.paths).expect("writer should reopen");
+        writer
+            .apply_retention(RetentionPolicy::default())
+            .expect("task retention should succeed");
+        let task_counts: (i64, i64, i64) = writer
+            .connection
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM tasks),
+                    (SELECT COUNT(*) FROM task_bundle_nodes),
+                    (SELECT COUNT(*) FROM task_applied_nodes)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("task counts should read");
+        assert_eq!(task_counts, (0, 0, 0));
+        drop(writer);
+        assert_eq!(
+            crate::task::load(&workspace.paths, &state.task_id),
+            Err(TaskStateError::NotFoundOrExpired)
+        );
+        let operational =
+            storage::open_workspace_db(&workspace.paths).expect("operational store should reopen");
+        let after: i64 = operational
+            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .expect("operational migrations should reread");
+        assert_eq!(after, operational_migrations);
     }
 }

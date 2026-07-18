@@ -36,6 +36,8 @@ pub(crate) enum HttpError {
     InvalidStaticHeader,
     #[error("could not serialize the local UI response")]
     Json(#[from] serde_json::Error),
+    #[error("could not safely redact the local UI response")]
+    Redaction,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -261,63 +263,85 @@ fn route_api(
         "api/v1/bootstrap" => request
             .require_only(&[])
             .and_then(|()| data::bootstrap(context))
-            .map_or_else(api_error, |body| json_response(StatusCode(200), &body)),
+            .map_or_else(api_error, |body| {
+                redacted_json_response(StatusCode(200), &body, context)
+            }),
         "api/v1/overview" => request
             .require_only(&[])
             .and_then(|()| data::overview(context))
-            .map_or_else(api_error, |body| json_response(StatusCode(200), &body)),
+            .map_or_else(api_error, |body| {
+                redacted_json_response(StatusCode(200), &body, context)
+            }),
         "api/v1/memory" => {
             let result = request
                 .memory_query()
                 .and_then(|query| data::memory(context, &query));
-            result.map_or_else(api_error, |body| json_response(StatusCode(200), &body))
+            result.map_or_else(api_error, |body| {
+                redacted_json_response(StatusCode(200), &body, context)
+            })
         }
         "api/v1/node" => {
             let result = request.required_positive_i64("id").and_then(|id| {
                 request.require_only(&["id"])?;
                 data::node(context, id)
             });
-            result.map_or_else(api_error, |body| json_response(StatusCode(200), &body))
+            result.map_or_else(api_error, |body| {
+                redacted_json_response(StatusCode(200), &body, context)
+            })
         }
         "api/v1/node-links" => {
             let result = request
                 .node_links_query()
                 .and_then(|query| data::node_links(context, &query));
-            result.map_or_else(api_error, |body| json_response(StatusCode(200), &body))
+            result.map_or_else(api_error, |body| {
+                redacted_json_response(StatusCode(200), &body, context)
+            })
         }
         "api/v1/graph" => {
             let result = request
                 .graph_query()
                 .and_then(|query| data::graph(context, &query));
-            result.map_or_else(api_error, |body| json_response(StatusCode(200), &body))
+            result.map_or_else(api_error, |body| {
+                redacted_json_response(StatusCode(200), &body, context)
+            })
         }
         "api/v1/activity" => {
             let result = request
                 .activity_query()
                 .and_then(|query| data::activity(context, &query));
-            result.map_or_else(api_error, |body| json_response(StatusCode(200), &body))
+            result.map_or_else(api_error, |body| {
+                redacted_json_response(StatusCode(200), &body, context)
+            })
         }
         "api/v1/bundle" => {
             let result = request
                 .bundle_query()
                 .and_then(|query| data::bundle(context, &query));
-            result.map_or_else(api_error, |body| json_response(StatusCode(200), &body))
+            result.map_or_else(api_error, |body| {
+                redacted_json_response(StatusCode(200), &body, context)
+            })
         }
         "api/v1/effectiveness" => request
             .require_only(&[])
             .and_then(|()| data::effectiveness(context))
-            .map_or_else(api_error, |body| json_response(StatusCode(200), &body)),
+            .map_or_else(api_error, |body| {
+                redacted_json_response(StatusCode(200), &body, context)
+            }),
         "api/v1/tools" => {
             let result = request
                 .tools_query()
                 .and_then(|query| data::tools(context, &query));
-            result.map_or_else(api_error, |body| json_response(StatusCode(200), &body))
+            result.map_or_else(api_error, |body| {
+                redacted_json_response(StatusCode(200), &body, context)
+            })
         }
         "api/v1/mcp" => {
             let result = request
                 .mcp_query()
                 .and_then(|query| data::mcp(context, &query));
-            result.map_or_else(api_error, |body| json_response(StatusCode(200), &body))
+            result.map_or_else(api_error, |body| {
+                redacted_json_response(StatusCode(200), &body, context)
+            })
         }
         _ => api_error(data::ApiError::not_found()),
     }
@@ -564,6 +588,50 @@ fn json_response<T: serde::Serialize>(
         content_type: "application/json; charset=utf-8",
         allow_get: status.0 == 405,
     })
+}
+
+fn redacted_json_response<T: serde::Serialize>(
+    status: StatusCode,
+    body: &T,
+    context: &data::UiDataContext,
+) -> Result<ResponseSpec, HttpError> {
+    let redactor = crate::redaction::TaggedValueRedactor::load_workspace(context.workspace_paths())
+        .map_err(|_| HttpError::Redaction)?;
+    let mut body = serde_json::to_value(body)?;
+    redact_json_strings(&mut body, &redactor)?;
+    json_response(status, &body)
+}
+
+fn redact_json_strings(
+    value: &mut serde_json::Value,
+    redactor: &crate::redaction::TaggedValueRedactor,
+) -> Result<(), HttpError> {
+    match value {
+        serde_json::Value::String(text) => {
+            *text = redactor
+                .redact_str(text)
+                .map_err(|_| HttpError::Redaction)?;
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                redact_json_strings(item, redactor)?;
+            }
+        }
+        serde_json::Value::Object(fields) => {
+            let original = std::mem::take(fields);
+            for (key, mut field) in original {
+                let key = redactor
+                    .redact_str(&key)
+                    .map_err(|_| HttpError::Redaction)?;
+                redact_json_strings(&mut field, redactor)?;
+                if fields.insert(key, field).is_some() {
+                    return Err(HttpError::Redaction);
+                }
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
+    Ok(())
 }
 
 fn build_response(spec: ResponseSpec) -> Result<Response<Cursor<Cow<'static, [u8]>>>, HttpError> {
@@ -907,6 +975,14 @@ mod tests {
                     "explicit",
                     "OMEGA_CONTRACT_SECRET",
                 ),
+                (
+                    "old-alpha-tool",
+                    "Old alpha tool",
+                    "superseded",
+                    "none",
+                    "none",
+                    "OLD_ALPHA_CONTRACT_SECRET",
+                ),
             ] {
                 connection
                     .execute(
@@ -924,6 +1000,19 @@ mod tests {
                         ],
                     )
                     .expect("UI tool fixture should insert");
+            }
+            for (alias, source) in [
+                ("alpha-alias", "cli"),
+                ("old-alpha-tool", "exact_only_dedupe"),
+            ] {
+                connection
+                    .execute(
+                        "INSERT INTO tool_aliases (
+                            alias, canonical_tool_id, source, status
+                         ) VALUES (?1, 'alpha-tool', ?2, 'active')",
+                        rusqlite::params![alias, source],
+                    )
+                    .expect("UI tool alias fixture should insert");
             }
             for (id, name, kind, status, side_effects, approval, credential_canary, notes_canary) in [
                 (
@@ -972,6 +1061,46 @@ mod tests {
             connection
                 .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
                 .expect("UI operational fixture should checkpoint");
+        }
+
+        fn seed_tagged_test_secret(&self, secret: &str) -> i64 {
+            let connection = crate::storage::open_workspace_db(self.context.workspace_paths())
+                .expect("UI tagged-secret fixture DB should open");
+            connection
+                .execute(
+                    "INSERT INTO nodes (
+                        node_type, status, title, body, source_ref,
+                        confidence, trust_level
+                     ) VALUES (
+                        'raw_note', 'active', 'Authorized test credential',
+                        ?1, 'source=user_instruction', 1.0, 'high'
+                     )",
+                    [secret],
+                )
+                .expect("UI tagged-secret node should insert");
+            let node_id = connection.last_insert_rowid();
+            connection
+                .execute(
+                    "INSERT INTO tags (node_id, tag) VALUES (?1, ?2)",
+                    rusqlite::params![node_id, crate::redaction::TEST_SECRET_TAG],
+                )
+                .expect("UI tagged-secret tag should insert");
+            connection
+                .execute(
+                    "UPDATE nodes
+                     SET title = ?1, summary = ?2
+                     WHERE id = ?3",
+                    rusqlite::params![
+                        format!("title copy: {secret}"),
+                        format!("summary copy: {secret}"),
+                        self.node_ids[0]
+                    ],
+                )
+                .expect("UI tagged-secret copies should seed");
+            connection
+                .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                .expect("UI tagged-secret fixture should checkpoint");
+            node_id
         }
 
         fn seed_graph_boundaries(&self) {
@@ -1139,6 +1268,17 @@ mod tests {
         counts: Vec<(String, i64)>,
     }
 
+    #[derive(Debug, PartialEq, Eq)]
+    struct FilesystemEntryFingerprint {
+        relative_path: std::path::PathBuf,
+        kind: &'static str,
+        size: u64,
+        modified: SystemTime,
+        read_only: bool,
+        bytes: Option<Vec<u8>>,
+        link_target: Option<std::path::PathBuf>,
+    }
+
     fn database_fingerprint(path: &std::path::Path, tables: &[&str]) -> DatabaseFingerprint {
         let canonical_path = path
             .parent()
@@ -1188,6 +1328,57 @@ mod tests {
             schema,
             counts,
         }
+    }
+
+    fn filesystem_tree_fingerprint(root: &std::path::Path) -> Vec<FilesystemEntryFingerprint> {
+        fn visit(
+            root: &std::path::Path,
+            path: &std::path::Path,
+            result: &mut Vec<FilesystemEntryFingerprint>,
+        ) {
+            let metadata =
+                std::fs::symlink_metadata(path).expect("tree fingerprint metadata should read");
+            let file_type = metadata.file_type();
+            let kind = if file_type.is_dir() {
+                "directory"
+            } else if file_type.is_file() {
+                "file"
+            } else if file_type.is_symlink() {
+                "symlink"
+            } else {
+                "special"
+            };
+            result.push(FilesystemEntryFingerprint {
+                relative_path: path
+                    .strip_prefix(root)
+                    .expect("tree entry should stay under root")
+                    .to_path_buf(),
+                kind,
+                size: metadata.len(),
+                modified: metadata.modified().expect("tree mtime should read"),
+                read_only: metadata.permissions().readonly(),
+                bytes: file_type
+                    .is_file()
+                    .then(|| std::fs::read(path).expect("tree file bytes should read")),
+                link_target: file_type
+                    .is_symlink()
+                    .then(|| std::fs::read_link(path).expect("tree link target should read")),
+            });
+            if file_type.is_dir() {
+                let mut children = std::fs::read_dir(path)
+                    .expect("tree directory should read")
+                    .map(|entry| entry.expect("tree entry should read").path())
+                    .collect::<Vec<_>>();
+                children.sort();
+                for child in children {
+                    visit(root, &child, result);
+                }
+            }
+        }
+
+        let mut result = Vec::new();
+        visit(root, root, &mut result);
+        result
     }
 
     #[test]
@@ -1500,6 +1691,68 @@ mod tests {
             .join()
             .expect("UI test server thread should join")
             .expect("UI test server should stop cleanly");
+    }
+
+    #[test]
+    fn stage_010_ui_data_and_http_redact_tagged_values_before_json_escaping() {
+        let fixture = DataFixture::new();
+        let secret = "TEST_ONLY_STAGE010_UI_\"quote\"\\slash\nline";
+        let secret_node_id = fixture.seed_tagged_test_secret(secret);
+        fixture.seed_observability();
+        let observability =
+            rusqlite::Connection::open(fixture.context.workspace_paths().observability_db())
+                .expect("UI observability fixture should open");
+        observability
+            .execute(
+                "UPDATE observability_events
+                 SET product_version = ?1
+                 WHERE event_type = 'tool.run.failed'",
+                [format!("event copy: {secret}")],
+            )
+            .expect("legacy observability copy should seed");
+        observability
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .expect("legacy observability copy should checkpoint");
+        drop(observability);
+
+        let direct_node = data::node(&fixture.context, secret_node_id)
+            .expect("direct UI node read should succeed");
+        let direct_node =
+            serde_json::to_string(&direct_node).expect("direct UI node response should serialize");
+        assert!(!direct_node.contains(secret));
+        assert!(direct_node.contains(crate::redaction::TEST_SECRET_REDACTION_MARKER));
+
+        let direct_activity = data::activity(
+            &fixture.context,
+            &data::ActivityQuery {
+                limit: 20,
+                ..data::ActivityQuery::default()
+            },
+        )
+        .expect("direct UI activity read should succeed");
+        let direct_activity = serde_json::to_string(&direct_activity)
+            .expect("direct UI activity response should serialize");
+        assert!(!direct_activity.contains(secret));
+        assert!(direct_activity.contains(crate::redaction::TEST_SECRET_REDACTION_MARKER));
+
+        let token = fixture_token();
+        let response = route(
+            &Method::Get,
+            &format!("/{}/api/v1/memory?limit=100", token.as_str()),
+            &token,
+            &fixture.context,
+        )
+        .expect("tagged UI response should serialize");
+        let body = String::from_utf8(response.body.into_owned())
+            .expect("tagged UI response should be UTF-8");
+        let escaped = serde_json::to_string(secret).expect("fake secret should JSON encode");
+        let escaped = escaped
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+            .expect("JSON string should have quotes");
+        assert!(!body.contains(secret));
+        assert!(!body.contains(escaped));
+        assert!(body.contains(crate::redaction::TEST_SECRET_REDACTION_MARKER));
     }
 
     #[test]
@@ -2128,6 +2381,27 @@ mod tests {
         )
         .expect("direct effectiveness report should build");
         let effectiveness_json = json_spec(&effectiveness);
+        assert_eq!(effectiveness_json["facts"]["tasks"]["starts"], 0);
+        assert_eq!(
+            effectiveness_json["facts"]["tasks"]["started_without_apply"],
+            0
+        );
+        assert!(
+            effectiveness_json["facts"]["tasks"]["applied_context_by_type"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+        );
+        for field in [
+            "tool_duplicate_blocks",
+            "alias_resolutions",
+            "unresolved_tool_overlaps",
+            "last_successful_audit_repair_at",
+        ] {
+            assert!(
+                effectiveness_json["facts"].get(field).is_some(),
+                "effectiveness API is missing {field}"
+            );
+        }
         let direct_json =
             serde_json::to_value(direct_report).expect("direct report should serialize");
         for field in [
@@ -2215,11 +2489,30 @@ mod tests {
         assert_eq!(tools_json["limit"], 1);
         assert_eq!(tools_json["more_results"], true);
         assert_eq!(tools_json["items"].as_array().map(Vec::len), Some(1));
+        assert_eq!(tools_json["items"][0]["canonical_tool_id"], "alpha-tool");
+        assert_eq!(
+            tools_json["items"][0]["aliases"],
+            serde_json::json!(["alpha-alias", "old-alpha-tool"])
+        );
+        assert_eq!(
+            tools_json["items"][0]["superseded_duplicates"],
+            serde_json::json!(["old-alpha-tool"])
+        );
+        assert_eq!(tools_json["items"][0]["superseded_duplicate"], false);
+        assert!(tools_json["items"][0]["duplicate_classifications"]
+            .as_array()
+            .is_some_and(Vec::is_empty));
+        assert!(tools_json["items"][0]["unresolved_overlaps"]
+            .as_array()
+            .is_some_and(Vec::is_empty));
+        assert_eq!(tools_json["duplicate_analysis_complete"], false);
+        assert_eq!(tools_json["complete"], false);
         let tools_body = String::from_utf8_lossy(&tools.body);
         for forbidden in [
             "contract_json",
             "ALPHA_CONTRACT_SECRET",
             "OMEGA_CONTRACT_SECRET",
+            "OLD_ALPHA_CONTRACT_SECRET",
         ] {
             assert!(!tools_body.contains(forbidden));
         }
@@ -2255,6 +2548,20 @@ mod tests {
         assert_eq!(
             json_spec(&external_write)["items"][0]["tool_id"],
             "omega-tool"
+        );
+        assert_eq!(
+            json_spec(&external_write)["duplicate_analysis_complete"],
+            false
+        );
+        assert_eq!(
+            json_spec(&external_write)["more_results"],
+            false,
+            "fixture should isolate analysis completeness from pagination"
+        );
+        assert_eq!(
+            json_spec(&external_write)["complete"],
+            false,
+            "failed duplicate analysis must keep the whole tools response incomplete"
         );
         let combined_tool_filters = route(
             &Method::Get,
@@ -2450,7 +2757,7 @@ mod tests {
     }
 
     #[test]
-    fn every_ui_get_preserves_database_bytes_schema_mtime_and_counts() {
+    fn every_ui_get_preserves_databases_and_tool_filesystem_tree() {
         const OPERATIONAL_TABLES: &[&str] = &[
             "nodes",
             "links",
@@ -2459,6 +2766,7 @@ mod tests {
             "sources",
             "events",
             "tool_contracts",
+            "tool_aliases",
             "mcp_profiles",
             "schema_migrations",
         ];
@@ -2468,6 +2776,9 @@ mod tests {
             "bundle_nodes",
             "feedback",
             "collector_state",
+            "tasks",
+            "task_bundle_nodes",
+            "task_applied_nodes",
         ];
         let fixture = DataFixture::new();
         fixture.seed_observability();
@@ -2476,6 +2787,7 @@ mod tests {
         let observability_path = fixture.context.workspace_paths().observability_db();
         let operational_before = database_fingerprint(operational_path, OPERATIONAL_TABLES);
         let observability_before = database_fingerprint(observability_path, OBSERVABILITY_TABLES);
+        let tools_before = filesystem_tree_fingerprint(fixture.context.workspace_paths().tools());
         let token = fixture_token();
         let prefix = format!("/{}/api/v1", token.as_str());
 
@@ -2504,7 +2816,9 @@ mod tests {
 
         let operational_after = database_fingerprint(operational_path, OPERATIONAL_TABLES);
         let observability_after = database_fingerprint(observability_path, OBSERVABILITY_TABLES);
+        let tools_after = filesystem_tree_fingerprint(fixture.context.workspace_paths().tools());
         assert_eq!(operational_after, operational_before);
         assert_eq!(observability_after, observability_before);
+        assert_eq!(tools_after, tools_before);
     }
 }

@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 
@@ -6,6 +7,7 @@ use super::{
     AUDIT_GIT_AUTHOR_EMAIL, AUDIT_GIT_AUTHOR_NAME, AUDIT_GIT_COMMIT_MESSAGE,
     MAX_AUDIT_GIT_METADATA_ENTRIES, SNAPSHOT_FILE_NAME,
 };
+use crate::platform_publish::{publish_regular, PublishError, PublishMode};
 
 const GIT_DIR: &str = ".git";
 const HEAD_FILE: &str = "HEAD";
@@ -21,7 +23,7 @@ const MAX_PACKED_REFS_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_COMMIT_BYTES: u64 = 1024 * 1024;
 const MAX_TREE_BYTES: u64 = 32 * 1024 * 1024;
 
-pub(super) fn commit_snapshot(root: &AnchoredDir) -> io::Result<()> {
+pub(super) fn commit_snapshot(root: &AnchoredDir) -> io::Result<super::GitCommitOutcome> {
     let repository = LocalGitAudit::open_or_initialize(root)?;
     repository.commit_snapshot()
 }
@@ -77,14 +79,14 @@ impl<'root> LocalGitAudit<'root> {
         })
     }
 
-    fn commit_snapshot(&self) -> io::Result<()> {
+    fn commit_snapshot(&self) -> io::Result<super::GitCommitOutcome> {
         let head = self.read_head()?;
         let (mut tree, base_tree_id) = self.read_base_tree(head.commit)?;
         let blob_id = self.write_snapshot_blob()?;
         upsert_snapshot_entry(&mut tree, blob_id);
         let tree_id = self.write_object(&tree)?;
         if head.commit.is_some() && tree_id == base_tree_id {
-            return Ok(());
+            return Ok(super::GitCommitOutcome::Unchanged);
         }
 
         let signature = gix::actor::Signature {
@@ -102,7 +104,8 @@ impl<'root> LocalGitAudit<'root> {
             extra_headers: Vec::new(),
         };
         let commit_id = self.write_object(&commit)?;
-        self.update_head(&head, commit_id)
+        self.update_head(&head, commit_id)?;
+        Ok(super::GitCommitOutcome::Created)
     }
 
     fn read_head(&self) -> io::Result<HeadState> {
@@ -336,18 +339,28 @@ impl<'root> LocalGitAudit<'root> {
             return Err(error);
         }
 
-        match fanout.publish_regular_no_replace(&temporary, &temporary_name, object_name) {
-            Ok(()) => Ok(()),
+        match publish_regular(
+            &fanout,
+            temporary,
+            OsStr::new(&temporary_name),
+            OsStr::new(object_name),
+            PublishMode::NoReplace,
+        ) {
+            Ok(outcome) => {
+                if !outcome.temporary_cleanup_confirmed {
+                    let _ = fanout.remove_regular(&temporary_name);
+                    let _ = fanout.sync();
+                }
+                crate::platform_publish::require_committed_validated_clean(outcome)
+            }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                drop(temporary);
                 let _ = fanout.remove_regular(&temporary_name);
                 let existing = fanout.open_regular(object_name)?;
                 verify_loose_stream(existing, id, expected_loose_bytes)
             }
             Err(error) => {
-                drop(temporary);
                 let _ = fanout.remove_regular(&temporary_name);
-                Err(error)
+                Err(PublishError::into_io_error(error))
             }
         }
     }
@@ -405,9 +418,16 @@ impl<'root> LocalGitAudit<'root> {
         let update_result = (|| {
             writeln!(lock, "{commit_id}")?;
             lock.sync_all()?;
-            directory.replace_regular(&lock, &lock_name, name)
+            publish_regular(
+                &directory,
+                lock,
+                OsStr::new(&lock_name),
+                OsStr::new(name),
+                PublishMode::ReplaceOrCreate,
+            )
+            .map_err(PublishError::into_io_error)
+            .and_then(crate::platform_publish::require_committed_validated_clean)
         })();
-        drop(lock);
         if update_result.is_err() {
             let _ = directory.remove_regular(&lock_name);
         }
@@ -744,7 +764,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn open_repository_survives_git_directory_swap_without_outside_writes() {
+    fn open_repository_rejects_git_directory_swap_without_outside_writes() {
         let (workspace, audit) = temp_workspace("git-dir-swap");
         let root = AnchoredDir::open_or_create_audit_root(&audit).expect("root should anchor");
         write_new_file(&root, SNAPSHOT_FILE_NAME, b"first snapshot\n")
@@ -764,7 +784,7 @@ mod tests {
 
         repository
             .commit_snapshot()
-            .expect("open Git capability should stay on the moved original");
+            .expect_err("changed Git directory identity must fail closed");
         assert_outside_untouched(&outside, &sentinel);
 
         std::fs::remove_file(audit.join(GIT_DIR)).expect("replacement symlink should remove");
@@ -777,7 +797,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn open_object_store_survives_directory_swap_without_outside_writes() {
+    fn open_object_store_rejects_directory_swap_without_outside_writes() {
         let (workspace, audit) = temp_workspace("objects-swap");
         let root = AnchoredDir::open_or_create_audit_root(&audit).expect("root should anchor");
         write_new_file(&root, SNAPSHOT_FILE_NAME, b"first snapshot\n")
@@ -798,7 +818,7 @@ mod tests {
 
         repository
             .commit_snapshot()
-            .expect("open object capability should stay on the moved original");
+            .expect_err("changed object directory identity must fail closed");
         assert_outside_untouched(&outside, &sentinel);
 
         std::fs::remove_file(&objects).expect("replacement symlink should remove");
@@ -811,7 +831,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn open_ref_store_updates_original_after_directory_swap() {
+    fn open_ref_store_rejects_directory_swap() {
         let (workspace, audit) = temp_workspace("refs-swap");
         let root = AnchoredDir::open_or_create_audit_root(&audit).expect("root should anchor");
         write_new_file(&root, SNAPSHOT_FILE_NAME, b"snapshot\n")
@@ -832,7 +852,7 @@ mod tests {
 
         repository
             .update_head(&expected, commit_id)
-            .expect("open ref capability should update the moved original");
+            .expect_err("changed ref directory identity must fail closed");
         assert_outside_untouched(&outside, &sentinel);
 
         std::fs::remove_file(&refs).expect("replacement symlink should remove");
@@ -877,13 +897,29 @@ mod tests {
     }
 
     #[test]
-    fn windows_anchor_source_has_no_delete_share_and_uses_handle_relative_rename() {
+    fn windows_publish_uses_one_path_boundary_without_handle_relative_rename() {
         let source = include_str!("anchored.rs");
+        let publish_source = include_str!("../platform_publish.rs");
+        let windows_path_source = include_str!("../windows_path.rs");
         let audit_source = include_str!("mod.rs");
         assert!(source.contains("FILE_FLAG_OPEN_REPARSE_POINT"));
-        assert!(source.contains("SetFileInformationByHandle"));
-        assert!(source.contains("RootDirectory = parent.as_raw_handle()"));
+        assert!(!source.contains("FileRenameInfo"));
+        assert!(!source.contains("FILE_RENAME_INFO"));
         assert!(!source.contains("FILE_SHARE_DELETE"));
+        assert!(publish_source.contains("ReplaceFileW"));
+        assert!(publish_source.contains("MoveFileExW"));
+        assert!(publish_source.contains("MOVEFILE_WRITE_THROUGH"));
+        assert!(!publish_source.contains("MOVEFILE_REPLACE_EXISTING"));
+        assert!(publish_source.contains("ReplaceFileW("));
+        assert!(
+            publish_source.contains("destination.as_ptr(),\n                    source.as_ptr()")
+        );
+        assert!(publish_source.contains("std::ptr::null(),\n                    0,"));
+        assert!(publish_source.contains("destination_validated"));
+        assert!(publish_source.contains("crate::windows_path::verbatim_wide_path"));
+        assert!(source.contains("crate::windows_path::verbatim_wide_path"));
+        assert!(windows_path_source.contains("const VERBATIM_PREFIX"));
+        assert!(windows_path_source.contains("const VERBATIM_UNC_PREFIX"));
         assert!(source.contains(".ancestors()"));
         assert!(source.contains("ancestors.push(Arc::new(windows_open("));
         assert!(source.contains("ancestors.push(Arc::clone(&self.handle))"));

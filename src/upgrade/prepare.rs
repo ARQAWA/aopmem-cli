@@ -21,7 +21,7 @@ use crate::storage::{self, AopmemPaths, WorkspacePaths};
 
 const PREPARE_SCOPE: &str = "all_workspaces";
 const BACKUPS_DIRECTORY: &str = "backups";
-const BACKUP_RUN_PREFIX: &str = "upgrade-prepare-rc4-";
+const BACKUP_RUN_PREFIX: &str = "upgrade-prepare-rc5-";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct UpgradePrepareReport {
@@ -785,9 +785,14 @@ mod tests {
             )
             .expect("node should insert");
         connection
-            .execute(
-                "DELETE FROM schema_migrations WHERE version IN ('002', '003')",
-                [],
+            .execute_batch(
+                "DELETE FROM schema_migrations WHERE version IN ('002', '003', '004');
+                 DROP TRIGGER tool_aliases_validate_insert;
+                 DROP TRIGGER tool_aliases_validate_update;
+                 DROP TRIGGER tool_contracts_reject_alias_shadow_insert;
+                 DROP TRIGGER tool_contracts_reject_alias_shadow_update;
+                 DROP TRIGGER tool_contracts_preserve_alias_target;
+                 DROP TABLE tool_aliases;",
             )
             .expect("fixture should emulate v0.1 markers");
         drop(connection);

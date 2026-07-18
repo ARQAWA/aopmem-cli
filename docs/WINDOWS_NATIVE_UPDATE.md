@@ -1,6 +1,6 @@
 # Windows native update
 
-This path updates SQLite-backed AOPMem v0.1 to `v0.2.0-rc4` on Windows 11
+This path updates SQLite-backed AOPMem v0.1 to `v0.2.0-rc5` on Windows 11
 x64 through native Windows PowerShell 5.1.
 
 ## Boundaries
@@ -43,7 +43,7 @@ Verify the copied binary hash, workspace directories, and database files.
 ## Required update sequence
 
 Run all upgrade commands through the downloaded and verified
-`v0.2.0-rc4` binary:
+`v0.2.0-rc5` binary:
 
 ```text
 aopmem upgrade prepare --all-workspaces --json
@@ -155,7 +155,7 @@ command, then repeat status, doctor, and verify.
 
 Require:
 
-- installed `aopmem 0.2.0-rc4` and release SHA-256;
+- installed `aopmem 0.2.0-rc5` and release SHA-256;
 - unchanged workspace keys;
 - all old workspace directories present;
 - adapter in sync;
@@ -174,5 +174,6 @@ macOS-hosted checks can prove Rust tests, fixtures, installer structure, PE
 type, imports, and release hash. They cannot prove native Windows PowerShell
 or executable runtime behavior.
 
-Native Windows retry for `v0.2.0-rc4` remains `PENDING` until executed on
-Windows 11 x64 with PowerShell 5.1 against backed-up dogfood workspaces.
+Native Windows runtime remains `PENDING_DOGFOOD` until this exact RC5 asset
+runs on Windows 11 x64 with PowerShell 5.1 against backed-up dogfood
+workspaces. macOS-hosted proof is not a native runtime PASS.

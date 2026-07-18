@@ -1,0 +1,332 @@
+{
+  "metadata": {
+    "harness_version": 1,
+    "binary": "/Users/arkadijcukavin/PycharmProjects/aopmem-cli/target/debug/aopmem",
+    "binary_sha256": "083c441e17e3a3832d5b57f1115306ff6aca4dfdbcb0374fddd21f7b6f8ef885",
+    "binary_version": "aopmem 0.2.0-rc5",
+    "host": {
+      "system": "Darwin",
+      "release": "25.5.0",
+      "machine": "arm64",
+      "python": "3.14.5"
+    },
+    "samples": 15,
+    "warmups": 3,
+    "corpora": [
+      {
+        "name": "small",
+        "extra_active_rules": 16
+      },
+      {
+        "name": "medium",
+        "extra_active_rules": 64
+      },
+      {
+        "name": "large",
+        "extra_active_rules": 256
+      }
+    ],
+    "method": "wall-clock subprocess duration; median; nearest-rank p95",
+    "setup": "isolated temporary AOPMEM_HOME and git repo; public CLI commands only",
+    "structural_checks": {
+      "status": "PASS",
+      "checks": {
+        "tool_candidate_limit": "MAX_TOOL_CREATION_GUARD_CANDIDATES: usize = 64",
+        "tool_file_limit": "MAX_TOOL_IMPLEMENTATION_FILES: usize = 256",
+        "tool_hash_once": "fn hash_open_file_once",
+        "task_budget": "TASK_RECALL_SOFT_BUDGET_BYTES"
+      },
+      "conclusion": "bounded shortlist/file/budget guards present; normal tool run has no fingerprint path"
+    }
+  },
+  "results": [
+    {
+      "corpus": "large",
+      "metric": "audit_repair",
+      "samples": 15,
+      "warmups": 3,
+      "median_ns": 16521916,
+      "median_ms": 16.522,
+      "p95_nearest_rank_ns": 28213500,
+      "p95_nearest_rank_ms": 28.213,
+      "min_ms": 14.568,
+      "max_ms": 28.213
+    },
+    {
+      "corpus": "large",
+      "metric": "canonical_resolution_fast_path",
+      "samples": 15,
+      "warmups": 3,
+      "median_ns": 6163500,
+      "median_ms": 6.163,
+      "p95_nearest_rank_ns": 9453041,
+      "p95_nearest_rank_ms": 9.453,
+      "min_ms": 5.622,
+      "max_ms": 9.453
+    },
+    {
+      "corpus": "large",
+      "metric": "debug_export",
+      "samples": 15,
+      "warmups": 3,
+      "median_ns": 75128459,
+      "median_ms": 75.128,
+      "p95_nearest_rank_ns": 103091584,
+      "p95_nearest_rank_ms": 103.092,
+      "min_ms": 65.635,
+      "max_ms": 103.092
+    },
+    {
+      "corpus": "large",
+      "metric": "duplicate_preflight",
+      "samples": 15,
+      "warmups": 3,
+      "median_ns": 19464375,
+      "median_ms": 19.464,
+      "p95_nearest_rank_ns": 35033333,
+      "p95_nearest_rank_ms": 35.033,
+      "min_ms": 16.757,
+      "max_ms": 35.033
+    },
+    {
+      "corpus": "large",
+      "metric": "platform_check",
+      "samples": 15,
+      "warmups": 3,
+      "median_ns": 41638958,
+      "median_ms": 41.639,
+      "p95_nearest_rank_ns": 49531208,
+      "p95_nearest_rank_ms": 49.531,
+      "min_ms": 37.514,
+      "max_ms": 49.531
+    },
+    {
+      "corpus": "large",
+      "metric": "task_apply",
+      "samples": 15,
+      "warmups": 3,
+      "median_ns": 35062000,
+      "median_ms": 35.062,
+      "p95_nearest_rank_ns": 40391833,
+      "p95_nearest_rank_ms": 40.392,
+      "min_ms": 28.654,
+      "max_ms": 40.392
+    },
+    {
+      "corpus": "large",
+      "metric": "task_complete",
+      "samples": 15,
+      "warmups": 3,
+      "median_ns": 32182583,
+      "median_ms": 32.183,
+      "p95_nearest_rank_ns": 81662458,
+      "p95_nearest_rank_ms": 81.662,
+      "min_ms": 29.895,
+      "max_ms": 81.662
+    },
+    {
+      "corpus": "large",
+      "metric": "task_start",
+      "samples": 15,
+      "warmups": 3,
+      "median_ns": 46891083,
+      "median_ms": 46.891,
+      "p95_nearest_rank_ns": 65797166,
+      "p95_nearest_rank_ms": 65.797,
+      "min_ms": 43.195,
+      "max_ms": 65.797
+    },
+    {
+      "corpus": "medium",
+      "metric": "audit_repair",
+      "samples": 15,
+      "warmups": 3,
+      "median_ns": 11612375,
+      "median_ms": 11.612,
+      "p95_nearest_rank_ns": 14002041,
+      "p95_nearest_rank_ms": 14.002,
+      "min_ms": 10.862,
+      "max_ms": 14.002
+    },
+    {
+      "corpus": "medium",
+      "metric": "canonical_resolution_fast_path",
+      "samples": 15,
+      "warmups": 3,
+      "median_ns": 5644334,
+      "median_ms": 5.644,
+      "p95_nearest_rank_ns": 6487500,
+      "p95_nearest_rank_ms": 6.487,
+      "min_ms": 5.306,
+      "max_ms": 6.487
+    },
+    {
+      "corpus": "medium",
+      "metric": "debug_export",
+      "samples": 15,
+      "warmups": 3,
+      "median_ns": 33927625,
+      "median_ms": 33.928,
+      "p95_nearest_rank_ns": 42791791,
+      "p95_nearest_rank_ms": 42.792,
+      "min_ms": 31.324,
+      "max_ms": 42.792
+    },
+    {
+      "corpus": "medium",
+      "metric": "duplicate_preflight",
+      "samples": 15,
+      "warmups": 3,
+      "median_ns": 13162333,
+      "median_ms": 13.162,
+      "p95_nearest_rank_ns": 14896042,
+      "p95_nearest_rank_ms": 14.896,
+      "min_ms": 12.191,
+      "max_ms": 14.896
+    },
+    {
+      "corpus": "medium",
+      "metric": "platform_check",
+      "samples": 15,
+      "warmups": 3,
+      "median_ns": 39594042,
+      "median_ms": 39.594,
+      "p95_nearest_rank_ns": 45851875,
+      "p95_nearest_rank_ms": 45.852,
+      "min_ms": 36.77,
+      "max_ms": 45.852
+    },
+    {
+      "corpus": "medium",
+      "metric": "task_apply",
+      "samples": 15,
+      "warmups": 3,
+      "median_ns": 21971084,
+      "median_ms": 21.971,
+      "p95_nearest_rank_ns": 23712209,
+      "p95_nearest_rank_ms": 23.712,
+      "min_ms": 19.754,
+      "max_ms": 23.712
+    },
+    {
+      "corpus": "medium",
+      "metric": "task_complete",
+      "samples": 15,
+      "warmups": 3,
+      "median_ns": 21161292,
+      "median_ms": 21.161,
+      "p95_nearest_rank_ns": 23340584,
+      "p95_nearest_rank_ms": 23.341,
+      "min_ms": 19.266,
+      "max_ms": 23.341
+    },
+    {
+      "corpus": "medium",
+      "metric": "task_start",
+      "samples": 15,
+      "warmups": 3,
+      "median_ns": 25525875,
+      "median_ms": 25.526,
+      "p95_nearest_rank_ns": 27967750,
+      "p95_nearest_rank_ms": 27.968,
+      "min_ms": 24.073,
+      "max_ms": 27.968
+    },
+    {
+      "corpus": "small",
+      "metric": "audit_repair",
+      "samples": 15,
+      "warmups": 3,
+      "median_ns": 10579166,
+      "median_ms": 10.579,
+      "p95_nearest_rank_ns": 11301375,
+      "p95_nearest_rank_ms": 11.301,
+      "min_ms": 10.05,
+      "max_ms": 11.301
+    },
+    {
+      "corpus": "small",
+      "metric": "canonical_resolution_fast_path",
+      "samples": 15,
+      "warmups": 3,
+      "median_ns": 5577250,
+      "median_ms": 5.577,
+      "p95_nearest_rank_ns": 6442042,
+      "p95_nearest_rank_ms": 6.442,
+      "min_ms": 5.176,
+      "max_ms": 6.442
+    },
+    {
+      "corpus": "small",
+      "metric": "debug_export",
+      "samples": 15,
+      "warmups": 3,
+      "median_ns": 25162125,
+      "median_ms": 25.162,
+      "p95_nearest_rank_ns": 28651750,
+      "p95_nearest_rank_ms": 28.652,
+      "min_ms": 21.927,
+      "max_ms": 28.652
+    },
+    {
+      "corpus": "small",
+      "metric": "duplicate_preflight",
+      "samples": 15,
+      "warmups": 3,
+      "median_ns": 11979375,
+      "median_ms": 11.979,
+      "p95_nearest_rank_ns": 13564250,
+      "p95_nearest_rank_ms": 13.564,
+      "min_ms": 11.365,
+      "max_ms": 13.564
+    },
+    {
+      "corpus": "small",
+      "metric": "platform_check",
+      "samples": 15,
+      "warmups": 3,
+      "median_ns": 37465083,
+      "median_ms": 37.465,
+      "p95_nearest_rank_ns": 40885625,
+      "p95_nearest_rank_ms": 40.886,
+      "min_ms": 34.797,
+      "max_ms": 40.886
+    },
+    {
+      "corpus": "small",
+      "metric": "task_apply",
+      "samples": 15,
+      "warmups": 3,
+      "median_ns": 19214875,
+      "median_ms": 19.215,
+      "p95_nearest_rank_ns": 24077584,
+      "p95_nearest_rank_ms": 24.078,
+      "min_ms": 18.21,
+      "max_ms": 24.078
+    },
+    {
+      "corpus": "small",
+      "metric": "task_complete",
+      "samples": 15,
+      "warmups": 3,
+      "median_ns": 18782208,
+      "median_ms": 18.782,
+      "p95_nearest_rank_ns": 21873042,
+      "p95_nearest_rank_ms": 21.873,
+      "min_ms": 18.287,
+      "max_ms": 21.873
+    },
+    {
+      "corpus": "small",
+      "metric": "task_start",
+      "samples": 15,
+      "warmups": 3,
+      "median_ns": 20038709,
+      "median_ms": 20.039,
+      "p95_nearest_rank_ns": 22061208,
+      "p95_nearest_rank_ms": 22.061,
+      "min_ms": 19.231,
+      "max_ms": 22.061
+    }
+  ]
+}

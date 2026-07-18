@@ -113,20 +113,31 @@ tool output, environment variables, secrets, tokens, or cookies.
 
 Shows the same fact-only report as `aopmem observe report --json`, including:
 
+- task start, context apply, missing-apply, complete, and failure facts;
+- applied context by type and applied gate, rule, workflow, tool, correction,
+  and failure-mode counts;
 - recall failures, empty results, overflow, and continuation;
 - FTS and graph traversal usage;
 - selected node types and top selected workflows, tools, and failure modes;
 - explicit useful, partial, and wrong feedback;
 - tool success, failure, timeout, and repeated errors;
 - reflection proposal state;
+- duplicate blocks, alias resolutions, unresolved overlaps, and the last
+  successful audit repair;
 - adapter drift, pending audit, doctor, verify, cleanup, and MCP facts.
 
 The UI does not calculate or display a product score.
 
 ### Tools / MCP
 
-Shows registered tool and MCP summaries. It includes status, owner or kind,
-side effects, read/write description, and approval requirement.
+Shows registered tool and MCP summaries. Tool rows add the resolved canonical
+tool, direct aliases, duplicate classifications, superseded duplicates, and
+unresolved overlaps. The duplicate plan is bounded and read-only. If its
+filesystem evidence is unavailable, the response says
+`duplicate_analysis_complete: false` and `complete: false` instead of
+inventing classifications.
+MCP rows include status, kind, side effects, read/write description, and
+approval requirement.
 
 This section cannot validate, approve, run, install, update, or remove a tool
 or MCP profile.

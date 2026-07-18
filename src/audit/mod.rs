@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write as IoWrite};
@@ -7,11 +8,14 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use rusqlite::types::ValueRef;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
+
+use crate::redaction::{TaggedValueRedactionError, TaggedValueRedactor};
 
 mod anchored;
 mod anchored_git;
 
-pub(crate) use anchored::{AnchoredDir, CommittedPublishOutcome, WorkspaceIdentity};
+pub(crate) use anchored::{AnchoredDir, WorkspaceIdentity};
 
 pub const NODE_CREATED_EVENT: &str = "node.created";
 pub const NODE_UPDATED_EVENT: &str = "node.updated";
@@ -272,10 +276,37 @@ pub struct SqlSnapshotReport {
     pub bytes_written: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitCommitOutcome {
+    Created,
+    Unchanged,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditRepairStatus {
+    AlreadyClean,
+    Repaired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AuditRepairReport {
+    pub status: AuditRepairStatus,
+    pub duration_ms: u64,
+    pub bytes_written: u64,
+    pub sha256: Option<String>,
+    pub git_commit: Option<GitCommitOutcome>,
+    pub marker_present_before: bool,
+    pub marker_present_after: bool,
+    pub operational_db_written: bool,
+}
+
 #[derive(Debug)]
 pub enum SnapshotError {
     Db(rusqlite::Error),
     Io(std::io::Error),
+    Redaction(TaggedValueRedactionError),
 }
 
 impl fmt::Display for SnapshotError {
@@ -283,6 +314,7 @@ impl fmt::Display for SnapshotError {
         match self {
             Self::Db(error) => write!(formatter, "{error}"),
             Self::Io(error) => write!(formatter, "{error}"),
+            Self::Redaction(error) => write!(formatter, "{error}"),
         }
     }
 }
@@ -348,6 +380,12 @@ impl From<rusqlite::Error> for SnapshotError {
 impl From<std::io::Error> for SnapshotError {
     fn from(error: std::io::Error) -> Self {
         Self::Io(error)
+    }
+}
+
+impl From<TaggedValueRedactionError> for SnapshotError {
+    fn from(error: TaggedValueRedactionError) -> Self {
+        Self::Redaction(error)
     }
 }
 
@@ -454,15 +492,178 @@ pub(crate) fn write_sql_snapshot_locked(
         create_temporary_snapshot,
         write_sql_dump,
         atomic_publish,
+        clear_pending_snapshot_marker_locked,
     )
+}
+
+/// Repairs one pending audit snapshot without taking the workspace mutation lock.
+///
+/// The caller must supply a read-only operational connection. An absent marker
+/// is a successful no-op. Every failure before the final marker removal leaves
+/// the marker in place.
+pub fn repair_sql_snapshot(
+    audit_git_dir: &Path,
+    connection: &Connection,
+) -> Result<AuditRepairReport, SnapshotError> {
+    let started_at = Instant::now();
+    let lock = acquire_snapshot_lock(audit_git_dir)?;
+    repair_sql_snapshot_locked(connection, &lock, started_at)
+}
+
+pub(crate) fn repair_sql_snapshot_locked(
+    connection: &Connection,
+    lock: &SnapshotLock,
+    started_at: Instant,
+) -> Result<AuditRepairReport, SnapshotError> {
+    if lock
+        .audit_root()
+        .open_regular_optional(PENDING_SNAPSHOT_MARKER_FILE_NAME)?
+        .is_none()
+    {
+        return Ok(AuditRepairReport {
+            status: AuditRepairStatus::AlreadyClean,
+            duration_ms: elapsed_ms(started_at),
+            bytes_written: 0,
+            sha256: None,
+            git_commit: None,
+            marker_present_before: false,
+            marker_present_after: false,
+            operational_db_written: false,
+        });
+    }
+
+    connection.pragma_update(None, "query_only", true)?;
+    let (bytes_written, digest, git_commit) = repair_pending_snapshot_locked(connection, lock)?;
+    finish_repair_locked(lock, clear_pending_snapshot_marker_locked)?;
+    Ok(AuditRepairReport {
+        status: AuditRepairStatus::Repaired,
+        duration_ms: elapsed_ms(started_at),
+        bytes_written,
+        sha256: Some(digest),
+        git_commit: Some(git_commit),
+        marker_present_before: true,
+        marker_present_after: false,
+        operational_db_written: false,
+    })
+}
+
+fn finish_repair_locked(
+    lock: &SnapshotLock,
+    clear: impl FnOnce(&SnapshotLock) -> Result<(), SnapshotError>,
+) -> Result<(), SnapshotError> {
+    lock.audit_root().sync()?;
+    if let Err(error) = clear(lock) {
+        let _ = ensure_pending_snapshot_marker_locked(lock);
+        return Err(error);
+    }
+    Ok(())
+}
+
+pub(crate) fn pending_snapshot_marker_locked(lock: &SnapshotLock) -> Result<bool, SnapshotError> {
+    Ok(lock
+        .audit_root()
+        .open_regular_optional(PENDING_SNAPSHOT_MARKER_FILE_NAME)?
+        .is_some())
+}
+
+fn repair_pending_snapshot_locked(
+    connection: &Connection,
+    lock: &SnapshotLock,
+) -> Result<(u64, String, GitCommitOutcome), SnapshotError> {
+    repair_pending_snapshot_with_hooks_locked(
+        connection,
+        lock,
+        atomic_publish,
+        |root, expected| {
+            let published = digest_regular(root.open_regular(SNAPSHOT_FILE_NAME)?)?;
+            if published == expected {
+                Ok(())
+            } else {
+                Err(io::Error::other(
+                    "published audit snapshot digest does not match streamed digest",
+                ))
+            }
+        },
+        anchored_git::commit_snapshot,
+    )
+}
+
+fn repair_pending_snapshot_with_hooks_locked(
+    connection: &Connection,
+    lock: &SnapshotLock,
+    publish: impl FnOnce(&AnchoredDir, File, &str) -> io::Result<()>,
+    validate: impl FnOnce(&AnchoredDir, &str) -> io::Result<()>,
+    commit: impl FnOnce(&AnchoredDir) -> io::Result<GitCommitOutcome>,
+) -> Result<(u64, String, GitCommitOutcome), SnapshotError> {
+    let root = lock.audit_root();
+    let temporary_name = snapshot_temporary_name();
+    let result = (|| {
+        let file = create_temporary_snapshot(root, &temporary_name)?;
+        let mut writer = CountingWriter::new(BufWriter::new(file));
+        let read_transaction = connection.unchecked_transaction()?;
+        write_sql_dump(&mut writer, &read_transaction)?;
+        writer.flush()?;
+        writer.inner.get_ref().sync_all()?;
+        read_transaction.commit()?;
+        let bytes_written = writer.bytes_written;
+        let streamed_digest = hex_digest(writer.hasher.clone().finalize().as_slice());
+        let temporary = writer
+            .inner
+            .into_inner()
+            .map_err(std::io::IntoInnerError::into_error)?;
+        publish(root, temporary, &temporary_name)?;
+        validate(root, &streamed_digest)?;
+        let git_commit = commit(root)?;
+        Ok((bytes_written, streamed_digest, git_commit))
+    })();
+    if result.is_err() {
+        let _ = root.remove_regular(&temporary_name);
+    }
+    result
+}
+
+fn digest_regular(mut file: File) -> io::Result<String> {
+    use std::io::Read;
+
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 32 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex_digest(hasher.finalize().as_slice()))
+}
+
+fn hex_digest(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write;
+        let _ = write!(output, "{byte:02x}");
+    }
+    output
+}
+
+fn elapsed_ms(started_at: Instant) -> u64 {
+    u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 fn create_temporary_snapshot(root: &AnchoredDir, name: &str) -> io::Result<fs::File> {
     root.create_new_regular(name)
 }
 
-fn atomic_publish(root: &AnchoredDir, temporary: &File, name: &str) -> io::Result<()> {
-    root.replace_regular(temporary, name, SNAPSHOT_FILE_NAME)
+fn atomic_publish(root: &AnchoredDir, temporary: File, name: &str) -> io::Result<()> {
+    crate::platform_publish::publish_regular(
+        root,
+        temporary,
+        OsStr::new(name),
+        OsStr::new(SNAPSHOT_FILE_NAME),
+        crate::platform_publish::PublishMode::ReplaceOrCreate,
+    )
+    .map_err(crate::platform_publish::PublishError::into_io_error)
+    .and_then(crate::platform_publish::require_committed_validated_clean)
 }
 
 #[cfg(test)]
@@ -474,7 +675,7 @@ fn write_sql_snapshot_with_hooks(
         &mut CountingWriter<BufWriter<fs::File>>,
         &Connection,
     ) -> Result<(), SnapshotError>,
-    publish: impl FnOnce(&AnchoredDir, &File, &str) -> io::Result<()>,
+    publish: impl FnOnce(&AnchoredDir, File, &str) -> io::Result<()>,
 ) -> Result<SqlSnapshotReport, SnapshotError> {
     let lock = acquire_snapshot_lock(audit_git_dir)?;
     write_sql_snapshot_with_hooks_locked(
@@ -484,6 +685,7 @@ fn write_sql_snapshot_with_hooks(
         open_temporary,
         dump,
         publish,
+        clear_pending_snapshot_marker_locked,
     )
 }
 
@@ -496,7 +698,8 @@ fn write_sql_snapshot_with_hooks_locked(
         &mut CountingWriter<BufWriter<fs::File>>,
         &Connection,
     ) -> Result<(), SnapshotError>,
-    publish: impl FnOnce(&AnchoredDir, &File, &str) -> io::Result<()>,
+    publish: impl FnOnce(&AnchoredDir, File, &str) -> io::Result<()>,
+    clear: impl FnOnce(&SnapshotLock) -> Result<(), SnapshotError>,
 ) -> Result<SqlSnapshotReport, SnapshotError> {
     let started_at = Instant::now();
     let root = lock.audit_root();
@@ -514,8 +717,11 @@ fn write_sql_snapshot_with_hooks_locked(
         writer.inner.get_ref().sync_all()?;
         read_transaction.commit()?;
         let bytes_written = writer.bytes_written;
-        publish(root, writer.inner.get_ref(), &temporary_name)?;
-        drop(writer);
+        let buffered = writer.inner;
+        let temporary = buffered
+            .into_inner()
+            .map_err(std::io::IntoInnerError::into_error)?;
+        publish(root, temporary, &temporary_name)?;
         Ok(bytes_written)
     })();
 
@@ -527,8 +733,8 @@ fn write_sql_snapshot_with_hooks_locked(
         }
     };
 
-    anchored_git::commit_snapshot(root)?;
-    clear_pending_snapshot_marker_locked(lock)?;
+    let _ = anchored_git::commit_snapshot(root)?;
+    finish_repair_locked(lock, clear)?;
 
     Ok(SqlSnapshotReport {
         path,
@@ -540,6 +746,7 @@ fn write_sql_snapshot_with_hooks_locked(
 struct CountingWriter<W> {
     inner: W,
     bytes_written: u64,
+    hasher: Sha256,
 }
 
 impl<W> CountingWriter<W> {
@@ -547,6 +754,7 @@ impl<W> CountingWriter<W> {
         Self {
             inner,
             bytes_written: 0,
+            hasher: Sha256::new(),
         }
     }
 }
@@ -554,6 +762,7 @@ impl<W> CountingWriter<W> {
 impl<W: IoWrite> IoWrite for CountingWriter<W> {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
         let written = self.inner.write(buffer)?;
+        self.hasher.update(&buffer[..written]);
         self.bytes_written = self
             .bytes_written
             .saturating_add(u64::try_from(written).unwrap_or(u64::MAX));
@@ -683,6 +892,7 @@ fn write_sql_dump<W: IoWrite>(
     writer: &mut W,
     connection: &Connection,
 ) -> Result<(), SnapshotError> {
+    let redactor = TaggedValueRedactor::load(connection)?;
     writer.write_all(b"BEGIN TRANSACTION;\nPRAGMA defer_foreign_keys = ON;\n")?;
 
     let mut schema_statement = connection.prepare(
@@ -731,12 +941,12 @@ fn write_sql_dump<W: IoWrite>(
 
     for table_name in table_names {
         if table_name != FTS_NODES_TABLE {
-            append_table_rows(writer, connection, &table_name)?;
+            append_table_rows(writer, connection, &table_name, &redactor)?;
         }
     }
 
     if has_table(connection, "sqlite_sequence")? {
-        append_sqlite_sequence_rows(writer, connection)?;
+        append_sqlite_sequence_rows(writer, connection, &redactor)?;
     }
 
     if has_fts_nodes {
@@ -802,6 +1012,7 @@ fn has_table(connection: &Connection, table_name: &str) -> rusqlite::Result<bool
 fn append_sqlite_sequence_rows<W: IoWrite>(
     writer: &mut W,
     connection: &Connection,
+    redactor: &TaggedValueRedactor,
 ) -> Result<(), SnapshotError> {
     writer.write_all(b"DELETE FROM \"sqlite_sequence\";\n")?;
     let mut statement =
@@ -809,9 +1020,9 @@ fn append_sqlite_sequence_rows<W: IoWrite>(
     let mut rows = statement.query([])?;
     while let Some(row) = rows.next()? {
         writer.write_all(b"INSERT INTO \"sqlite_sequence\" (\"name\", \"seq\") VALUES (")?;
-        write_sql_value(writer, row.get_ref(0)?)?;
+        write_sql_value(writer, row.get_ref(0)?, redactor)?;
         writer.write_all(b", ")?;
-        write_sql_value(writer, row.get_ref(1)?)?;
+        write_sql_value(writer, row.get_ref(1)?, redactor)?;
         writer.write_all(b");\n")?;
     }
     Ok(())
@@ -821,6 +1032,7 @@ fn append_table_rows<W: IoWrite>(
     writer: &mut W,
     connection: &Connection,
     table_name: &str,
+    redactor: &TaggedValueRedactor,
 ) -> Result<(), SnapshotError> {
     let preview_query = format!("SELECT * FROM {} LIMIT 0;", quote_identifier(table_name));
     let preview = connection.prepare(&preview_query)?;
@@ -867,7 +1079,7 @@ fn append_table_rows<W: IoWrite>(
             if index > 0 {
                 writer.write_all(b", ")?;
             }
-            write_sql_value(writer, row.get_ref(index)?)?;
+            write_sql_value(writer, row.get_ref(index)?, redactor)?;
         }
 
         writer.write_all(b");\n")?;
@@ -880,7 +1092,11 @@ fn quote_identifier(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
 }
 
-fn write_sql_value<W: IoWrite>(writer: &mut W, value: ValueRef<'_>) -> Result<(), SnapshotError> {
+fn write_sql_value<W: IoWrite>(
+    writer: &mut W,
+    value: ValueRef<'_>,
+    redactor: &TaggedValueRedactor,
+) -> Result<(), SnapshotError> {
     match value {
         ValueRef::Null => writer.write_all(b"NULL")?,
         ValueRef::Integer(number) => write!(writer, "{number}")?,
@@ -891,8 +1107,14 @@ fn write_sql_value<W: IoWrite>(writer: &mut W, value: ValueRef<'_>) -> Result<()
             writer.write_all(b"-9.0e999")?;
         }
         ValueRef::Real(number) => write!(writer, "{number:?}")?,
-        ValueRef::Text(text) => write_sql_text(writer, text)?,
-        ValueRef::Blob(bytes) => write_hex_literal(writer, bytes)?,
+        ValueRef::Text(text) => {
+            let redacted = redactor.redact_bytes_with_json_copies(text)?;
+            write_sql_text(writer, &redacted)?;
+        }
+        ValueRef::Blob(bytes) => {
+            let redacted = redactor.redact_bytes_with_json_copies(bytes)?;
+            write_hex_literal(writer, &redacted)?;
+        }
     }
     Ok(())
 }
@@ -1286,6 +1508,84 @@ mod tests {
     }
 
     #[test]
+    fn stage_010_sql_dump_scrubs_tagged_body_and_json_proposal_copy() {
+        let source = migrated_connection();
+        let secret = "TEST_ONLY_STAGE010_AUDIT_'quote'\\slash\nline";
+        source
+            .execute(
+                "INSERT INTO nodes (
+                    node_type, status, title, body, source_ref,
+                    confidence, trust_level
+                 ) VALUES (
+                    'raw_note', 'active', 'Authorized test credential',
+                    ?1, 'source=user_instruction', 1.0, 'high'
+                 )",
+                [secret],
+            )
+            .expect("tagged secret node should insert");
+        let secret_node_id = source.last_insert_rowid();
+        source
+            .execute(
+                "INSERT INTO tags (node_id, tag) VALUES (?1, ?2)",
+                params![secret_node_id, crate::redaction::TEST_SECRET_TAG],
+            )
+            .expect("tagged secret tag should insert");
+        let proposal = serde_json::json!({
+            "session_id": "stage-010",
+            "items": [{"op": "create_node", "body": secret}],
+        })
+        .to_string();
+        source
+            .execute(
+                "INSERT INTO nodes (
+                    node_type, status, title, summary, body
+                 ) VALUES (
+                    'raw_note', 'draft', 'Reflection proposal stage-010',
+                    'reflection_proposal_v1', ?1
+                 )",
+                [proposal],
+            )
+            .expect("proposal copy should insert");
+
+        let dump = build_sql_dump(&source).expect("redacted SQL dump should build");
+        assert!(!dump.contains(secret));
+        let json_escaped = serde_json::to_string(secret)
+            .expect("fake secret should encode")
+            .trim_matches('"')
+            .to_string();
+        assert!(!dump.contains(&json_escaped));
+        assert!(
+            dump.matches(crate::redaction::TEST_SECRET_REDACTION_MARKER)
+                .count()
+                >= 2,
+            "tagged body and proposal copy must both be scrubbed"
+        );
+
+        let stored: String = source
+            .query_row(
+                "SELECT body FROM nodes WHERE id = ?1",
+                [secret_node_id],
+                |row| row.get(0),
+            )
+            .expect("operational exact body should remain");
+        assert_eq!(stored, secret);
+
+        let restored = restore_sql_dump(&dump);
+        let mut statement = restored
+            .prepare("SELECT body FROM nodes WHERE body IS NOT NULL ORDER BY id")
+            .expect("restored bodies should prepare");
+        let restored_bodies = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("restored bodies should query")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("restored bodies should collect");
+        assert!(restored_bodies.iter().all(|body| !body.contains(secret)));
+        assert!(restored_bodies
+            .iter()
+            .any(|body| body.contains(crate::redaction::TEST_SECRET_REDACTION_MARKER)));
+    }
+
+    #[test]
     fn sql_dump_restores_canonical_rows_and_rebuilds_fts() {
         let source = migrated_connection();
         source
@@ -1385,6 +1685,7 @@ mod tests {
             "events",
             "registries",
             "tool_contracts",
+            "tool_aliases",
             "mcp_profiles",
             "sqlite_sequence",
         ] {
@@ -1559,6 +1860,186 @@ mod tests {
     }
 
     #[test]
+    fn stage_019_repair_is_read_only_redacted_and_idempotent() {
+        let root = temp_path("stage-019-repair");
+        let audit_git_dir = root.join("audit-git");
+        let db_path = root.join("memory.sqlite");
+        fs::create_dir_all(&audit_git_dir).expect("audit dir should create");
+        let mut writer = Connection::open(&db_path).expect("fixture DB should open");
+        schema::apply_migrations(&mut writer).expect("migrations should apply");
+        writer
+            .execute(
+                "INSERT INTO nodes (id, node_type, status, title, body)
+                 VALUES (1, 'fact', 'active', 'secret', 'STAGE019_SECRET');",
+                [],
+            )
+            .expect("secret node should insert");
+        writer
+            .execute(
+                "INSERT INTO tags (node_id, tag) VALUES (1, 'sensitivity:test_secret');",
+                [],
+            )
+            .expect("secret tag should insert");
+        drop(writer);
+        let before = fs::read(&db_path).expect("DB bytes should read");
+        let canonical_db_path = db_path.canonicalize().expect("DB path should canonicalize");
+        let reader = Connection::open_with_flags(
+            &canonical_db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .expect("read-only DB should open");
+
+        ensure_pending_snapshot_marker(&audit_git_dir).expect("marker should create");
+        let first = repair_sql_snapshot(&audit_git_dir, &reader).expect("repair should succeed");
+        assert_eq!(first.status, AuditRepairStatus::Repaired);
+        assert_eq!(first.git_commit, Some(GitCommitOutcome::Created));
+        assert!(!first.marker_present_after);
+        let snapshot = fs::read_to_string(audit_git_dir.join(SNAPSHOT_FILE_NAME))
+            .expect("snapshot should read");
+        assert!(!snapshot.contains("STAGE019_SECRET"));
+        assert!(snapshot.contains("<TEST_SECRET_REDACTED>"));
+        assert_eq!(fs::read(&db_path).expect("DB bytes should reread"), before);
+        assert_eq!(
+            reader
+                .query_row("PRAGMA query_only;", [], |row| row.get::<_, i64>(0))
+                .expect("query_only should read"),
+            1
+        );
+
+        ensure_pending_snapshot_marker(&audit_git_dir).expect("marker should recreate");
+        let second = repair_sql_snapshot(&audit_git_dir, &reader).expect("replay should succeed");
+        assert_eq!(second.git_commit, Some(GitCommitOutcome::Unchanged));
+        assert_eq!(second.sha256, first.sha256);
+        let clean = repair_sql_snapshot(&audit_git_dir, &reader).expect("clean replay should pass");
+        assert_eq!(clean.status, AuditRepairStatus::AlreadyClean);
+        assert_eq!(clean.bytes_written, 0);
+        assert_eq!(clean.git_commit, None);
+        assert_eq!(fs::read(&db_path).expect("DB bytes should reread"), before);
+        fs::remove_dir_all(root).expect("fixture should remove");
+    }
+
+    #[test]
+    fn stage_019_core_failures_retain_pending_marker() {
+        fn fresh_case(name: &str) -> (PathBuf, Connection, SnapshotLock) {
+            let path = temp_path(name);
+            fs::create_dir_all(&path).expect("audit root should create");
+            let connection = migrated_connection();
+            ensure_pending_snapshot_marker(&path).expect("marker should create");
+            let lock = acquire_snapshot_lock(&path).expect("snapshot lock should acquire");
+            (path, connection, lock)
+        }
+
+        let (publish_path, publish_connection, publish_lock) = fresh_case("stage-019-publish-87");
+        let publish_error = repair_pending_snapshot_with_hooks_locked(
+            &publish_connection,
+            &publish_lock,
+            |_root, _temporary, _name| Err(io::Error::from_raw_os_error(87)),
+            |_root, _digest| Ok(()),
+            |_root| Ok(GitCommitOutcome::Created),
+        )
+        .expect_err("publish error 87 should fail");
+        assert_eq!(
+            snapshot_io_error_for_test(&publish_error).and_then(io::Error::raw_os_error),
+            Some(87)
+        );
+        assert!(pending_snapshot_marker_locked(&publish_lock).expect("marker should inspect"));
+        drop(publish_lock);
+        fs::remove_dir_all(publish_path).expect("publish case should remove");
+
+        let (digest_path, digest_connection, digest_lock) = fresh_case("stage-019-digest-mismatch");
+        repair_pending_snapshot_with_hooks_locked(
+            &digest_connection,
+            &digest_lock,
+            atomic_publish,
+            |_root, _digest| Err(io::Error::other("injected digest mismatch")),
+            |_root| Ok(GitCommitOutcome::Created),
+        )
+        .expect_err("digest mismatch should fail");
+        assert!(pending_snapshot_marker_locked(&digest_lock).expect("marker should inspect"));
+        drop(digest_lock);
+        fs::remove_dir_all(digest_path).expect("digest case should remove");
+
+        let (git_path, git_connection, git_lock) = fresh_case("stage-019-git-failure");
+        repair_pending_snapshot_with_hooks_locked(
+            &git_connection,
+            &git_lock,
+            atomic_publish,
+            |_root, _digest| Ok(()),
+            |_root| Err(io::Error::other("injected Git failure")),
+        )
+        .expect_err("Git failure should fail");
+        assert!(pending_snapshot_marker_locked(&git_lock).expect("marker should inspect"));
+        drop(git_lock);
+        fs::remove_dir_all(git_path).expect("Git case should remove");
+
+        let (clear_path, _clear_connection, clear_lock) = fresh_case("stage-019-clear-failure");
+        finish_repair_locked(&clear_lock, |lock| {
+            clear_pending_snapshot_marker_locked(lock)?;
+            Err(io::Error::other("injected clear durability failure").into())
+        })
+        .expect_err("clear failure should fail");
+        assert!(pending_snapshot_marker_locked(&clear_lock).expect("marker should restore"));
+        drop(clear_lock);
+        fs::remove_dir_all(clear_path).expect("clear case should remove");
+    }
+
+    #[test]
+    fn stage_020_normal_snapshot_restores_marker_after_post_remove_clear_failure() {
+        let audit_git_dir = temp_path("stage-020-normal-clear-failure");
+        fs::create_dir_all(&audit_git_dir).expect("audit root should create");
+        let connection = migrated_connection();
+        let lock = acquire_snapshot_lock(&audit_git_dir).expect("snapshot lock should acquire");
+
+        let error = write_sql_snapshot_with_hooks_locked(
+            &audit_git_dir,
+            &connection,
+            &lock,
+            create_temporary_snapshot,
+            write_sql_dump,
+            atomic_publish,
+            |lock| {
+                clear_pending_snapshot_marker_locked(lock)?;
+                assert!(
+                    !pending_snapshot_marker_locked(lock)?,
+                    "injected failure must happen after marker removal"
+                );
+                Err(io::Error::other("injected post-remove durability failure").into())
+            },
+        )
+        .expect_err("post-remove clear failure should fail");
+
+        assert!(error
+            .to_string()
+            .contains("injected post-remove durability failure"));
+        assert!(
+            pending_snapshot_marker_locked(&lock).expect("restored marker should inspect"),
+            "every failed normal snapshot must retain or restore its marker"
+        );
+        assert!(
+            fs::read_to_string(audit_git_dir.join(SNAPSHOT_FILE_NAME))
+                .expect("committed snapshot should read")
+                .contains("COMMIT;"),
+            "snapshot publication should remain committed"
+        );
+        assert_eq!(
+            anchored_git::commit_snapshot(lock.audit_root())
+                .expect("replaying committed Git snapshot should succeed"),
+            GitCommitOutcome::Unchanged,
+            "Git audit commit must already be durable before marker clear"
+        );
+
+        drop(lock);
+        fs::remove_dir_all(audit_git_dir).expect("fixture should remove");
+    }
+
+    fn snapshot_io_error_for_test(error: &SnapshotError) -> Option<&io::Error> {
+        match error {
+            SnapshotError::Io(error) => Some(error),
+            SnapshotError::Db(_) | SnapshotError::Redaction(_) => None,
+        }
+    }
+
+    #[test]
     fn writer_failure_keeps_old_snapshot_marker_and_removes_temporary_file() {
         let connection = migrated_connection();
         let audit_git_dir = temp_path("writer-failure");
@@ -1574,7 +2055,7 @@ mod tests {
                 writer.write_all(b"partial dump")?;
                 Err(io::Error::other("injected writer failure").into())
             },
-            |root, temporary, name| root.replace_regular(temporary, name, SNAPSHOT_FILE_NAME),
+            atomic_publish,
         )
         .expect_err("writer failure should fail snapshot");
 
@@ -1601,7 +2082,7 @@ mod tests {
             &connection,
             |_root, _name| Err(io::Error::other("injected temp creation failure")),
             write_sql_dump,
-            |root, temporary, name| root.replace_regular(temporary, name, SNAPSHOT_FILE_NAME),
+            atomic_publish,
         )
         .expect_err("temporary file failure should fail snapshot");
 
@@ -2004,24 +2485,24 @@ mod tests {
             create_temporary_snapshot,
             write_sql_dump,
             |root, temporary, name| {
-                root.replace_regular(temporary, name, SNAPSHOT_FILE_NAME)?;
+                atomic_publish(root, temporary, name)?;
                 fs::rename(&audit_git_dir, &moved_audit_dir)?;
                 symlink(&outside, &audit_git_dir)?;
                 Ok(())
             },
         )
-        .expect("anchored snapshot should finish in the displaced original root");
+        .expect_err("changed audit root identity must fail closed before Git publication");
 
         assert!(moved_audit_dir.join(SNAPSHOT_FILE_NAME).is_file());
-        assert!(moved_audit_dir.join(".git").is_dir());
+        assert!(moved_audit_dir
+            .join(PENDING_SNAPSHOT_MARKER_FILE_NAME)
+            .is_file());
         assert!(!outside.join(SNAPSHOT_FILE_NAME).exists());
         assert!(!outside.join(".git").exists());
         assert_eq!(
             fs::read(&sentinel).expect("outside sentinel should read"),
             b"outside audit sentinel\n"
         );
-        git_success_for_test(&moved_audit_dir, &["fsck", "--full"]);
-
         fs::remove_file(&audit_git_dir).expect("replacement symlink should remove");
         fs::remove_dir_all(&moved_audit_dir).expect("moved audit root should remove");
         fs::remove_dir_all(&outside).expect("outside directory should remove");

@@ -12,7 +12,7 @@ Target:
 Required prebuilt artifact:
 
 ```text
-dist\aopmem-windows-x86_64\aopmem.exe
+dist\aopmem-windows-x86_64.exe
 ```
 
 Install target:
@@ -31,7 +31,7 @@ $OutputEncoding = [System.Text.UTF8Encoding]::new()
 
 $InstallDir = "$env:USERPROFILE\.aopmem\bin"
 New-Item -ItemType Directory -Force $InstallDir | Out-Null
-Copy-Item ".\dist\aopmem-windows-x86_64\aopmem.exe" "$InstallDir\aopmem.exe" -Force
+Copy-Item ".\dist\aopmem-windows-x86_64.exe" "$InstallDir\aopmem.exe" -Force
 
 & "$InstallDir\aopmem.exe" --version
 & "$InstallDir\aopmem.exe" --help
@@ -49,13 +49,13 @@ $OutputEncoding = [System.Text.UTF8Encoding]::new()
 
 $InstallDir = "$env:USERPROFILE\.aopmem\bin"
 New-Item -ItemType Directory -Force $InstallDir | Out-Null
-Copy-Item ".\dist\aopmem-windows-x86_64\aopmem.exe" "$InstallDir\aopmem.exe" -Force
+Copy-Item ".\dist\aopmem-windows-x86_64.exe" "$InstallDir\aopmem.exe" -Force
 
 & "$InstallDir\aopmem.exe" --version
 & "$InstallDir\aopmem.exe" --help
 
-$env:AOPMEM_HOME = "$env:TEMP\aopmem-rc3-home"
-$Repo = "$env:TEMP\aopmem-rc3-repo"
+$env:AOPMEM_HOME = "$env:TEMP\aopmem-rc5-home"
+$Repo = "$env:TEMP\aopmem-rc5-repo"
 
 Remove-Item -Recurse -Force $env:AOPMEM_HOME -ErrorAction SilentlyContinue
 Remove-Item -Recurse -Force $Repo -ErrorAction SilentlyContinue
@@ -66,7 +66,7 @@ Set-Location $Repo
 @"
 n
 n
-Тестовый Windows workspace для AOPMem rc3.
+Тестовый Windows workspace для AOPMem rc5.
 Пользователь проверяет установку; агент ведет operational memory.
 Вся папка рабочая; ничего запрещенного нет.
 "@ | & "$InstallDir\aopmem.exe" --json init
@@ -84,9 +84,15 @@ Select-String -Path "$env:AOPMEM_HOME\workspaces\*\audit-git\memory.sql" -Patter
 
 Expected result:
 
-- `aopmem 0.1.0`
+- `aopmem 0.2.0-rc5`
 - JSON `ok=true`, or healthy equivalent
 - `Test-Path "$Repo\.aopmem"` returns `False`
 - `$env:AOPMEM_HOME\workspaces\...` exists
 - `AGENTS.md` contains real managed AOPMem block
 - Russian text is stored as UTF-8, not `????`
+
+## Proof status
+
+This is a native Windows dogfood procedure. It remains
+`PENDING_DOGFOOD` until it is run on Windows 11 x64 with PowerShell 5.1.
+The macOS PE, import, and checksum checks do not prove the Windows runtime.

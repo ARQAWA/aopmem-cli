@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "scenario_id": "DOG-09",
+  "scenario_kind": "same_task_continuation",
+  "parent_agent": "codex-session:019f7540-f25d-7ec0-8f1a-2dafd9d64034",
+  "keeper_agent": "codex-exec:019f7542-0e8c-7611-a51b-66bd9ae4dff9",
+  "task": {
+    "task_id": "f0987ba7-5468-43de-aaa8-fbecd5f3844c",
+    "bundle_id": "9a2a18f2-597b-4eb7-8b0e-5e1fa748bf3c",
+    "workspace_key": "repo-fa31dced",
+    "mandatory_context_complete": true,
+    "retrieval_complete": true,
+    "budget_exhausted": false,
+    "applied_gate_ids": [2, 3, 10],
+    "applied_rule_ids": [11],
+    "selected_workflow_ids": [12],
+    "selected_tool_ids": [],
+    "apply_status": "applied",
+    "completion_result": "success"
+  },
+  "actions": [
+    {"seq": 1, "actor": "parent", "action": "instruction_read", "status": "ok"},
+    {"seq": 2, "actor": "parent", "action": "native_keeper_started", "status": "ok"},
+    {"seq": 3, "actor": "keeper", "action": "task_started", "status": "ok"},
+    {"seq": 4, "actor": "keeper", "action": "context_applied", "status": "ok"},
+    {"seq": 5, "actor": "parent", "action": "receipt_received", "status": "ok"},
+    {"seq": 6, "actor": "parent", "action": "first_turn_answered", "status": "ok"},
+    {"seq": 7, "actor": "parent", "action": "same_goal_followup_received", "status": "ok"},
+    {"seq": 8, "actor": "parent", "action": "continuation_reused_existing_task", "status": "ok"},
+    {"seq": 9, "actor": "parent", "action": "second_turn_answered", "status": "ok"},
+    {"seq": 10, "actor": "parent", "action": "task_completed_after_fail_closed_runtime_retry", "status": "ok"}
+  ],
+  "checks": {
+    "start_before_substantive_action": true,
+    "apply_before_substantive_action": true,
+    "mandatory_gate_applied": true,
+    "relevant_workflow_or_tool_selected": true,
+    "same_goal_classified_as_continuation": true,
+    "task_starts_across_two_turns": 1,
+    "context_applications_across_two_turns": 1,
+    "new_keeper_on_followup": 0,
+    "user_reminders_required": 0,
+    "duplicate_tools_created": 0,
+    "blanket_secret_refusals": 0,
+    "external_writes": 0
+  },
+  "final_answer_summary": "Kept one lifecycle across two user turns and added a short example without starting or applying memory a second time."
+}

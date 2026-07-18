@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "scenario_id": "DOG-04",
+  "scenario_kind": "code_modification_planning",
+  "parent_agent": "codex-exec:019f752d-b6d6-7143-9a83-0715ba7bd6a8",
+  "keeper_agent": "codex-exec:019f752e-197b-7541-94d7-4567d93ca61c",
+  "task": {
+    "task_id": "0294db58-5daf-4f54-85c8-8acdd6eebc57",
+    "bundle_id": "60661015-8631-4317-b50b-64341195ec63",
+    "workspace_key": "repo-fa31dced",
+    "mandatory_context_complete": true,
+    "retrieval_complete": true,
+    "budget_exhausted": false,
+    "applied_gate_ids": [2, 3, 10],
+    "applied_rule_ids": [11],
+    "selected_workflow_ids": [13],
+    "selected_tool_ids": [],
+    "apply_status": "applied",
+    "completion_result": "success"
+  },
+  "actions": [
+    {"seq": 1, "actor": "parent", "action": "instruction_read", "status": "ok"},
+    {"seq": 2, "actor": "parent", "action": "native_keeper_started", "status": "ok"},
+    {"seq": 3, "actor": "keeper", "action": "task_started", "status": "ok"},
+    {"seq": 4, "actor": "keeper", "action": "context_applied", "status": "ok"},
+    {"seq": 5, "actor": "parent", "action": "receipt_received", "status": "ok"},
+    {"seq": 6, "actor": "parent", "action": "project_file_read", "status": "ok", "path": "src/example.rs"},
+    {"seq": 7, "actor": "parent", "action": "modification_plan_only", "status": "ok"},
+    {"seq": 8, "actor": "parent", "action": "task_completed", "status": "ok"}
+  ],
+  "checks": {
+    "start_before_substantive_action": true,
+    "apply_before_substantive_action": true,
+    "mandatory_gate_applied": true,
+    "relevant_workflow_or_tool_selected": true,
+    "project_file_read_after_receipt": true,
+    "files_changed": 0,
+    "user_reminders_required": 0,
+    "duplicate_tools_created": 0,
+    "blanket_secret_refusals": 0,
+    "external_writes": 0
+  },
+  "final_answer_summary": "Proposed a four-step staging-mode change after reading only the requested file; changed no file."
+}

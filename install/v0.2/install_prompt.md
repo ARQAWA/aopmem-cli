@@ -1,17 +1,28 @@
-# AOPMem v0.2.0-rc4 install prompt
+# AOPMem v0.2.0-rc5 install prompt
 
-Use this prompt to install AOPMem v0.2.0-rc4 for the current project.
+Use this prompt to install AOPMem v0.2.0-rc5 for the current project.
 It supports a fresh install and an update from compatible AOPMem v0.1.0
 SQLite workspaces.
 
 ````text
-You are installing AOPMem v0.2.0-rc4 for the user's current project.
+You are installing AOPMem v0.2.0-rc5 for the user's current project.
 
 Complete the whole safe flow without pausing between normal steps.
 Do not run Codex CLI during installation.
 Do not open another terminal.
 Do not ask technical questions which can be detected.
 Do not ask for a final confirmation.
+
+The caller must explicitly provide both `AOPMEM_ACTIVE_ADAPTER` and
+`AOPMEM_ACTIVE_INSTRUCTION_FILE`. Accept only these exact pairs:
+
+- `codex` / `AGENTS.md`
+- `claude` / `CLAUDE.md`
+- `cursor` / `.cursor/rules/aopmem.mdc`
+- `copilot` / `.github/copilot-instructions.md`
+
+Do not guess a default adapter. Stop before any change if the pair is absent
+or mismatched. This is an install gate, not an onboarding question.
 
 Supported hosts:
 
@@ -51,7 +62,7 @@ Integrity rules:
 - Reject a missing, duplicate, malformed, or differently named line.
 - Verify SHA-256 before chmod or any binary execution.
 - Verify the downloaded binary reports exactly:
-  aopmem 0.2.0-rc4
+  aopmem 0.2.0-rc5
 - Never execute an unverified file.
 
 Path rules:
@@ -67,16 +78,20 @@ Path rules:
 Select the flow silently:
 
 1. No installed binary means fresh install.
-2. A compatible v0.1 binary reports exactly `aopmem 0.1.0`.
+2. A compatible installed binary reports exactly one of `aopmem 0.1.0`,
+   `aopmem 0.2.0-rc1`, `aopmem 0.2.0-rc2`, `aopmem 0.2.0-rc3`, or
+   `aopmem 0.2.0-rc4`.
    Recognize the known v0.1.0-rc3 release SHA-256. For another SHA-256,
    emit `NONCANONICAL_V010_BINARY`, require the durable full backup, and let
    staged `upgrade prepare` plus `upgrade plan` decide workspace compatibility.
-3. Any other installed version is unsupported. Stop without changing it.
+3. Any other installed version, including RC5 itself, is unsupported. Stop
+   without changing it.
 
 For macOS, use the supplied install/v0.2/install.sh.
 Pass the trusted base through AOPMEM_ASSET_BASE_URI.
 The script must use curl with fail, TLS 1.2, HTTPS-only initial and redirect
-protocols, shasum -a 256, chmod, private temp files, and same-directory mv.
+protocols, shasum -a 256, chmod, and private temp files. It must never replace
+the update binary with shell `mv`; only `aopmem upgrade publish --json` may do it.
 
 For Windows, use the supplied install/v0.2/install.ps1.
 Pass the trusted base through -AssetBaseUri or AOPMEM_ASSET_BASE_URI.
@@ -86,8 +101,8 @@ Invoke the system Windows PowerShell executable in the same console with
 the user or machine execution policy and must not open a new window.
 The script must configure TLS 1.2 and UTF-8, use
 Invoke-WebRequest -UseBasicParsing, inspect each redirect with automatic
-redirects disabled, use Get-FileHash, and publish with same-directory
-File.Replace.
+redirects disabled and use Get-FileHash. It must never call File.Replace or
+File.Move for the update binary; only `aopmem upgrade publish --json` may do it.
 
 Fresh flow:
 
@@ -95,10 +110,14 @@ Fresh flow:
 2. Publish it atomically in the user-level bin directory.
 3. Run the normal aopmem init flow in the current project.
 4. Let that CLI ask its existing five semantic questions.
-5. Run `aopmem adapter seed --json` and require `ok=true`.
+5. Run `aopmem adapter seed --file <selected-active-file> --json` and require
+   `ok=true`. It may write only the explicit selected adapter file.
 6. Run `aopmem doctor --json` and require `ok=true`, `healthy=true`.
 7. Run `aopmem verify --json` and require `ok=true`, `clean=true`.
-8. Print one short final status.
+8. Run secure-stdin `aopmem task start --query-stdin --json` and require a
+   complete receipt with bundle id and memory revision.
+9. Run `observe status`, `observe report`, and `observe export`.
+10. Print one short final status.
 
 The existing five questions are:
 
@@ -117,29 +136,37 @@ Update flow:
 2. Require all AOPMem UI and CLI processes to be closed. Do not terminate an
    unknown process automatically.
 3. Create and verify a durable full backup of AOPMem home plus the old binary.
-4. Prepare verified v0.2 stage and recovery binaries in the install
-   directory.
-5. Run the downloaded temporary v0.2 binary:
+   The installer-owned backup is a direct sibling named
+   `aopmem-home-backup-v0.2.0-rc5-*` with deterministic `MANIFEST.sha256`.
+4. Download and verify RC5. Then adopt exactly that unchanged backup:
+   `aopmem upgrade backup --adopt <backup> --manifest-sha256 <digest> --json`.
+5. Retain the verified artifact with `upgrade stage --artifact ... --sha256 ...`.
+6. Run staged `platform check --json`. If it fails, stop before prepare.
+7. Run staged `audit repair --all-workspaces --json`; an already-clean result
+   is an allowed no-op.
+8. Run the staged binary:
    aopmem upgrade prepare --all-workspaces --json
-6. Require exit code 0, ok=true, and success=true. Preparation may checkpoint
-   SQLite and create its own per-workspace backups. On failure, do not run plan,
-   apply, or publish.
-7. Immediately run the same temporary v0.2 binary:
+9. Require exit code 0, ok=true, and success=true. On failure, do not run
+   plan, apply, or publish.
+10. Immediately run the same staged binary:
    aopmem upgrade plan --all-workspaces --json
-8. Run no AOPMem DB-read command between prepare and plan. Require ok=true,
+11. Run no AOPMem DB-read command between prepare and plan. Require ok=true,
    ready=true, and writes_performed=false.
-9. Then run the same temporary v0.2 binary:
+12. Then run the same staged binary exactly once:
    aopmem upgrade apply --all-workspaces --json --approved "+++"
-10. Require exit code 0, ok=true, success=true, and
-   binary_replaced=false.
-11. Only after successful apply, replace the installed binary atomically.
-12. Verify the installed SHA-256 and exact version.
-13. Run `aopmem adapter status --json`, `doctor --json`, `verify --json`,
-   `recall --json`, `observe status --json`, and `observe report --json` with
-   the installed binary. Require ok=true, doctor healthy=true, verify
-   clean=true, and one stable non-empty current workspace key across reports.
-   Do not sync the adapter automatically; report a real status failure.
-14. Print one short final status and all durable backup paths.
+13. Require exit code 0 and ok=true. Never auto-retry apply.
+14. Only after successful apply run native `aopmem upgrade publish --json`.
+   The installer must not copy, move, or replace the installed binary itself.
+15. Sync exactly one explicit active adapter: `codex`/`claude`/`cursor`/
+   `copilot`, mapped to `AGENTS.md`, `CLAUDE.md`, `.cursor/rules/aopmem.mdc`,
+   or `.github/copilot-instructions.md` respectively. Preserve all other files.
+16. Run post-publish `audit repair --all-workspaces --json`, then
+   `doctor --json`, `verify --json`, secure-stdin `task start --query-stdin --json`,
+   `observe status --json`,
+   `observe report --json`, and `observe export --output <new capsule> --json`.
+   Require ok=true, doctor healthy=true, verify clean=true, and one stable
+   non-empty current workspace key across reports.
+17. Print one short final status and all durable backup paths.
 
 Failure rules:
 
@@ -149,8 +176,8 @@ Failure rules:
   failure must block plan, apply, and publish.
 - After upgrade apply starts, some v0.2 data may already be committed.
 - Never restore or republish v0.1 after that point.
-- On any apply or later publish failure, keep the verified same-directory
-  v0.2 recovery binary and print its exact path.
+- On any apply or later failure, keep the recovery journal, retained staged
+  binary, home backup, and all evidence. Follow only the native recovery phase.
 - Tell the user not to run v0.1 after such a failure.
 - Keep every upgrade backup and every workspace.
 - Remove only installer temporary files.
@@ -163,7 +190,7 @@ Success report:
 - fresh or updated;
 - doctor=ok;
 - verify=ok;
-- recall=ok;
+- task_start=ok;
 - observability=ok;
 - binary backup path for update.
 - durable full-backup path for update.

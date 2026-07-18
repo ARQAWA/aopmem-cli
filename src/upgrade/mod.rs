@@ -14,10 +14,11 @@ use crate::storage::{self, AopmemPaths, WorkspacePaths};
 mod apply;
 mod backup;
 mod prepare;
+mod recovery;
 
 pub use apply::{
-    apply_all_workspaces, UpgradeApplyError, UpgradeApplyExecution, UpgradeApplyFailure,
-    UpgradeApplyReport,
+    apply_all_workspaces, apply_core_all_workspaces, UpgradeApplyError, UpgradeApplyExecution,
+    UpgradeApplyFailure, UpgradeApplyReport,
 };
 #[cfg(test)]
 pub(crate) use backup::BackupPhase;
@@ -25,6 +26,10 @@ pub(crate) use backup::WorkspaceBackupFailureDetails;
 pub use prepare::{
     prepare_all_workspaces, UpgradePrepareError, UpgradePrepareExecution, UpgradePrepareFailure,
     UpgradePrepareReport,
+};
+pub use recovery::{
+    adopt_home_backup, apply_or_resume, backup_home, publish_applied, stage_binary, RecoveryError,
+    RecoveryExecution, RecoveryPhase, RecoveryPublishFailure,
 };
 
 const PLAN_SCOPE: &str = "all_workspaces";
@@ -859,14 +864,14 @@ mod tests {
                 .as_ref()
                 .expect("schema should be reported");
             assert_eq!(schema.current_version, "001");
-            assert_eq!(schema.target_version, "003");
+            assert_eq!(schema.target_version, "004");
             assert_eq!(
                 schema
                     .pending_migrations
                     .iter()
                     .map(|migration| migration.version.as_str())
                     .collect::<Vec<_>>(),
-                vec!["002", "003"]
+                vec!["002", "003", "004"]
             );
         }
         assert!(!path_with_suffix(&first, "-wal").exists());

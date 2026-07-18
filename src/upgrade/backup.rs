@@ -12,6 +12,7 @@ use thiserror::Error;
 
 use super::WorkspaceSchemaPlan;
 use crate::audit::AnchoredDir;
+use crate::platform_publish::{publish_regular, PublishError, PublishMode};
 
 const BACKUP_PAGE_BATCH: i32 = 256;
 const BACKUP_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -371,19 +372,23 @@ pub(super) fn online_backup_to_path_with_faults(
         final_path,
         true,
     )?;
-    let outcome = destination_root
-        .publish_regular_no_replace_committed_os(&temporary_file, &temporary_name, final_name)
-        .map_err(|error| {
-            backup_error(
-                BackupPhase::PublishBackup,
-                source_path,
-                &temporary_path,
-                final_path,
-                true,
-                error,
-            )
-        })?;
-    drop(temporary_file);
+    let outcome = publish_regular(
+        &destination_root,
+        temporary_file,
+        &temporary_name,
+        final_name,
+        PublishMode::NoReplace,
+    )
+    .map_err(|error| {
+        backup_error(
+            BackupPhase::PublishBackup,
+            source_path,
+            &temporary_path,
+            final_path,
+            true,
+            PublishError::into_io_error(error),
+        )
+    })?;
     if !outcome.durability_confirmed || !outcome.temporary_cleanup_confirmed {
         return Err(backup_error(
             BackupPhase::PublishBackup,
@@ -745,9 +750,14 @@ mod tests {
             )
             .expect("source row should insert");
         connection
-            .execute(
-                "DELETE FROM schema_migrations WHERE version IN ('002', '003');",
-                [],
+            .execute_batch(
+                "DELETE FROM schema_migrations WHERE version IN ('002', '003', '004');
+                 DROP TRIGGER tool_aliases_validate_insert;
+                 DROP TRIGGER tool_aliases_validate_update;
+                 DROP TRIGGER tool_contracts_reject_alias_shadow_insert;
+                 DROP TRIGGER tool_contracts_reject_alias_shadow_update;
+                 DROP TRIGGER tool_contracts_preserve_alias_target;
+                 DROP TABLE tool_aliases;",
             )
             .expect("source should emulate schema 001");
         drop(connection);
@@ -846,6 +856,75 @@ mod tests {
             1,
             "temporary database must be gone after publish"
         );
+    }
+
+    #[test]
+    fn stage_010_online_backup_preserves_exact_tagged_operational_value() {
+        let root = TestRoot::new("stage-010-tagged-secret");
+        let source_path = create_source(root.path(), "source.sqlite");
+        let secret = "TEST_ONLY_STAGE010_BACKUP_EXACT";
+        let source = Connection::open(&source_path).expect("source database should open");
+        source
+            .execute(
+                "INSERT INTO nodes (
+                    node_type, status, title, body, source_ref,
+                    confidence, trust_level
+                 ) VALUES (
+                    'raw_note', 'active', 'Authorized test credential',
+                    ?1, 'source=user_instruction', 1.0, 'high'
+                 )",
+                [secret],
+            )
+            .expect("tagged source node should insert");
+        source
+            .execute(
+                "INSERT INTO tags (node_id, tag) VALUES (?1, ?2)",
+                rusqlite::params![
+                    source.last_insert_rowid(),
+                    crate::redaction::TEST_SECRET_TAG
+                ],
+            )
+            .expect("tagged source tag should insert");
+        source
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .expect("source WAL should checkpoint");
+        drop(source);
+
+        let destination_dir = root.path().join("backups");
+        fs::create_dir(&destination_dir).expect("backup directory should create");
+        let final_path = destination_dir.join("aopmem.sqlite");
+        let expected_schema = schema(&source_path);
+        online_backup_to_path_with_faults(
+            open_source(&source_path),
+            &source_path,
+            &destination_dir,
+            &final_path,
+            &expected_schema,
+            &NoBackupFaults,
+        )
+        .expect("tagged operational backup should publish");
+
+        for path in [&source_path, &final_path] {
+            let connection = open_source(path);
+            let stored: (String, String) = connection
+                .query_row(
+                    "SELECT nodes.body, tags.tag
+                     FROM nodes JOIN tags ON tags.node_id = nodes.id
+                     WHERE nodes.title = 'Authorized test credential'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("tagged logical value should read");
+            assert_eq!(stored.0, secret);
+            assert_eq!(stored.1, crate::redaction::TEST_SECRET_TAG);
+            let bytes = fs::read(path).expect("database bytes should read");
+            assert!(bytes
+                .windows(secret.len())
+                .any(|window| window == secret.as_bytes()));
+            assert!(bytes
+                .windows(crate::redaction::TEST_SECRET_TAG.len())
+                .any(|window| window == crate::redaction::TEST_SECRET_TAG.as_bytes()));
+        }
     }
 
     #[test]
@@ -957,20 +1036,29 @@ mod tests {
             .open_regular_for_update_os(temporary_name)
             .expect("temporary file should open for publish");
 
-        destination_root
-            .publish_regular_no_replace_committed_os(&temporary_file, temporary_name, final_name)
-            .expect_err("an open SQLite destination handle must block Windows publish");
+        publish_regular(
+            &destination_root,
+            temporary_file,
+            temporary_name,
+            final_name,
+            PublishMode::NoReplace,
+        )
+        .expect_err("an open SQLite destination handle must block Windows publish");
         assert!(temporary_path.is_file());
         assert!(!final_path.exists());
 
-        drop(temporary_file);
         close_connection(destination).expect("destination SQLite should close");
         let temporary_file = destination_root
             .open_regular_for_update_os(temporary_name)
             .expect("closed destination should reopen for publish");
-        let outcome = destination_root
-            .publish_regular_no_replace_committed_os(&temporary_file, temporary_name, final_name)
-            .expect("publish should succeed after SQLite destination closes");
+        let outcome = publish_regular(
+            &destination_root,
+            temporary_file,
+            temporary_name,
+            final_name,
+            PublishMode::NoReplace,
+        )
+        .expect("publish should succeed after SQLite destination closes");
         assert!(outcome.durability_confirmed);
         assert!(outcome.temporary_cleanup_confirmed);
         assert!(final_path.is_file());
@@ -979,7 +1067,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_writable_flush_and_handle_relative_publish_regression() {
+    fn windows_writable_flush_and_platform_publish_regression() {
         let root = TestRoot::new("windows-publish");
         let source_path = create_source(root.path(), "source.sqlite");
         let destination_dir = root.path().join("backups");

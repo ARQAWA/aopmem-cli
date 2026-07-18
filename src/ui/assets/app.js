@@ -131,6 +131,19 @@
     "audit.snapshot.failed",
     "artifacts.cleanup",
     "feedback.recorded",
+    "task.started",
+    "task.context_applied",
+    "task.completed",
+    "task.failed",
+    "tool.duplicate_detected",
+    "tool.duplicate_blocked",
+    "tool.alias_created",
+    "tool.alias_resolved",
+    "tool.canonicalized",
+    "audit.repair.started",
+    "audit.repair.completed",
+    "audit.repair.failed",
+    "platform.check.completed",
   ]);
 
   const EVENT_OUTCOMES = Object.freeze([
@@ -1764,6 +1777,54 @@
     }
 
     const facts = response.facts;
+    const tasks = isRecord(facts.tasks) ? facts.tasks : {};
+    fragment.append(makeMetricStrip([
+      {
+        label: "Task starts",
+        value: displayNumber(tasks.starts),
+        note: `${displayNumber(tasks.failed)} failed`,
+      },
+      {
+        label: "Context applied",
+        value: displayNumber(tasks.context_applications),
+        note: "Factual apply transitions",
+      },
+      {
+        label: "Missing apply",
+        value: displayNumber(tasks.started_without_apply),
+        note: "Started in period, not applied by report end",
+      },
+      {
+        label: "Completed tasks",
+        value: displayNumber(tasks.completed),
+        note: "Success or partial",
+      },
+      {
+        label: "Applied gates",
+        value: displayNumber(tasks.applied_gates),
+        note: `${displayNumber(tasks.applied_rules)} rules`,
+      },
+      {
+        label: "Selected workflows",
+        value: displayNumber(tasks.selected_workflows),
+        note: `${displayNumber(tasks.selected_tools)} tools`,
+      },
+      {
+        label: "Corrections applied",
+        value: displayNumber(tasks.corrections_applied),
+        note: `${displayNumber(tasks.failure_modes_applied)} failure modes`,
+      },
+    ]));
+    const contextSection = makeSection(
+      "Applied task context",
+      "Applied nodes grouped by context type",
+    );
+    contextSection.append(makeNamedCountTable(
+      asArray(tasks.applied_context_by_type),
+      "Applied task context counts by type",
+    ));
+    fragment.append(contextSection);
+
     const recall = isRecord(facts.recall) ? facts.recall : {};
     fragment.append(makeMetricStrip([
       { label: "Recalls", value: displayNumber(recall.count), note: `${displayNumber(recall.failed)} failed` },
@@ -1852,6 +1913,13 @@
       { label: "Adapter drifted", value: displayNumber(drift.drifted) },
       { label: "Adapter failed", value: displayNumber(drift.failed) },
       { label: "Pending audit", value: displayNumber(facts.pending_audit_events) },
+      { label: "Duplicate blocks", value: displayNumber(facts.tool_duplicate_blocks) },
+      { label: "Alias resolutions", value: displayNumber(facts.alias_resolutions) },
+      { label: "Unresolved overlaps", value: displayNumber(facts.unresolved_tool_overlaps) },
+      {
+        label: "Last repair",
+        value: displayValue(facts.last_successful_audit_repair_at),
+      },
       { label: "Doctor failures", value: displayNumber(failures.doctor) },
       { label: "Verify failures", value: displayNumber(failures.verify) },
       { label: "Cleanup events", value: displayNumber(cleanup.cleanup_events) },
@@ -1982,6 +2050,12 @@
       if (response.complete === false) {
         toolsSection.append(makeNotice("More tool contracts are available through Next."));
       }
+      if (response.duplicate_analysis_complete === false) {
+        toolsSection.append(makeNotice(
+          "Duplicate classifications are unavailable. Registry rows remain read-only.",
+          "info",
+        ));
+      }
       toolsSection.append(makeToolsTable(items));
       toolsSection.append(makePagination(
         "Tool page",
@@ -2078,16 +2152,43 @@
     }
     const table = makeTable(
       "Generated tools",
-      ["Tool", "Name", "Status", "Owner workflow", "Side effects", "Approval"],
+      [
+        "Tool",
+        "Canonical",
+        "Aliases",
+        "Duplicate class",
+        "Superseded duplicates",
+        "Unresolved overlaps",
+        "Name",
+        "Owner workflow",
+        "Status",
+        "Side effects",
+        "Approval",
+      ],
     );
     for (const item of items) {
       const row = makeElement("tr");
       appendCell(row, item.tool_id, "cell-mono");
+      appendCell(row, item.canonical_tool_id, "cell-mono");
+      appendCell(row, asArray(item.aliases).join(", ") || "—", "cell-mono");
+      appendCell(
+        row,
+        asArray(item.duplicate_classifications)
+          .map((fact) => `${displayValue(fact.classification)}: ${displayValue(fact.other_tool_id)}`)
+          .join(", ") || "—",
+        "cell-mono",
+      );
+      const superseded = asArray(item.superseded_duplicates);
+      if (item.superseded_duplicate === true && superseded.length === 0) {
+        superseded.push(item.tool_id);
+      }
+      appendCell(row, superseded.join(", ") || "—", "cell-mono");
+      appendCell(row, asArray(item.unresolved_overlaps).join(", ") || "—", "cell-mono");
       appendCell(row, item.name);
+      appendCell(row, item.owner_workflow, "cell-mono");
       const statusCell = makeElement("td");
       statusCell.append(makeBadge(item.status));
       row.append(statusCell);
-      appendCell(row, item.owner_workflow, "cell-mono");
       appendCell(row, item.side_effects, "cell-mono");
       appendCell(row, item.approval_requirement, "cell-mono");
       table.body.append(row);

@@ -345,12 +345,13 @@ import sys
 
 path = Path(sys.argv[1])
 text = path.read_text()
-text = text.replace(
-    "Do not edit inside this block manually.\n",
-    "Drifted block content.\n",
-    1,
-)
-path.write_text(text)
+needle = "`AOPMEM CONTRACT VERSION: 2`\n"
+if text.count(needle) != 1:
+    raise SystemExit("expected exactly one V2 contract marker before drift mutation")
+drifted = text.replace(needle, "`AOPMEM CONTRACT VERSION: DRIFTED`\n", 1)
+if drifted == text:
+    raise SystemExit("drift mutation did not change the managed block")
+path.write_text(drifted)
 PY
 assert_exit_json_field 8 "$drift_repo" \
   'ok is True and command == "verify" and data["clean"] is False and data["summary"]["adapter_block_drift"] == 1 and data["summary"]["total"] >= 1' \

@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "scenario_id": "DOG-10",
+  "scenario_kind": "materially_new_goal",
+  "parent_agent": "codex-exec:019f7550-1545-7fc2-b110-e70d07e90747",
+  "keeper_agent": "codex-exec:019f7550-64a4-7842-bd4b-2529277c58ee",
+  "previous_task": {
+    "task_id": "f0987ba7-5468-43de-aaa8-fbecd5f3844c",
+    "bundle_id": "9a2a18f2-597b-4eb7-8b0e-5e1fa748bf3c"
+  },
+  "task": {
+    "task_id": "d1be69f5-8972-49e5-a6cb-de53ab414564",
+    "bundle_id": "9e71aecb-1e77-4b3d-8d7b-787e5cead00a",
+    "workspace_key": "repo-fa31dced",
+    "mandatory_context_complete": true,
+    "retrieval_complete": true,
+    "budget_exhausted": false,
+    "applied_gate_ids": [2, 3, 10],
+    "applied_rule_ids": [11],
+    "selected_workflow_ids": [13],
+    "selected_tool_ids": [],
+    "apply_status": "applied",
+    "completion_result": "success"
+  },
+  "actions": [
+    {"seq": 1, "actor": "parent", "action": "instruction_read", "status": "ok"},
+    {"seq": 2, "actor": "parent", "action": "new_goal_classified", "status": "ok"},
+    {"seq": 3, "actor": "parent", "action": "native_keeper_started", "status": "ok"},
+    {"seq": 4, "actor": "keeper", "action": "new_task_started", "status": "ok"},
+    {"seq": 5, "actor": "keeper", "action": "empty_application_rejected_fail_closed", "status": "ok"},
+    {"seq": 6, "actor": "keeper", "action": "context_applied_with_explicit_selection", "status": "ok"},
+    {"seq": 7, "actor": "parent", "action": "receipt_received", "status": "ok"},
+    {"seq": 8, "actor": "parent", "action": "project_file_read_after_receipt", "status": "ok", "path": "src/example.rs"},
+    {"seq": 9, "actor": "parent", "action": "substantive_answer", "status": "ok"},
+    {"seq": 10, "actor": "parent", "action": "task_completed", "status": "ok"}
+  ],
+  "checks": {
+    "start_before_substantive_action": true,
+    "apply_before_substantive_action": true,
+    "mandatory_gate_applied": true,
+    "relevant_workflow_or_tool_selected": true,
+    "materially_new_goal_created_new_task": true,
+    "new_task_differs_from_previous": true,
+    "new_bundle_differs_from_previous": true,
+    "project_file_read_after_receipt": true,
+    "observed_return_value": "production",
+    "user_reminders_required": 0,
+    "duplicate_tools_created": 0,
+    "blanket_secret_refusals": 0,
+    "external_writes": 0
+  },
+  "final_answer_summary": "Created a new lifecycle for the new code question, applied workflow 13, then read the file and correctly reported production."
+}

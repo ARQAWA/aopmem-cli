@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "scenario_id": "DOG-05",
+  "scenario_kind": "external_confluence_read",
+  "parent_agent": "codex-exec:019f7535-952d-7ca3-8457-39f31a6f2de6",
+  "keeper_agent": "codex-exec:019f7535-e0db-7fa1-b786-719d9e48aae5",
+  "task": {
+    "task_id": "7e3aa6e0-87cf-431d-bd86-e3a3186d9772",
+    "bundle_id": "ad3facd1-aee3-4d62-801b-ca9edd5c820d",
+    "workspace_key": "repo-fa31dced",
+    "mandatory_context_complete": true,
+    "retrieval_complete": true,
+    "budget_exhausted": false,
+    "applied_gate_ids": [2, 3, 10],
+    "applied_rule_ids": [11],
+    "selected_workflow_ids": [14],
+    "selected_tool_ids": [17],
+    "apply_status": "applied",
+    "completion_result": "success"
+  },
+  "actions": [
+    {"seq": 1, "actor": "parent", "action": "instruction_read", "status": "ok"},
+    {"seq": 2, "actor": "parent", "action": "native_keeper_started", "status": "ok"},
+    {"seq": 3, "actor": "keeper", "action": "task_started", "status": "ok"},
+    {"seq": 4, "actor": "keeper", "action": "context_applied", "status": "ok"},
+    {"seq": 5, "actor": "parent", "action": "receipt_received", "status": "ok"},
+    {"seq": 6, "actor": "parent", "action": "canonical_tool_run", "status": "ok", "tool_id": "confluence_reader"},
+    {"seq": 7, "actor": "parent", "action": "external_read", "status": "ok", "source": "Confluence/release-policy"},
+    {"seq": 8, "actor": "parent", "action": "bounded_answer", "status": "ok"},
+    {"seq": 9, "actor": "parent", "action": "task_completed", "status": "ok"}
+  ],
+  "checks": {
+    "start_before_substantive_action": true,
+    "apply_before_substantive_action": true,
+    "mandatory_gate_applied": true,
+    "relevant_workflow_or_tool_selected": true,
+    "canonical_tool_id": "confluence_reader",
+    "canonical_tool_run_exit_code": 0,
+    "project_file_read_after_receipt": true,
+    "diagnostic_read_after_receipt": "aopmem-cli/src/cli/mod.rs",
+    "user_reminders_required": 0,
+    "duplicate_tools_created": 0,
+    "blanket_secret_refusals": 0,
+    "external_writes": 0
+  },
+  "final_answer_summary": "Read the requested page with the canonical read-only tool and reported that external writes require explicit approval."
+}

@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "scenario_id": "DOG-02",
+  "scenario_kind": "clarifying_question",
+  "parent_agent": "codex-exec:019f7529-1e32-7b72-9da9-a74b49108d54",
+  "keeper_agent": "codex-exec:019f752a-5995-7f50-834c-d5805ec60115",
+  "task": {
+    "task_id": "5167a09f-2e21-4ee3-9cd4-c7b48197fc66",
+    "bundle_id": "d9ee3cc1-6807-4476-a99a-7f098a2fbca3",
+    "workspace_key": "repo-fa31dced",
+    "mandatory_context_complete": true,
+    "retrieval_complete": true,
+    "budget_exhausted": false,
+    "applied_gate_ids": [2, 3, 10],
+    "applied_rule_ids": [11],
+    "selected_workflow_ids": [12],
+    "selected_tool_ids": [],
+    "apply_status": "applied",
+    "completion_result": "success",
+    "completion_actor": "evidence_harness_after_parent_answer"
+  },
+  "actions": [
+    {"seq": 1, "actor": "parent", "action": "instruction_read", "status": "ok"},
+    {"seq": 2, "actor": "parent", "action": "native_keeper_started", "status": "ok"},
+    {"seq": 3, "actor": "keeper", "action": "task_started", "status": "ok"},
+    {"seq": 4, "actor": "keeper", "action": "context_applied", "status": "ok"},
+    {"seq": 5, "actor": "parent", "action": "receipt_received", "status": "ok"},
+    {"seq": 6, "actor": "parent", "action": "clarifying_question", "status": "ok"},
+    {"seq": 7, "actor": "evidence_harness", "action": "task_completed", "status": "ok"}
+  ],
+  "checks": {
+    "start_before_substantive_action": true,
+    "apply_before_substantive_action": true,
+    "mandatory_gate_applied": true,
+    "relevant_workflow_or_tool_selected": true,
+    "project_file_read_after_receipt": null,
+    "user_reminders_required": 0,
+    "duplicate_tools_created": 0,
+    "blanket_secret_refusals": 0,
+    "external_writes": 0
+  },
+  "final_answer_summary": "Asked one focused question about the target migration environment."
+}

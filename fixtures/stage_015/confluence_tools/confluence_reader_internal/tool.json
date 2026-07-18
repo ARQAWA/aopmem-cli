@@ -1,0 +1,22 @@
+{
+  "tool_id": "confluence_reader_internal",
+  "name": "Confluence Reader Internal",
+  "status": "active",
+  "owner_workflow": "memory_keeper",
+  "command": { "entrypoint": "bin/runner" },
+  "args_schema": { "type": "object", "properties": {} },
+  "output_schema": { "type": "object", "properties": { "result": { "type": "string" } } },
+  "side_effects": "external_read",
+  "approval_requirement": "none",
+  "examples": [{ "name": "read", "args": [], "description": "reads a fixture page" }],
+  "runtime": {
+    "executable_path": "bin/runner",
+    "runtime_dir": null,
+    "timeout_ms": 30000,
+    "stdout_limit_bytes": 65536,
+    "stderr_limit_bytes": 65536,
+    "supports_dry_run": false,
+    "output_mode": "inline"
+  },
+  "platform_launchers": { "darwin": "bin/runner", "linux": "bin/runner" }
+}

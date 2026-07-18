@@ -5,6 +5,7 @@ use rusqlite::{Connection, TransactionBehavior};
 pub const MIGRATION_001_INIT: &str = "001_init";
 pub const MIGRATION_002_NODES_SUMMARY_INDEX: &str = "002_nodes_summary_index";
 pub const MIGRATION_003_TASK_RECALL_EXACT_INDEXES: &str = "003_task_recall_exact_indexes";
+pub const MIGRATION_004_TASK_PROTOCOL_AND_TOOL_ALIASES: &str = "004_task_protocol_and_tool_aliases";
 
 struct Migration {
     version: &'static str,
@@ -166,6 +167,126 @@ const MIGRATIONS: &[Migration] = &[
                 ON aliases(alias COLLATE NOCASE);
             CREATE INDEX IF NOT EXISTS idx_tags_tag_nocase
                 ON tags(tag COLLATE NOCASE);
+        ",
+    },
+    Migration {
+        version: "004",
+        name: MIGRATION_004_TASK_PROTOCOL_AND_TOOL_ALIASES,
+        sql: "
+            CREATE TABLE tool_aliases (
+                alias TEXT PRIMARY KEY
+                    CHECK (
+                        typeof(alias) = 'text'
+                        AND length(CAST(alias AS BLOB)) BETWEEN 1 AND 128
+                        AND trim(alias) <> ''
+                        AND instr(alias, char(0)) = 0
+                    ),
+                canonical_tool_id TEXT NOT NULL
+                    CHECK (
+                        typeof(canonical_tool_id) = 'text'
+                        AND length(CAST(canonical_tool_id AS BLOB)) BETWEEN 1 AND 128
+                        AND trim(canonical_tool_id) <> ''
+                        AND instr(canonical_tool_id, char(0)) = 0
+                    ),
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                source TEXT NOT NULL
+                    CHECK (
+                        typeof(source) = 'text'
+                        AND length(CAST(source AS BLOB)) BETWEEN 1 AND 128
+                        AND trim(source) <> ''
+                        AND instr(source, char(0)) = 0
+                    ),
+                status TEXT NOT NULL DEFAULT 'active'
+                    CHECK (status = 'active'),
+                FOREIGN KEY (canonical_tool_id)
+                    REFERENCES tool_contracts(tool_id) ON DELETE RESTRICT
+            );
+            CREATE INDEX idx_tool_aliases_status_alias
+                ON tool_aliases(status, alias);
+            CREATE INDEX idx_tool_aliases_canonical_status_alias
+                ON tool_aliases(canonical_tool_id, status, alias);
+
+            CREATE TRIGGER tool_aliases_validate_insert
+            BEFORE INSERT ON tool_aliases
+            BEGIN
+                SELECT CASE WHEN NOT EXISTS (
+                    SELECT 1
+                    FROM tool_contracts
+                    WHERE tool_id = NEW.canonical_tool_id
+                      AND status = 'active'
+                ) THEN RAISE(ABORT, 'tool alias target must be an active canonical tool') END;
+                SELECT CASE WHEN EXISTS (
+                    SELECT 1
+                    FROM tool_aliases
+                    WHERE alias = NEW.canonical_tool_id
+                      AND status = 'active'
+                ) THEN RAISE(ABORT, 'tool alias target cannot be another alias') END;
+                SELECT CASE WHEN EXISTS (
+                    SELECT 1
+                    FROM tool_contracts
+                    WHERE tool_id = NEW.alias
+                      AND status <> 'superseded'
+                ) THEN RAISE(ABORT, 'tool alias cannot shadow a non-superseded tool') END;
+            END;
+
+            CREATE TRIGGER tool_aliases_validate_update
+            BEFORE UPDATE ON tool_aliases
+            BEGIN
+                SELECT CASE WHEN NOT EXISTS (
+                    SELECT 1
+                    FROM tool_contracts
+                    WHERE tool_id = NEW.canonical_tool_id
+                      AND status = 'active'
+                ) THEN RAISE(ABORT, 'tool alias target must be an active canonical tool') END;
+                SELECT CASE WHEN EXISTS (
+                    SELECT 1
+                    FROM tool_aliases
+                    WHERE alias = NEW.canonical_tool_id
+                      AND status = 'active'
+                ) THEN RAISE(ABORT, 'tool alias target cannot be another alias') END;
+                SELECT CASE WHEN EXISTS (
+                    SELECT 1
+                    FROM tool_contracts
+                    WHERE tool_id = NEW.alias
+                      AND status <> 'superseded'
+                ) THEN RAISE(ABORT, 'tool alias cannot shadow a non-superseded tool') END;
+            END;
+
+            CREATE TRIGGER tool_contracts_reject_alias_shadow_insert
+            BEFORE INSERT ON tool_contracts
+            WHEN NEW.status <> 'superseded'
+                 AND EXISTS (
+                    SELECT 1 FROM tool_aliases WHERE alias = NEW.tool_id
+                 )
+            BEGIN
+                SELECT RAISE(ABORT, 'non-superseded tool cannot shadow an alias');
+            END;
+
+            CREATE TRIGGER tool_contracts_reject_alias_shadow_update
+            BEFORE UPDATE OF tool_id, status ON tool_contracts
+            WHEN NEW.status <> 'superseded'
+                 AND EXISTS (
+                    SELECT 1 FROM tool_aliases WHERE alias = NEW.tool_id
+                 )
+            BEGIN
+                SELECT RAISE(ABORT, 'non-superseded tool cannot shadow an alias');
+            END;
+
+            CREATE TRIGGER tool_contracts_preserve_alias_target
+            BEFORE UPDATE OF tool_id, status ON tool_contracts
+            WHEN EXISTS (
+                     SELECT 1
+                     FROM tool_aliases
+                     WHERE canonical_tool_id = OLD.tool_id
+                       AND status = 'active'
+                 )
+                 AND (
+                     NEW.tool_id <> OLD.tool_id
+                     OR NEW.status <> 'active'
+                 )
+            BEGIN
+                SELECT RAISE(ABORT, 'tool alias target must remain active and canonical');
+            END;
         ",
     },
 ];
@@ -342,7 +463,7 @@ mod tests {
             })
             .expect("schema_migrations should be queryable");
 
-        assert_eq!(count, 3);
+        assert_eq!(count, 4);
     }
 
     #[test]
@@ -417,6 +538,18 @@ mod tests {
                     tag TEXT NOT NULL,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
+                CREATE TABLE tool_contracts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tool_id TEXT NOT NULL UNIQUE,
+                    name TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    owner_workflow TEXT,
+                    side_effects TEXT NOT NULL,
+                    approval_requirement TEXT NOT NULL,
+                    contract_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
                 INSERT INTO nodes (node_type, status, title)
                 VALUES ('raw_note', 'draft', 'preserve-v010-row');
                 ",
@@ -436,7 +569,7 @@ mod tests {
             })
             .expect("migration markers should be readable");
         assert_eq!(title, "preserve-v010-row");
-        assert_eq!(migrations, 3);
+        assert_eq!(migrations, 4);
         assert!(object_exists(&connection, "index", "idx_nodes_summary"));
         assert!(object_exists(
             &connection,
@@ -493,8 +626,8 @@ mod tests {
             })
             .collect::<Vec<_>>();
         migrations.push(Migration {
-            version: "004",
-            name: "004_forced_failure",
+            version: "005",
+            name: "005_forced_failure",
             sql: "CREATE TABLE invalid_sql (",
         });
 
@@ -511,6 +644,132 @@ mod tests {
         let marker: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM schema_migrations WHERE version = '003';",
+                [],
+                |row| row.get(0),
+            )
+            .expect("migration marker should remain readable");
+        assert_eq!(marker, 0);
+        assert!(connection.is_autocommit());
+    }
+
+    #[test]
+    fn stage_011_tool_alias_migration_has_required_schema_and_marker() {
+        let mut connection =
+            Connection::open_in_memory().expect("in-memory DB should open for alias migration");
+
+        apply_migrations(&mut connection).expect("migrations should apply");
+
+        let columns = connection
+            .prepare("PRAGMA table_info('tool_aliases')")
+            .and_then(|mut statement| {
+                statement
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .expect("tool alias columns should be readable");
+        assert_eq!(
+            columns,
+            [
+                "alias",
+                "canonical_tool_id",
+                "created_at",
+                "source",
+                "status"
+            ]
+        );
+        for index in [
+            "idx_tool_aliases_status_alias",
+            "idx_tool_aliases_canonical_status_alias",
+        ] {
+            assert!(
+                object_exists(&connection, "index", index),
+                "missing {index}"
+            );
+        }
+        for trigger in [
+            "tool_aliases_validate_insert",
+            "tool_aliases_validate_update",
+            "tool_contracts_reject_alias_shadow_insert",
+            "tool_contracts_reject_alias_shadow_update",
+            "tool_contracts_preserve_alias_target",
+        ] {
+            assert!(
+                object_exists(&connection, "trigger", trigger),
+                "missing {trigger}"
+            );
+        }
+        let marker: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations
+                 WHERE version = '004' AND name = ?1",
+                [MIGRATION_004_TASK_PROTOCOL_AND_TOOL_ALIASES],
+                |row| row.get(0),
+            )
+            .expect("tool alias migration marker should be readable");
+        assert_eq!(marker, 1);
+    }
+
+    #[test]
+    fn stage_011_tool_alias_migration_upgrades_001_and_003_sources() {
+        for completed in [1_usize, 3_usize] {
+            let mut connection = Connection::open_in_memory()
+                .expect("in-memory DB should open for migration source");
+            apply_migrations_from(&mut connection, &MIGRATIONS[..completed])
+                .expect("source migrations should apply");
+            connection
+                .execute(
+                    "INSERT INTO tool_contracts (
+                        tool_id, name, status, side_effects,
+                        approval_requirement, contract_json
+                     ) VALUES ('canonical', 'Canonical', 'active', 'none', 'none', '{}')",
+                    [],
+                )
+                .expect("source tool should insert");
+
+            apply_migrations(&mut connection).expect("source should upgrade to 004");
+            connection
+                .execute(
+                    "INSERT INTO tool_aliases (
+                        alias, canonical_tool_id, source, status
+                     ) VALUES ('old-id', 'canonical', 'migration-test', 'active')",
+                    [],
+                )
+                .expect("alias should insert after migration");
+
+            let rows: i64 = connection
+                .query_row("SELECT COUNT(*) FROM tool_aliases", [], |row| row.get(0))
+                .expect("tool aliases should be readable");
+            assert_eq!(rows, 1);
+        }
+    }
+
+    #[test]
+    fn stage_011_tool_alias_migration_rolls_back_with_later_failure() {
+        let mut connection =
+            Connection::open_in_memory().expect("in-memory DB should open for rollback fixture");
+        apply_migrations_from(&mut connection, &MIGRATIONS[..3])
+            .expect("003 source fixture should migrate");
+        let mut migrations = MIGRATIONS
+            .iter()
+            .map(|migration| Migration {
+                version: migration.version,
+                name: migration.name,
+                sql: migration.sql,
+            })
+            .collect::<Vec<_>>();
+        migrations.push(Migration {
+            version: "005",
+            name: "005_forced_failure_after_tool_aliases",
+            sql: "CREATE TABLE invalid_sql (",
+        });
+
+        apply_migrations_from(&mut connection, &migrations)
+            .expect_err("later failure should roll back tool alias migration");
+
+        assert!(!object_exists(&connection, "table", "tool_aliases"));
+        let marker: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version = '004'",
                 [],
                 |row| row.get(0),
             )

@@ -11,7 +11,8 @@ The store is separate from operational memory:
 <workspace>/observability/observability.sqlite
 ```
 
-It uses schema version 1. It is not included in `memory.sql` audit snapshots.
+It uses schema version 2. Exact version-1 stores migrate transactionally on
+the next writable open. It is not included in `memory.sql` audit snapshots.
 The collector runs only inside normal CLI invocations. There is no daemon or
 background worker.
 
@@ -19,8 +20,10 @@ Retention is 30 days or 100,000,000 bytes per workspace, whichever limit is
 reached first. Oldest facts are removed first. Export files are not removed by
 collector retention.
 
-Collector failure never changes the core command result. The command keeps its
-exit status and adds `OBSERVABILITY_WRITE_FAILED`.
+Best-effort collector failure never changes the core command result. The
+command keeps its exit status and adds `OBSERVABILITY_WRITE_FAILED`.
+Authoritative task-state writes are different: they fail closed before a task
+transition can be reported as successful.
 
 ## Read-only commands
 
@@ -61,6 +64,10 @@ their in-window `first_seen_at`, including continuations of older bundles.
 
 The report contains verifiable facts:
 
+- task starts, context applications, starts without an apply by report end,
+  completions, and failures;
+- applied gate, rule, workflow, tool, correction, and failure-mode counts,
+  grouped again by mandatory or task context;
 - recall count, failure, empty, and mandatory overflow;
 - continuation and `more_results` use;
 - FTS fallback and graph traversal use;
@@ -70,6 +77,8 @@ The report contains verifiable facts:
 - tool success, failure, timeout, and repeated errors;
 - repeated correction and failure-mode titles;
 - reflection proposed, applied, and drafted counts;
+- blocked tool duplicates, resolved aliases, unresolved overlap blocks, and
+  the last successful audit repair time;
 - adapter drift missing, drifted, and failed events, pending audit snapshots,
   and doctor/verify failures;
 - artifact cleanup deletion counts;
@@ -77,9 +86,10 @@ The report contains verifiable facts:
 
 Top lists contain at most 20 rows and always include `limit` and
 `more_results`. The report does not invent a product score or advice.
-This read boundary passed independent Stage 26 re-audit with `P1=0`, `P2=0`,
-and `P3=0`. Debug capsule export reuses it without collecting or writing new
-events.
+Task lifecycle rows live only in this retention-bounded observability store.
+They are not operational-memory nodes and are not included in `memory.sql`.
+Debug capsule export reuses the same read boundary without collecting or
+writing new events.
 
 ## Privacy boundary
 
@@ -87,10 +97,10 @@ Local Observability may store bounded ids, types, titles, summaries, source
 references, selection reasons, scores, counts, durations, error codes, and
 artifact metadata.
 
-It does not store raw chat, hidden reasoning, full task text, raw node bodies,
-raw tool stdout/stderr, environment values, authorization headers, cookies,
-tokens, or secrets. Text is redacted before collection. Report output redacts
-emitted titles, tool ids, and repeated error codes again.
+It does not store raw query or chat, hidden reasoning, full task text, raw node
+bodies, raw tool stdout/stderr, environment values, authorization headers,
+cookies, tokens, or secrets. Text is redacted before collection. Report output
+redacts emitted titles, tool ids, and repeated error codes again.
 
 `bundle_id` links one recall to later AOPMem operations. Feedback stays only in
 this observability store and never changes operational memory.

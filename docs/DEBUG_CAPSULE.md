@@ -19,6 +19,8 @@ file must not exist. Export never overwrites a file.
 Export:
 
 - opens operational memory and Local Observability read-only;
+- uses SQLite URI `mode=ro`, `query_only=ON`, and in-memory temp storage for
+  the live operational database, including committed WAL-only state;
 - does not run operational or observability migrations;
 - does not initialize a collector or record its own invocation;
 - does not run retention, tools, adapter actions, or memory mutations;
@@ -79,10 +81,12 @@ missing or initialized-empty store uses
 
 ## Privacy boundary
 
-All free text is passed through the deterministic Local Observability
-redactor. The capsule may include node ids, types, titles, bounded summaries,
-source references, trust/confidence values, selection reasons, counts,
-durations, error codes, tool ids, MCP ids, approval facts, and recall scores.
+All free text is passed through the shared deterministic tagged-value and
+Local Observability redactors. Exact tagged values and their canonical
+JSON-string copies are removed before ZIP serialization. The capsule may
+include node ids, types, titles, bounded summaries, source references,
+trust/confidence values, selection reasons, counts, durations, error codes,
+tool ids, MCP ids, approval facts, and recall scores.
 
 The capsule does not include:
 
@@ -101,8 +105,16 @@ action.
 ## Safe publication and errors
 
 Export writes a private same-directory temporary file, syncs it, verifies the
-same open file handle, and publishes without replacing an existing path.
-Temporary files are removed after pre-publication failure.
+same open file handle, closes publication-conflicting handles, and transfers
+the owned file to shared Atomic Publish V2 in `NoReplace` mode. Windows uses
+`MoveFileExW(MOVEFILE_WRITE_THROUGH)` and one shared absolute verbatim
+drive/UNC path conversion for normal long and non-ASCII paths. Export never
+uses replace mode. Temporary files are removed and their absence is checked
+after pre-publication failure.
+
+The command does not create, clear, or otherwise change the audit
+`.pending-snapshot` marker. Audit repair and capsule export share the same
+publisher but keep separate lifecycle rules.
 
 Common error codes are:
 
@@ -116,6 +128,7 @@ Common error codes are:
 | `OBSERVABILITY_UNSAFE_PATH` | The observability path is unsafe |
 | `OBSERVABILITY_INVALID_STORE` | The store is corrupt or incompatible |
 | `OBSERVABILITY_READ_FAILED` | The read-only observability read failed |
+| `PLATFORM_PUBLISH_FAILED` | Atomic publish failed; inspect private structured state and `raw_os_error` |
 | `EXPORT_FAILED` | Export failed before final publication |
 
 If the final file is already visible but directory durability or temporary
@@ -124,6 +137,12 @@ cleanup could not be confirmed, the core command remains successful and emits
 `publication_status=published_with_warning` and an honest
 `temporary_cleanup_confirmed` value. Keep the published file and inspect the
 warning; do not retry to the same path.
+
+Structured publish errors expose only stable roles and state: mode, strategy,
+phase, raw OS code, I/O kind, source/destination existence, source size,
+commit, validation, durability, and cleanup. They never expose either path or
+file content. A committed but not validated failure is reported as committed;
+it is never mislabeled as a pre-publication failure.
 
 The v0.2 local/no-sandbox threat boundary excludes active tampering by another
 process running as the same user. On Unix this includes the narrow leaf-name

@@ -16,6 +16,7 @@ use std::time::Instant;
 use crate::adapter;
 use crate::artifacts;
 use crate::audit;
+use crate::audit_repair;
 use crate::install;
 use crate::mutation;
 use crate::observability::export as observability_export;
@@ -29,9 +30,11 @@ use crate::observability::{
     RecallBundleNode, RecallBundleRecord, RecallPayload, RecallScore, SelectionReason, ToolPayload,
 };
 use crate::output::{OutputWarning, OBSERVABILITY_WRITE_FAILED};
+use crate::platform_check;
 use crate::recall;
 use crate::reflection;
 use crate::storage;
+use crate::task;
 use crate::tools;
 use crate::ui;
 use crate::upgrade;
@@ -50,6 +53,8 @@ pub const EXIT_IO_ERROR: u8 = 9;
 
 const DEFAULT_BOUNDED_RECALL_LIMIT: usize = 12;
 const MAX_BOUNDED_RECALL_LIMIT: usize = 50;
+const TASK_START_MAX_CANDIDATES_PER_LAYER: usize = 2_048;
+const MAX_TASK_QUERY_BYTES: usize = 64 * 1024;
 const MAX_STRUCTURED_PAYLOAD_BYTES: usize = 2 * 1024 * 1024;
 const DEFAULT_LIST_LIMIT: usize = 100;
 const MAX_LIST_LIMIT: usize = 500;
@@ -643,6 +648,10 @@ enum Command {
         command: SourceCommand,
     },
     Recall(RecallArgs),
+    Task {
+        #[command(subcommand)]
+        command: TaskCommand,
+    },
     Remember(RememberArgs),
     Teach {
         #[command(subcommand)]
@@ -680,6 +689,14 @@ enum Command {
         #[command(subcommand)]
         command: UpgradeCommand,
     },
+    Platform {
+        #[command(subcommand)]
+        command: PlatformCommand,
+    },
+    Audit {
+        #[command(subcommand)]
+        command: AuditCommand,
+    },
     Ui(UiArgs),
 }
 
@@ -692,7 +709,7 @@ enum NodeCommand {
     Update(NodeUpdateArgs),
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, Clone, Args)]
 struct NodeCreateArgs {
     #[arg(long = "type")]
     node_type: String,
@@ -803,6 +820,74 @@ struct RecallArgs {
     continuation_cursor: Option<String>,
 }
 
+#[derive(Debug, Subcommand)]
+#[command(rename_all = "kebab-case")]
+enum TaskCommand {
+    Start(TaskStartArgs),
+    Apply(TaskApplyArgs),
+    Complete(TaskCompleteArgs),
+}
+
+#[derive(Debug, Args)]
+struct TaskStartArgs {
+    #[arg(
+        long,
+        required_unless_present = "query_stdin",
+        conflicts_with = "query_stdin"
+    )]
+    query: Option<String>,
+
+    #[arg(
+        long,
+        required_unless_present = "query",
+        conflicts_with = "query",
+        action = clap::ArgAction::SetTrue
+    )]
+    query_stdin: bool,
+}
+
+#[derive(Debug, Args)]
+struct TaskApplyArgs {
+    #[arg(long)]
+    task_id: String,
+
+    #[arg(long = "applied-gate-id", value_parser = parse_positive_id)]
+    applied_gate_ids: Vec<i64>,
+
+    #[arg(long = "applied-rule-id", value_parser = parse_positive_id)]
+    applied_rule_ids: Vec<i64>,
+
+    #[arg(long = "selected-workflow-id", value_parser = parse_positive_id)]
+    selected_workflow_ids: Vec<i64>,
+
+    #[arg(long = "selected-tool-id", value_parser = parse_positive_id)]
+    selected_tool_ids: Vec<i64>,
+
+    #[arg(long = "selected-correction-id", value_parser = parse_positive_id)]
+    selected_correction_ids: Vec<i64>,
+
+    #[arg(long = "selected-failure-mode-id", value_parser = parse_positive_id)]
+    selected_failure_mode_ids: Vec<i64>,
+
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    none_relevant: bool,
+}
+
+#[derive(Debug, Args)]
+struct TaskCompleteArgs {
+    #[arg(long)]
+    task_id: String,
+
+    #[arg(long, value_parser = parse_task_result)]
+    result: task::TaskResult,
+
+    #[arg(long)]
+    error_code: Option<String>,
+
+    #[arg(long)]
+    reason: Option<String>,
+}
+
 fn parse_bounded_recall_limit(value: &str) -> Result<usize, String> {
     let limit = value
         .parse::<usize>()
@@ -837,6 +922,15 @@ fn parse_recall_continuation_cursor(value: &str) -> Result<String, String> {
 
 fn parse_global_bundle_id(value: &str) -> Result<recall::RecallBundleId, String> {
     recall::RecallBundleId::parse(value).map_err(|error| error.to_string())
+}
+
+fn parse_task_result(value: &str) -> Result<task::TaskResult, String> {
+    match value {
+        "success" => Ok(task::TaskResult::Success),
+        "partial" => Ok(task::TaskResult::Partial),
+        "failed" => Ok(task::TaskResult::Failed),
+        _ => Err("result must be one of: success, partial, failed".to_string()),
+    }
 }
 
 #[derive(Debug, Args)]
@@ -1145,7 +1239,7 @@ fn lowercase_hex_nibble(byte: u8) -> Result<u8, &'static str> {
 enum TeachCommand {
     Start(TeachStartArgs),
     Add(TeachPayloadArgs),
-    Propose(TeachPayloadArgs),
+    Propose(TeachProposeArgs),
     Apply(TeachApplyArgs),
 }
 
@@ -1165,6 +1259,34 @@ struct TeachPayloadArgs {
 
     #[arg(long)]
     payload: String,
+}
+
+#[derive(Debug, Args)]
+struct TeachProposeArgs {
+    #[arg(long, value_parser = parse_positive_id)]
+    session_id: i64,
+
+    #[arg(
+        long,
+        required_unless_present = "payload_stdin",
+        conflicts_with = "payload_stdin"
+    )]
+    payload: Option<String>,
+
+    #[arg(
+        long,
+        required_unless_present = "payload",
+        conflicts_with = "payload",
+        requires = "apply",
+        action = clap::ArgAction::SetTrue
+    )]
+    payload_stdin: bool,
+
+    #[arg(
+        long,
+        help = "Store and apply the proposal in one transaction before the audit snapshot"
+    )]
+    apply: bool,
 }
 
 #[derive(Debug, Args)]
@@ -1212,10 +1334,68 @@ struct ReflectProposalApplyArgs {
 #[command(rename_all = "kebab-case")]
 enum ToolCommand {
     CreateDraft(ToolCreateDraftArgs),
-    List(StringListArgs),
+    List(ToolListArgs),
     Get(ToolGetArgs),
     Run(ToolRunArgs),
     Validate(ToolValidateArgs),
+    Alias {
+        #[command(subcommand)]
+        command: ToolAliasCommand,
+    },
+    Resolve(ToolResolveArgs),
+    Dedupe {
+        #[command(subcommand)]
+        command: ToolDedupeCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+#[command(rename_all = "kebab-case")]
+enum ToolDedupeCommand {
+    Plan,
+    Apply(ToolDedupeApplyArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+struct ToolDedupeApplyArgs {
+    /// Required guard: only byte-for-byte canonical fingerprint matches apply.
+    #[arg(long = "exact-only", required = true)]
+    exact_only: bool,
+}
+
+#[derive(Debug, Subcommand)]
+#[command(rename_all = "kebab-case")]
+enum ToolAliasCommand {
+    Add(ToolAliasAddArgs),
+    List(StringListArgs),
+    Remove(ToolAliasRemoveArgs),
+}
+
+#[derive(Debug, Args)]
+struct ToolAliasAddArgs {
+    alias: String,
+
+    #[arg(long = "to")]
+    canonical_tool_id: String,
+}
+
+#[derive(Debug, Args)]
+struct ToolAliasRemoveArgs {
+    alias: String,
+}
+
+#[derive(Debug, Args)]
+struct ToolResolveArgs {
+    id_or_alias: String,
+}
+
+#[derive(Debug, Args)]
+struct ToolListArgs {
+    #[command(flatten)]
+    page: StringListArgs,
+
+    #[arg(long)]
+    include_aliases: bool,
 }
 
 #[derive(Debug, Args)]
@@ -1252,6 +1432,9 @@ struct ToolCreateDraftArgs {
 
     #[arg(long, default_value = "inline")]
     output_mode: tools::ToolOutputMode,
+
+    #[arg(long)]
+    technical_distinction: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -1371,15 +1554,56 @@ enum ObserveCommand {
 #[derive(Debug, Subcommand)]
 #[command(rename_all = "kebab-case")]
 enum UpgradeCommand {
+    Backup(UpgradeBackupArgs),
+    Stage(UpgradeStageArgs),
     Prepare(UpgradePlanArgs),
     Plan(UpgradePlanArgs),
     Apply(UpgradePlanArgs),
+    Publish,
+}
+
+#[derive(Debug, Subcommand)]
+#[command(rename_all = "kebab-case")]
+enum PlatformCommand {
+    Check,
+}
+
+#[derive(Debug, Subcommand)]
+#[command(rename_all = "kebab-case")]
+enum AuditCommand {
+    Repair(AuditRepairArgs),
+}
+
+#[derive(Debug, Args)]
+#[group(required = true, multiple = false)]
+struct AuditRepairArgs {
+    #[arg(long, group = "selector")]
+    all_workspaces: bool,
+
+    #[arg(long, group = "selector")]
+    current_workspace: bool,
 }
 
 #[derive(Debug, Args)]
 struct UpgradePlanArgs {
     #[arg(long, required = true, action = clap::ArgAction::SetTrue)]
     all_workspaces: bool,
+}
+
+#[derive(Debug, Args)]
+struct UpgradeBackupArgs {
+    #[arg(long, requires = "manifest_sha256")]
+    adopt: Option<PathBuf>,
+    #[arg(long, requires = "adopt")]
+    manifest_sha256: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct UpgradeStageArgs {
+    #[arg(long)]
+    artifact: PathBuf,
+    #[arg(long)]
+    sha256: String,
 }
 
 #[derive(Debug, Args)]
@@ -1445,6 +1669,18 @@ fn run_command_with_context(
     bundle_id: Option<recall::RecallBundleId>,
 ) -> ExitCode {
     let command_id = command_id(command);
+    if let Command::Platform {
+        command: PlatformCommand::Check,
+    } = command
+    {
+        return run_platform_check(command_id, json);
+    }
+    if let Command::Audit {
+        command: AuditCommand::Repair(args),
+    } = command
+    {
+        return run_audit_repair(command_id, args, json);
+    }
     if let Command::Ui(args) = command {
         return run_ui(command_id, args, json);
     }
@@ -1457,10 +1693,21 @@ fn run_command_with_context(
     }
     if let Command::Upgrade { command } = command {
         return match command {
+            UpgradeCommand::Backup(args) => run_upgrade_backup(command_id, args, json),
+            UpgradeCommand::Stage(args) => run_upgrade_stage(command_id, args, json),
             UpgradeCommand::Prepare(args) => run_upgrade_prepare(command_id, args, json),
             UpgradeCommand::Plan(args) => run_upgrade_plan(command_id, args, json),
             UpgradeCommand::Apply(args) => run_upgrade_apply(command_id, args, json),
+            UpgradeCommand::Publish => run_upgrade_publish(command_id, json),
         };
+    }
+    if let Command::Tool {
+        command: ToolCommand::Dedupe {
+            command: ToolDedupeCommand::Plan,
+        },
+    } = command
+    {
+        return run_tool_dedupe_plan(command_id, json);
     }
     let mut observation = CommandObservation::new(command_id, bundle_id);
     match command {
@@ -1514,6 +1761,15 @@ fn run_command_with_context(
             command: McpCommand::Get(args),
         } => run_mcp_get(command_id, args, json, &mut observation),
         Command::Recall(args) => run_recall(command_id, args, json, &mut observation),
+        Command::Task {
+            command: TaskCommand::Start(args),
+        } => run_task_start(command_id, args, json, &mut observation),
+        Command::Task {
+            command: TaskCommand::Apply(args),
+        } => run_task_apply(command_id, args, json, &mut observation),
+        Command::Task {
+            command: TaskCommand::Complete(args),
+        } => run_task_complete(command_id, args, json, &mut observation),
         Command::Remember(args) => run_remember(command_id, args, json, &mut observation),
         Command::Teach {
             command: TeachCommand::Start(args),
@@ -1566,6 +1822,36 @@ fn run_command_with_context(
         Command::Tool {
             command: ToolCommand::Validate(args),
         } => run_tool_validate(command_id, args, json, &mut observation),
+        Command::Tool {
+            command:
+                ToolCommand::Alias {
+                    command: ToolAliasCommand::Add(args),
+                },
+        } => run_tool_alias_add(command_id, args, json, &mut observation),
+        Command::Tool {
+            command:
+                ToolCommand::Alias {
+                    command: ToolAliasCommand::List(args),
+                },
+        } => run_tool_alias_list(command_id, args, json),
+        Command::Tool {
+            command:
+                ToolCommand::Alias {
+                    command: ToolAliasCommand::Remove(args),
+                },
+        } => run_tool_alias_remove(command_id, args, json, &mut observation),
+        Command::Tool {
+            command: ToolCommand::Resolve(args),
+        } => run_tool_resolve(command_id, args, json),
+        Command::Tool {
+            command:
+                ToolCommand::Dedupe {
+                    command: ToolDedupeCommand::Apply(args),
+                },
+        } => run_tool_dedupe_apply(command_id, args.clone(), json, &mut observation),
+        Command::Tool {
+            command: ToolCommand::Dedupe { .. },
+        } => unreachable!("dedupe plan returns before collector state"),
         Command::Artifacts {
             command: ArtifactsCommand::Cleanup,
         } => run_artifacts_cleanup(command_id, json, &mut observation),
@@ -1574,7 +1860,194 @@ fn run_command_with_context(
         } => run_feedback_record(command_id, args, json, &mut observation),
         Command::Observe { .. } => unreachable!("observe commands return before collector state"),
         Command::Upgrade { .. } => unreachable!("upgrade commands return before collector state"),
+        Command::Platform { .. } => {
+            unreachable!("platform commands return before collector state")
+        }
+        Command::Audit { .. } => unreachable!("audit repair returns before collector state"),
         Command::Ui(_) => unreachable!("UI returns before collector state"),
+    }
+}
+
+fn run_audit_repair(
+    command_id: &'static str,
+    args: &AuditRepairArgs,
+    json_output: bool,
+) -> ExitCode {
+    let paths = match storage::resolve_paths() {
+        Ok(paths) => paths,
+        Err(_) => {
+            return print_error(command_id, &CliError::audit_repair_discovery(), json_output);
+        }
+    };
+    let mut execution = if args.current_workspace {
+        let (workspace_key, workspace_paths) = match current_workspace_read_target() {
+            Ok(target) => target,
+            Err(_) => {
+                return print_error(command_id, &CliError::audit_repair_discovery(), json_output);
+            }
+        };
+        audit_repair::repair_current(workspace_key, workspace_paths)
+    } else {
+        match audit_repair::repair_all(&paths) {
+            Ok(execution) => execution,
+            Err(_) => {
+                return print_error(command_id, &CliError::audit_repair_discovery(), json_output);
+            }
+        }
+    };
+
+    record_audit_repair_observability(&paths, command_id, &mut execution);
+    let failed = execution.failed;
+    let data = serde_json::to_value(&execution)
+        .expect("audit repair execution serialization should not fail");
+    if json_output {
+        if failed == 0 {
+            println!("{}", success_envelope(command_id, data));
+        } else {
+            println!(
+                "{}",
+                serialize_envelope(&OutputEnvelope {
+                    ok: false,
+                    command: command_id,
+                    data: Some(data),
+                    warnings: Vec::new(),
+                    errors: vec![OutputError {
+                        code: "AUDIT_REPAIR_PARTIAL_FAILURE",
+                        message: "one or more audit snapshot repairs failed".to_string(),
+                        fix_hint:
+                            "preserve pending markers, fix structured local errors, and rerun the same repair command"
+                                .to_string(),
+                        details: None,
+                    }],
+                    meta: OutputMeta::default(),
+                })
+            );
+        }
+    } else {
+        println!(
+            "audit repair: workspaces={} succeeded={} failed={} operational_db_written=false",
+            execution.workspace_count, execution.succeeded, execution.failed
+        );
+        for result in &execution.workspaces {
+            match result {
+                audit_repair::WorkspaceRepairResult::Success(success) => println!(
+                    "{}: {:?} git={:?} marker_after={} observability_recorded={}",
+                    success.workspace_key,
+                    success.repair.status,
+                    success.repair.git_commit,
+                    success.repair.marker_present_after,
+                    success.observability_recorded
+                ),
+                audit_repair::WorkspaceRepairResult::Failure(failure) => eprintln!(
+                    "{}: {} kind={:?} os={:?} marker_retained={}",
+                    failure.workspace_key,
+                    failure.code,
+                    failure.io_kind,
+                    failure.raw_os_error,
+                    failure.marker_retained
+                ),
+            }
+        }
+    }
+    ExitCode::from(if failed == 0 {
+        EXIT_SUCCESS
+    } else {
+        EXIT_IO_ERROR
+    })
+}
+
+fn record_audit_repair_observability(
+    paths: &storage::AopmemPaths,
+    command_id: &'static str,
+    execution: &mut audit_repair::AuditRepairExecution,
+) {
+    for result in &mut execution.workspaces {
+        if matches!(
+            result,
+            audit_repair::WorkspaceRepairResult::Failure(failure)
+                if failure.code == "AUDIT_REPAIR_UNSAFE_WORKSPACE"
+        ) {
+            continue;
+        }
+        let workspace_paths = storage::workspace_paths_for_key(paths, result.workspace_key());
+        let Ok(mut collector) = LocalCollector::new(&workspace_paths, command_id) else {
+            continue;
+        };
+        let event = match result {
+            audit_repair::WorkspaceRepairResult::Success(_) => command_observation_event(
+                EventType::AuditRepairCompleted,
+                EventOutcome::Success,
+                EventPayload::Empty,
+                None,
+            ),
+            audit_repair::WorkspaceRepairResult::Failure(failure) => command_observation_event(
+                EventType::AuditRepairFailed,
+                EventOutcome::Failure,
+                EventPayload::Empty,
+                Some(failure.code),
+            ),
+        };
+        if collector.record_result(event).is_none() {
+            match result {
+                audit_repair::WorkspaceRepairResult::Success(success) => {
+                    success.observability_recorded = true;
+                }
+                audit_repair::WorkspaceRepairResult::Failure(failure) => {
+                    failure.observability_recorded = true;
+                }
+            }
+        }
+    }
+}
+
+fn run_platform_check(command_id: &'static str, json_output: bool) -> ExitCode {
+    match platform_check::run() {
+        Ok(report) => {
+            if json_output {
+                println!(
+                    "{}",
+                    success_envelope(
+                        command_id,
+                        serde_json::to_value(&report)
+                            .expect("platform check report serialization should not fail"),
+                    )
+                );
+            } else {
+                println!(
+                    "platform check: pass checks={} cleanup=confirmed observability_recorded=false",
+                    report.check_count()
+                );
+            }
+            ExitCode::from(EXIT_SUCCESS)
+        }
+        Err(failure) => {
+            if json_output {
+                println!(
+                    "{}",
+                    serialize_envelope(&OutputEnvelope {
+                        ok: false,
+                        command: command_id,
+                        data: None,
+                        warnings: Vec::new(),
+                        errors: vec![OutputError {
+                            code: failure.code,
+                            message: "platform self-check failed".to_string(),
+                            fix_hint:
+                                "stop the update and preserve user data; inspect structured details"
+                                    .to_string(),
+                            details: Some(OutputErrorDetails::PlatformCheck(failure)),
+                        }],
+                        meta: OutputMeta::default(),
+                    })
+                );
+            } else {
+                eprintln!(
+                    "{}: platform self-check failed at {} (kind={}, os={:?})",
+                    failure.code, failure.phase, failure.io_kind, failure.raw_os_error
+                );
+            }
+            ExitCode::from(EXIT_IO_ERROR)
+        }
     }
 }
 
@@ -1694,6 +2167,35 @@ fn run_upgrade_plan(
     }
 }
 
+fn run_upgrade_backup(
+    command_id: &'static str,
+    args: &UpgradeBackupArgs,
+    json_output: bool,
+) -> ExitCode {
+    let result = match (&args.adopt, &args.manifest_sha256) {
+        (Some(backup), Some(manifest_sha256)) => {
+            upgrade::adopt_home_backup(backup, manifest_sha256)
+        }
+        (None, None) => upgrade::backup_home(),
+        _ => unreachable!("clap requires both backup adoption arguments"),
+    };
+    match result {
+        Ok(execution) => print_upgrade_recovery_success(command_id, execution, json_output),
+        Err(error) => print_upgrade_recovery_error(command_id, &error, json_output),
+    }
+}
+
+fn run_upgrade_stage(
+    command_id: &'static str,
+    args: &UpgradeStageArgs,
+    json_output: bool,
+) -> ExitCode {
+    match upgrade::stage_binary(&args.artifact, &args.sha256) {
+        Ok(execution) => print_upgrade_recovery_success(command_id, execution, json_output),
+        Err(error) => print_upgrade_recovery_error(command_id, &error, json_output),
+    }
+}
+
 fn run_upgrade_apply(
     command_id: &'static str,
     args: &UpgradePlanArgs,
@@ -1702,75 +2204,113 @@ fn run_upgrade_apply(
     if !args.all_workspaces {
         return print_error(command_id, &CliError::invalid_args(), json_output);
     }
-    let execution = match upgrade::apply_all_workspaces() {
+    let execution = match upgrade::apply_or_resume() {
         Ok(execution) => execution,
-        Err(error) => return print_error(command_id, &CliError::upgrade_apply(error), json_output),
+        Err(error) => return print_upgrade_recovery_error(command_id, &error, json_output),
     };
-    let data = serde_json::to_value(&execution.report)
+    print_upgrade_recovery_success(command_id, execution, json_output)
+}
+
+fn run_upgrade_publish(command_id: &'static str, json_output: bool) -> ExitCode {
+    match upgrade::publish_applied() {
+        Ok(execution) => print_upgrade_recovery_success(command_id, execution, json_output),
+        Err(error) => print_upgrade_recovery_error(command_id, &error, json_output),
+    }
+}
+
+fn print_upgrade_recovery_success(
+    command_id: &'static str,
+    execution: upgrade::RecoveryExecution,
+    json_output: bool,
+) -> ExitCode {
+    let data = serde_json::to_value(&execution)
         .expect("upgrade apply report serialization should not fail");
-    match execution.failure {
-        None => {
-            if json_output {
-                println!(
-                    "{}",
-                    success_envelope_with_meta_and_warnings(
-                        command_id,
-                        data,
-                        OutputMeta::default(),
-                        execution.warnings,
-                    )
-                );
-            } else {
-                println!(
-                    "upgrade apply: success workspaces={} backup_root={}",
-                    execution.report.workspaces.len(),
-                    execution.report.backup_root.as_deref().unwrap_or("none"),
-                );
-                print_text_warnings(execution.warnings);
-            }
-            ExitCode::from(EXIT_SUCCESS)
-        }
-        Some(failure) => {
-            if json_output {
-                let fix_hint = failure
-                    .backup_details
-                    .as_ref()
-                    .map_or_else(
-                        || {
-                            "keep every backup, fix the exact reported workspace error, then rerun upgrade plan before apply"
-                                .to_string()
-                        },
-                        |details| details.fix_hint.clone(),
-                    );
-                let details = failure
-                    .backup_details
-                    .clone()
-                    .map(|details| OutputErrorDetails::WorkspaceBackup(*details));
-                println!(
-                    "{}",
-                    serialize_envelope(&OutputEnvelope {
-                        ok: false,
-                        command: command_id,
-                        data: Some(data),
-                        warnings: execution.warnings,
-                        errors: vec![OutputError {
-                            code: failure.code,
-                            message: failure.message,
-                            fix_hint,
-                            details,
-                        }],
-                        meta: OutputMeta::default(),
-                    })
-                );
-            } else {
-                eprintln!("{}: {}", failure.code, failure.message);
-                if let Some(workspace_key) = failure.workspace_key {
-                    eprintln!("workspace: {workspace_key}");
-                }
-                print_text_warnings(execution.warnings);
-            }
-            ExitCode::from(EXIT_GENERIC_ERROR)
-        }
+    let warnings = upgrade_recovery_warnings(&execution);
+    if json_output {
+        println!(
+            "{}",
+            success_envelope_with_meta_and_warnings(
+                command_id,
+                data,
+                OutputMeta::default(),
+                warnings,
+            )
+        );
+    } else {
+        println!(
+            "upgrade recovery: phase={:?} resumed={} apply_invoked={} binary_published={}",
+            execution.journal_phase,
+            execution.resumed,
+            execution.apply_invoked,
+            execution.binary_published,
+        );
+        print_text_warnings(warnings);
+    }
+    ExitCode::from(EXIT_SUCCESS)
+}
+
+fn upgrade_recovery_warnings(execution: &upgrade::RecoveryExecution) -> Vec<OutputWarning> {
+    if execution.durability_warning {
+        vec![OutputWarning {
+            code: "UPGRADE_BINARY_DURABILITY_UNCONFIRMED",
+            message: "the installed binary was committed and validated, but ReplaceFileW could not independently confirm directory durability".to_string(),
+        }]
+    } else {
+        Vec::new()
+    }
+}
+
+fn print_upgrade_recovery_error(
+    command_id: &'static str,
+    recovery_error: &upgrade::RecoveryError,
+    json_output: bool,
+) -> ExitCode {
+    let error = CliError::upgrade_recovery(recovery_error);
+    if json_output {
+        let details = upgrade_recovery_error_details(recovery_error);
+        println!(
+            "{}",
+            serialize_envelope(&OutputEnvelope {
+                ok: false,
+                command: command_id,
+                data: None,
+                warnings: Vec::new(),
+                errors: vec![OutputError {
+                    code: error.code,
+                    message: error.message.clone(),
+                    fix_hint: error.fix_hint.clone(),
+                    details,
+                }],
+                meta: OutputMeta::default(),
+            })
+        );
+    } else {
+        eprintln!("{}: {}", error.code, error.message);
+    }
+    ExitCode::from(error.exit_code)
+}
+
+fn upgrade_recovery_error_details(
+    recovery_error: &upgrade::RecoveryError,
+) -> Option<OutputErrorDetails> {
+    match recovery_error {
+        upgrade::RecoveryError::Publish(details) => Some(
+            OutputErrorDetails::UpgradeRecoveryPublish(UpgradeRecoveryPublishDetails {
+                operation: details.operation.to_string(),
+                source_role: details.source_role.to_string(),
+                destination_role: details.destination_role.to_string(),
+                mode: details.mode.clone(),
+                phase: details.phase.clone(),
+                strategy: details.strategy.clone(),
+                io_kind: details.io_kind.to_string(),
+                raw_os_error: details.raw_os_error,
+                final_validated: details.final_validated,
+                committed: details.committed,
+                durability_confirmed: details.durability_confirmed,
+                temporary_cleanup_confirmed: details.temporary_cleanup_confirmed,
+            }),
+        ),
+        _ => None,
     }
 }
 
@@ -1802,18 +2342,99 @@ fn run_tool_create_draft(
     if let Err(error) = tools::validate_draft_tool_input_with_runtime(&input, &runtime) {
         return print_error(command_id, &CliError::tool_validation(error), json_output);
     }
-    let (workspace_key, workspace_paths) = match current_workspace_mutation_target() {
+    if let Some(value) = args.technical_distinction.as_deref() {
+        if tools::validate_technical_distinction(value).is_err() {
+            return print_error(
+                command_id,
+                &CliError::invalid_technical_distinction(),
+                json_output,
+            );
+        }
+    }
+    let technical_distinction_provided = args.technical_distinction.is_some();
+    let (workspace_key, workspace_paths) = match current_workspace_read_target() {
         Ok(workspace) => workspace,
         Err(error) => return print_error(command_id, &error, json_output),
     };
+    let guard = if workspace_paths.db().is_file() {
+        let connection = match open_tool_creation_preflight_connection(&workspace_paths) {
+            Ok(connection) => connection,
+            Err(error) => return print_error(command_id, &error, json_output),
+        };
+        let guard = tools::preflight_tool_creation(
+            &workspace_paths,
+            &connection,
+            &input,
+            &runtime,
+            technical_distinction_provided,
+        );
+        drop(connection);
+        guard
+    } else {
+        Ok(tools::ToolCreationGuardDecision::Allowed {
+            technical_distinction_provided,
+            reviewed_candidates: Vec::new(),
+        })
+    };
+    let guard = match guard {
+        Ok(guard) => guard,
+        Err(error) => {
+            return print_error(
+                command_id,
+                &tool_creation_guard_cli_error(error),
+                json_output,
+            )
+        }
+    };
+    if !guard.is_allowed() {
+        observation.attach_workspace(&workspace_paths);
+        record_tool_creation_guard_observation(observation, &guard);
+        return print_tool_creation_guard_block(
+            command_id,
+            guard,
+            workspace_key,
+            observation.warnings_after(Vec::new()),
+            json_output,
+        );
+    }
+    let (mutation_workspace_key, mutation_workspace_paths) =
+        match current_workspace_mutation_target() {
+            Ok(workspace) => workspace,
+            Err(error) => return print_error(command_id, &error, json_output),
+        };
+    if mutation_workspace_key != workspace_key || mutation_workspace_paths != workspace_paths {
+        return print_error(
+            command_id,
+            &CliError::tool_creation_guard_failed(
+                "workspace changed between creation preflight and mutation".to_string(),
+            ),
+            json_output,
+        );
+    }
     observation.attach_workspace(&workspace_paths);
+    if let tools::ToolCreationGuardDecision::Allowed {
+        reviewed_candidates,
+        ..
+    } = &guard
+    {
+        if let Some(candidate) = reviewed_candidates.first() {
+            observation.record(tool_observation_event(
+                EventType::ToolDuplicateDetected,
+                EventOutcome::Warning,
+                &candidate.canonical_tool_id,
+                false,
+                None,
+            ));
+        }
+    }
 
     match mutation::mutate_workspace(&workspace_paths, |database, effects| {
-        tools::create_draft_tool_in_mutation_with_runtime(
+        tools::create_guarded_draft_tool_in_mutation(
             &workspace_paths,
             database,
             &input,
             &runtime,
+            technical_distinction_provided,
             effects,
         )
     }) {
@@ -1824,37 +2445,87 @@ fn run_tool_create_draft(
             observation,
             json_output,
         ),
-        Err(mutation::MutationError::Operation(tools::CreateDraftToolError::Storage(
-            tools::ToolContractStorageError::Validation(error),
+        Err(mutation::MutationError::Operation(tools::GuardedCreateDraftError::Blocked(
+            decision,
+        ))) => {
+            record_tool_creation_guard_observation(observation, &decision);
+            print_tool_creation_guard_block(
+                command_id,
+                decision,
+                workspace_key,
+                observation.warnings_after(Vec::new()),
+                json_output,
+            )
+        }
+        Err(mutation::MutationError::Operation(tools::GuardedCreateDraftError::Guard(error))) => {
+            print_error(
+                command_id,
+                &tool_creation_guard_cli_error(error),
+                json_output,
+            )
+        }
+        Err(mutation::MutationError::Operation(tools::GuardedCreateDraftError::Create(
+            tools::CreateDraftToolError::Storage(tools::ToolContractStorageError::Validation(
+                error,
+            )),
         )))
-        | Err(mutation::MutationError::Operation(tools::CreateDraftToolError::Json(
-            tools::ToolJsonError::Validation(error),
+        | Err(mutation::MutationError::Operation(tools::GuardedCreateDraftError::Create(
+            tools::CreateDraftToolError::Json(tools::ToolJsonError::Validation(error)),
         ))) => print_error(command_id, &CliError::tool_validation(error), json_output),
-        Err(mutation::MutationError::Operation(tools::CreateDraftToolError::Storage(
-            tools::ToolContractStorageError::Db(error),
+        Err(mutation::MutationError::Operation(tools::GuardedCreateDraftError::Create(
+            tools::CreateDraftToolError::Storage(tools::ToolContractStorageError::Db(error)),
         ))) => print_error(command_id, &CliError::db_schema(error), json_output),
-        Err(mutation::MutationError::Operation(tools::CreateDraftToolError::Storage(
-            tools::ToolContractStorageError::Json(error),
+        Err(mutation::MutationError::Operation(tools::GuardedCreateDraftError::Create(
+            tools::CreateDraftToolError::Storage(tools::ToolContractStorageError::Json(error)),
         )))
-        | Err(mutation::MutationError::Operation(tools::CreateDraftToolError::Json(
-            tools::ToolJsonError::Json(error),
+        | Err(mutation::MutationError::Operation(tools::GuardedCreateDraftError::Create(
+            tools::CreateDraftToolError::Json(tools::ToolJsonError::Json(error)),
         ))) => print_error(
             command_id,
             &CliError::tool_contract_json(error),
             json_output,
         ),
-        Err(mutation::MutationError::Operation(tools::CreateDraftToolError::Json(
-            tools::ToolJsonError::Io(error),
+        Err(mutation::MutationError::Operation(tools::GuardedCreateDraftError::Create(
+            tools::CreateDraftToolError::Json(tools::ToolJsonError::Io(error)),
         )))
-        | Err(mutation::MutationError::Operation(tools::CreateDraftToolError::Io(error))) => {
-            print_error(command_id, &CliError::io(error), json_output)
-        }
+        | Err(mutation::MutationError::Operation(tools::GuardedCreateDraftError::Create(
+            tools::CreateDraftToolError::Io(error),
+        ))) => print_error(command_id, &CliError::io(error), json_output),
         Err(error) => print_error(
             command_id,
             &mutation_infrastructure_error(error),
             json_output,
         ),
     }
+}
+
+fn record_tool_creation_guard_observation(
+    observation: &mut CommandObservation,
+    decision: &tools::ToolCreationGuardDecision,
+) {
+    let (candidate, code) = match decision {
+        tools::ToolCreationGuardDecision::Duplicate { candidate, .. } => {
+            (candidate, "TOOL_DUPLICATE")
+        }
+        tools::ToolCreationGuardDecision::OverlapReviewRequired { candidate, .. } => {
+            (candidate, "TOOL_OVERLAP_REVIEW_REQUIRED")
+        }
+        tools::ToolCreationGuardDecision::Allowed { .. } => return,
+    };
+    observation.record(tool_observation_event(
+        EventType::ToolDuplicateDetected,
+        EventOutcome::Recorded,
+        &candidate.canonical_tool_id,
+        false,
+        None,
+    ));
+    observation.record_terminal(tool_observation_event(
+        EventType::ToolDuplicateBlocked,
+        EventOutcome::Blocked,
+        &candidate.canonical_tool_id,
+        false,
+        Some(code),
+    ));
 }
 
 fn run_tool_validate(
@@ -1869,21 +2540,44 @@ fn run_tool_validate(
     };
     observation.attach_workspace(&workspace_paths);
 
-    let result = tools::validate_tool(&workspace_paths, &connection, &args.tool_id);
+    let resolution = match resolve_tool_cli(&connection, &args.tool_id) {
+        Ok(resolution) => resolution,
+        Err(error) => return print_error(command_id, &error, json_output),
+    };
+    if let Some(alias) = resolution.matched_alias.as_deref() {
+        observation.record(tool_observation_event(
+            EventType::ToolAliasResolved,
+            EventOutcome::Success,
+            alias,
+            false,
+            None,
+        ));
+    }
+    let result = tools::validate_tool(&workspace_paths, &connection, &resolution.canonical_tool_id);
     drop(connection);
     observation.freeze_terminal_duration_ms();
     match result {
         Ok(record) => {
+            let data = if resolution.matched_alias.is_some() {
+                json!({
+                    "requested_id": resolution.requested_id,
+                    "matched_alias": resolution.matched_alias,
+                    "canonical_tool_id": resolution.canonical_tool_id,
+                    "validation": record,
+                })
+            } else {
+                json!(record)
+            };
             observation.record_terminal(tool_observation_event(
                 EventType::ToolValidation,
                 EventOutcome::Success,
-                &args.tool_id,
+                &resolution.canonical_tool_id,
                 false,
                 None,
             ));
             print_success_with_warnings(
                 command_id,
-                json!(record),
+                data,
                 workspace_key,
                 observation.warnings_after(Vec::new()),
                 json_output,
@@ -1895,7 +2589,7 @@ fn run_tool_validate(
             observation.record_terminal(tool_observation_event(
                 EventType::ToolValidation,
                 EventOutcome::Failure,
-                &args.tool_id,
+                &resolution.canonical_tool_id,
                 false,
                 Some(error.code),
             ));
@@ -1907,6 +2601,196 @@ fn run_tool_validate(
                 json_output,
             )
         }
+    }
+}
+
+fn run_tool_alias_add(
+    command_id: &'static str,
+    args: &ToolAliasAddArgs,
+    json_output: bool,
+    observation: &mut CommandObservation,
+) -> ExitCode {
+    let input = tools::NewToolAlias {
+        alias: args.alias.clone(),
+        canonical_tool_id: args.canonical_tool_id.clone(),
+        source: "cli".to_string(),
+        status: tools::TOOL_ALIAS_STATUS_ACTIVE.to_string(),
+    };
+    if let Err(error) = tools::validate_new_tool_alias(&input) {
+        return print_error(command_id, &tool_alias_cli_error(error.into()), json_output);
+    }
+    let (workspace_key, workspace_paths) = match current_workspace_mutation_target() {
+        Ok(workspace) => workspace,
+        Err(error) => return print_error(command_id, &error, json_output),
+    };
+    observation.attach_workspace(&workspace_paths);
+    match mutation::mutate_workspace(&workspace_paths, |connection, _| {
+        tools::add_tool_alias(connection, &input)
+    }) {
+        Ok(outcome) => {
+            observation.record_terminal(tool_observation_event(
+                EventType::ToolAliasCreated,
+                EventOutcome::Success,
+                &outcome.value.alias,
+                false,
+                None,
+            ));
+            print_observed_mutation_success(
+                command_id,
+                outcome,
+                workspace_key,
+                observation,
+                json_output,
+            )
+        }
+        Err(mutation::MutationError::Operation(error)) => {
+            print_error(command_id, &tool_alias_cli_error(error), json_output)
+        }
+        Err(error) => print_error(
+            command_id,
+            &mutation_infrastructure_error(error),
+            json_output,
+        ),
+    }
+}
+
+fn run_tool_alias_remove(
+    command_id: &'static str,
+    args: &ToolAliasRemoveArgs,
+    json_output: bool,
+    observation: &mut CommandObservation,
+) -> ExitCode {
+    let (workspace_key, workspace_paths) = match current_workspace_mutation_target() {
+        Ok(workspace) => workspace,
+        Err(error) => return print_error(command_id, &error, json_output),
+    };
+    observation.attach_workspace(&workspace_paths);
+    match mutation::mutate_workspace(&workspace_paths, |connection, _| {
+        tools::remove_tool_alias(connection, &args.alias)
+    }) {
+        Ok(outcome) => print_observed_mutation_success(
+            command_id,
+            outcome,
+            workspace_key,
+            observation,
+            json_output,
+        ),
+        Err(mutation::MutationError::Operation(error)) => {
+            print_error(command_id, &tool_alias_cli_error(error), json_output)
+        }
+        Err(error) => print_error(
+            command_id,
+            &mutation_infrastructure_error(error),
+            json_output,
+        ),
+    }
+}
+
+fn run_tool_alias_list(
+    command_id: &'static str,
+    args: &StringListArgs,
+    json_output: bool,
+) -> ExitCode {
+    let after_alias = match string_cursor_or_legacy(
+        args.cursor.as_deref(),
+        args.after_id.as_deref(),
+        CursorKind::Alias,
+        "tool",
+    ) {
+        Ok(after_alias) => after_alias,
+        Err(error) => return print_error(command_id, &error, json_output),
+    };
+    let (workspace_key, _workspace_paths, mut connection) =
+        match open_current_workspace_read_context() {
+            Ok(workspace) => workspace,
+            Err(error) => return print_error(command_id, &error, json_output),
+        };
+    let transaction =
+        match connection.transaction_with_behavior(rusqlite::TransactionBehavior::Deferred) {
+            Ok(transaction) => transaction,
+            Err(error) => return print_error(command_id, &CliError::db_schema(error), json_output),
+        };
+    let page = if args.all {
+        collect_all_pages(
+            args.limit,
+            |after: Option<&String>, limit| {
+                tools::list_tool_aliases_page(&transaction, after.map(String::as_str), limit)
+                    .map(|page| storage::Page {
+                        items: page.items,
+                        next_after_id: page.next_after_alias,
+                        more_results: page.more_results,
+                    })
+                    .map_err(|error| match error {
+                        tools::ToolAliasStorageError::Db(error) => ListError::Db(error),
+                        _ => ListError::Pagination("invalid tool alias page request"),
+                    })
+            },
+            |alias| alias.alias.clone(),
+        )
+    } else {
+        tools::list_tool_aliases_page(&transaction, after_alias.as_deref(), args.limit)
+            .map(|page| storage::Page {
+                items: page.items,
+                next_after_id: page.next_after_alias,
+                more_results: page.more_results,
+            })
+            .map_err(|error| match error {
+                tools::ToolAliasStorageError::Db(error) => ListError::Db(error),
+                _ => ListError::Pagination("invalid tool alias page request"),
+            })
+            .and_then(|page| {
+                validate_page(&page, after_alias.as_ref(), args.limit, |alias| {
+                    alias.alias.clone()
+                })?;
+                Ok(page)
+            })
+    };
+    let data = page.and_then(|page| string_list_data("aliases", page, CursorKind::Alias, "tool"));
+    match data {
+        Ok(data) => match transaction.commit() {
+            Ok(()) => print_success(command_id, data, workspace_key, json_output, EXIT_SUCCESS),
+            Err(error) => print_error(command_id, &CliError::db_schema(error), json_output),
+        },
+        Err(error) => print_list_outcome(command_id, Err(error), workspace_key, json_output),
+    }
+}
+
+fn run_tool_resolve(
+    command_id: &'static str,
+    args: &ToolResolveArgs,
+    json_output: bool,
+) -> ExitCode {
+    let (workspace_key, _workspace_paths, connection) = match open_current_workspace_read_context()
+    {
+        Ok(workspace) => workspace,
+        Err(error) => return print_error(command_id, &error, json_output),
+    };
+    match resolve_tool_cli(&connection, &args.id_or_alias) {
+        Ok(resolution) => print_success(
+            command_id,
+            json!(resolution),
+            workspace_key,
+            json_output,
+            EXIT_SUCCESS,
+        ),
+        Err(error) => print_error(command_id, &error, json_output),
+    }
+}
+
+fn resolve_tool_cli(
+    connection: &rusqlite::Connection,
+    requested_id: &str,
+) -> Result<tools::ToolIdResolution, CliError> {
+    tools::resolve_tool_id(connection, requested_id)
+        .map_err(tool_alias_cli_error)?
+        .ok_or_else(|| CliError::tool_not_found(requested_id))
+}
+
+fn tool_alias_cli_error(error: tools::ToolAliasStorageError) -> CliError {
+    match error {
+        tools::ToolAliasStorageError::Validation(error) => CliError::tool_alias(error.to_string()),
+        tools::ToolAliasStorageError::Db(error) => CliError::db_schema(error),
+        other => CliError::tool_alias(other.to_string()),
     }
 }
 
@@ -1928,12 +2812,13 @@ fn validate_tool_cli_error(error: tools::ValidateToolError) -> CliError {
     }
 }
 
-fn run_tool_list(command_id: &'static str, args: &StringListArgs, json_output: bool) -> ExitCode {
+fn run_tool_list(command_id: &'static str, args: &ToolListArgs, json_output: bool) -> ExitCode {
+    let page_args = &args.page;
     let after_id = match string_cursor_or_legacy(
-        args.cursor.as_deref(),
-        args.after_id.as_deref(),
+        page_args.cursor.as_deref(),
+        page_args.after_id.as_deref(),
         CursorKind::Tool,
-        "all",
+        "canonical",
     ) {
         Ok(after_id) => after_id,
         Err(error) => return print_error(command_id, &error, json_output),
@@ -1944,34 +2829,111 @@ fn run_tool_list(command_id: &'static str, args: &StringListArgs, json_output: b
             Err(error) => return print_error(command_id, &error, json_output),
         };
 
-    let page = if args.all {
-        list_all_pages_in_read_transaction(
-            &mut connection,
-            args.limit,
-            |connection, after_id: Option<&String>, limit| {
-                tools::list_tool_contracts_page(connection, after_id.map(String::as_str), limit)
-                    .map(tool_contracts_page)
+    let transaction =
+        match connection.transaction_with_behavior(rusqlite::TransactionBehavior::Deferred) {
+            Ok(transaction) => transaction,
+            Err(error) => return print_error(command_id, &CliError::db_schema(error), json_output),
+        };
+    let page = if page_args.all {
+        collect_all_pages(
+            page_args.limit,
+            |after_id: Option<&String>, limit| {
+                tools::list_canonical_tool_contracts_page(
+                    &transaction,
+                    after_id.map(String::as_str),
+                    limit,
+                )
+                .map(tool_contracts_page)
+                .map_err(ListError::Db)
             },
             |record| record.contract.tool_id.clone(),
         )
     } else {
-        tools::list_tool_contracts_page(&connection, after_id.as_deref(), args.limit)
-            .map(tool_contracts_page)
-            .map_err(ListError::Db)
-            .and_then(|page| {
-                validate_page(&page, after_id.as_ref(), args.limit, |record| {
-                    record.contract.tool_id.clone()
-                })?;
-                Ok(page)
-            })
+        tools::list_canonical_tool_contracts_page(
+            &transaction,
+            after_id.as_deref(),
+            page_args.limit,
+        )
+        .map(tool_contracts_page)
+        .map_err(ListError::Db)
+        .and_then(|page| {
+            validate_page(&page, after_id.as_ref(), page_args.limit, |record| {
+                record.contract.tool_id.clone()
+            })?;
+            Ok(page)
+        })
     };
+    let data = page.and_then(|page| {
+        let canonical_ids = page
+            .items
+            .iter()
+            .map(|record| record.contract.tool_id.clone())
+            .collect::<Vec<_>>();
+        let aliases = tools::list_tool_aliases_for_canonical_ids(&transaction, &canonical_ids)
+            .map_err(|error| match error {
+                tools::ToolAliasStorageError::Db(error) => ListError::Db(error),
+                _ => ListError::Pagination("invalid canonical alias batch"),
+            })?;
+        tool_list_data(page, aliases, args.include_aliases)
+    });
+    match data {
+        Ok(data) => match transaction.commit() {
+            Ok(()) => print_success(command_id, data, workspace_key, json_output, EXIT_SUCCESS),
+            Err(error) => print_error(command_id, &CliError::db_schema(error), json_output),
+        },
+        Err(error) => print_list_outcome(command_id, Err(error), workspace_key, json_output),
+    }
+}
 
-    print_list_outcome(
-        command_id,
-        page.and_then(|page| string_list_data("tools", page, CursorKind::Tool, "all")),
-        workspace_key,
-        json_output,
-    )
+fn tool_list_data(
+    page: storage::Page<tools::ToolContractRecord, String>,
+    mut aliases: std::collections::BTreeMap<String, Vec<tools::ToolAlias>>,
+    include_aliases: bool,
+) -> Result<Value, ListError> {
+    let next_cursor = page
+        .next_after_id
+        .as_deref()
+        .map(|key| encode_list_cursor(CursorKind::Tool, "canonical", key))
+        .transpose()
+        .map_err(ListError::Pagination)?;
+    let mut rows = Vec::new();
+    for record in page.items {
+        let tool_id = record.contract.tool_id.clone();
+        let tool_aliases = aliases.remove(&tool_id).unwrap_or_default();
+        let alias_ids = tool_aliases
+            .iter()
+            .map(|alias| alias.alias.clone())
+            .collect::<Vec<_>>();
+        let mut canonical =
+            serde_json::to_value(record).expect("tool contract record must serialize");
+        let object = canonical
+            .as_object_mut()
+            .expect("tool contract record must serialize as object");
+        object.insert("row_type".to_string(), json!("canonical"));
+        object.insert("aliases".to_string(), json!(alias_ids));
+        rows.push(canonical);
+        if include_aliases {
+            rows.extend(tool_aliases.into_iter().map(|alias| {
+                json!({
+                    "row_type": "alias",
+                    "alias": alias.alias,
+                    "canonical_tool_id": alias.canonical_tool_id,
+                    "created_at": alias.created_at,
+                    "source": alias.source,
+                    "status": alias.status,
+                })
+            }));
+        }
+    }
+    Ok(json!({
+        "tools": rows,
+        "next_cursor": next_cursor,
+        "more_results": page.more_results,
+        "canonical_count": rows.iter()
+            .filter(|row| row.get("row_type") == Some(&json!("canonical")))
+            .count(),
+        "include_aliases": include_aliases,
+    }))
 }
 
 fn run_tool_get(command_id: &'static str, args: &ToolGetArgs, json_output: bool) -> ExitCode {
@@ -1980,9 +2942,14 @@ fn run_tool_get(command_id: &'static str, args: &ToolGetArgs, json_output: bool)
         Err(error) => return print_error(command_id, &error, json_output),
     };
 
-    match tools::get_tool_contract(&connection, &args.tool_id) {
+    let resolution = match resolve_tool_cli(&connection, &args.tool_id) {
+        Ok(resolution) => resolution,
+        Err(error) => return print_error(command_id, &error, json_output),
+    };
+    match tools::get_tool_contract(&connection, &resolution.canonical_tool_id) {
         Ok(Some(record)) => {
-            let tool_json_path = tools::tool_json_path(&workspace_paths, &args.tool_id);
+            let tool_json_path =
+                tools::tool_json_path(&workspace_paths, &resolution.canonical_tool_id);
             let tool_json_path = if tool_json_path.is_file() {
                 Some(tool_json_path)
             } else {
@@ -1991,6 +2958,10 @@ fn run_tool_get(command_id: &'static str, args: &ToolGetArgs, json_output: bool)
             print_success(
                 command_id,
                 json!({
+                    "requested_id": resolution.requested_id,
+                    "matched_alias": resolution.matched_alias,
+                    "canonical_tool_id": resolution.canonical_tool_id,
+                    "canonical_contract": record.contract.clone(),
                     "tool": record,
                     "tool_json_path": tool_json_path,
                 }),
@@ -2001,10 +2972,121 @@ fn run_tool_get(command_id: &'static str, args: &ToolGetArgs, json_output: bool)
         }
         Ok(None) => print_error(
             command_id,
-            &CliError::tool_not_found(&args.tool_id),
+            &CliError::tool_not_found(&resolution.canonical_tool_id),
             json_output,
         ),
         Err(error) => print_error(command_id, &CliError::db_schema(error), json_output),
+    }
+}
+
+fn run_tool_dedupe_plan(command_id: &'static str, json_output: bool) -> ExitCode {
+    let (workspace_key, workspace_paths, connection) =
+        match open_current_workspace_immutable_context() {
+            Ok(workspace) => workspace,
+            Err(error) => return print_error(command_id, &error, json_output),
+        };
+    let result = tools::plan_tool_deduplication(&workspace_paths, &connection);
+    drop(connection);
+    match result {
+        Ok(plan) => print_success(
+            command_id,
+            json!(plan),
+            workspace_key,
+            json_output,
+            EXIT_SUCCESS,
+        ),
+        Err(error) => print_error(command_id, &tool_dedupe_plan_cli_error(error), json_output),
+    }
+}
+
+fn run_tool_dedupe_apply(
+    command_id: &'static str,
+    args: ToolDedupeApplyArgs,
+    json_output: bool,
+    observation: &mut CommandObservation,
+) -> ExitCode {
+    if !args.exact_only {
+        return print_error(
+            command_id,
+            &CliError::tool_dedupe_plan("--exact-only is required".to_string()),
+            json_output,
+        );
+    }
+    let (workspace_key, workspace_paths) = match current_workspace_mutation_target() {
+        Ok(workspace) => workspace,
+        Err(error) => return print_error(command_id, &error, json_output),
+    };
+    observation.attach_workspace(&workspace_paths);
+    match mutation::mutate_workspace(&workspace_paths, |connection, effects| {
+        tools::apply_exact_only_deduplication_in_mutation(&workspace_paths, connection, effects)
+    }) {
+        Ok(outcome) => {
+            for item in &outcome.value.canonicalized {
+                observation.record_terminal(tool_observation_event(
+                    EventType::ToolCanonicalized,
+                    EventOutcome::Success,
+                    &item.superseded_tool_id,
+                    false,
+                    None,
+                ));
+            }
+            print_observed_mutation_success(
+                command_id,
+                outcome,
+                workspace_key,
+                observation,
+                json_output,
+            )
+        }
+        Err(mutation::MutationError::Operation(error)) => {
+            print_error(command_id, &tool_dedupe_apply_cli_error(error), json_output)
+        }
+        Err(error) => print_error(
+            command_id,
+            &mutation_infrastructure_error(error),
+            json_output,
+        ),
+    }
+}
+
+fn tool_dedupe_plan_cli_error(error: tools::ToolDedupePlanError) -> CliError {
+    match error {
+        tools::ToolDedupePlanError::Db(error) => CliError::db_schema(error),
+        tools::ToolDedupePlanError::Json(_)
+        | tools::ToolDedupePlanError::Io(_)
+        | tools::ToolDedupePlanError::UnsafeImplementationPath(_)
+        | tools::ToolDedupePlanError::ImplementationDrift(_)
+        | tools::ToolDedupePlanError::ContractDrift(_) => {
+            CliError::tool_dedupe_plan("TOOL_DEDUPE_FILESYSTEM_UNSAFE".to_string())
+        }
+        error => CliError::tool_dedupe_plan(error.to_string()),
+    }
+}
+
+fn tool_dedupe_apply_cli_error(error: tools::ToolDedupeApplyError) -> CliError {
+    match error {
+        tools::ToolDedupeApplyError::Plan(error) => tool_dedupe_plan_cli_error(error),
+        tools::ToolDedupeApplyError::Alias(error) => tool_alias_cli_error(error),
+        tools::ToolDedupeApplyError::Db(error) => CliError::db_schema(error),
+        tools::ToolDedupeApplyError::Json(_) | tools::ToolDedupeApplyError::Io(_) => {
+            CliError::tool_dedupe_plan("TOOL_DEDUPE_FILESYSTEM_UNSAFE".to_string())
+        }
+        tools::ToolDedupeApplyError::Serialization => {
+            CliError::tool_dedupe_plan("failed to serialize canonical tool contract".to_string())
+        }
+    }
+}
+
+fn tool_creation_guard_cli_error(error: tools::ToolCreationGuardError) -> CliError {
+    match error {
+        tools::ToolCreationGuardError::Validation(error) => CliError::tool_validation(error),
+        tools::ToolCreationGuardError::Alias(error) => tool_alias_cli_error(error),
+        tools::ToolCreationGuardError::Plan(error) => tool_dedupe_plan_cli_error(error),
+        tools::ToolCreationGuardError::Db(error) => CliError::db_schema(error),
+        error @ (tools::ToolCreationGuardError::TooManyCandidates { .. }
+        | tools::ToolCreationGuardError::TooManySearchTokens { .. }) => {
+            CliError::tool_creation_guard_failed(error.to_string())
+        }
     }
 }
 
@@ -2026,16 +3108,34 @@ fn run_tool_run(
         Err(error) => return print_error(command_id, &error, json_output),
     };
     observation.attach_workspace(&workspace_paths);
+    let resolution = match resolve_tool_cli(&connection, &args.tool_id) {
+        Ok(resolution) => resolution,
+        Err(error) => return print_error(command_id, &error, json_output),
+    };
+    if let Some(alias) = resolution.matched_alias.as_deref() {
+        observation.record(tool_observation_event(
+            EventType::ToolAliasResolved,
+            EventOutcome::Success,
+            alias,
+            approved.is_some(),
+            None,
+        ));
+    }
 
     let mut trace = tools::ToolRunTrace::default();
     let result = if args.dry_run {
-        tools::dry_run_tool(&workspace_paths, &connection, &args.tool_id, &args.args)
-            .map(tools::ToolInvocationRecord::DryRun)
+        tools::dry_run_tool(
+            &workspace_paths,
+            &connection,
+            &resolution.canonical_tool_id,
+            &args.args,
+        )
+        .map(tools::ToolInvocationRecord::DryRun)
     } else {
         tools::run_tool_with_trace(
             &workspace_paths,
             &connection,
-            &args.tool_id,
+            &resolution.canonical_tool_id,
             &args.args,
             approved,
             &mut trace,
@@ -2045,22 +3145,33 @@ fn run_tool_run(
     drop(connection);
     record_tool_run_observation(
         observation,
-        &args.tool_id,
+        &resolution.canonical_tool_id,
         approved.is_some(),
         trace,
         &result,
         args.dry_run,
     );
-
     match result {
-        Ok(record) => print_success_with_warnings(
-            command_id,
-            json!(record),
-            workspace_key,
-            observation.warnings_after(Vec::new()),
-            json_output,
-            EXIT_SUCCESS,
-        ),
+        Ok(record) => {
+            let data = if resolution.matched_alias.is_some() {
+                json!({
+                    "requested_id": resolution.requested_id,
+                    "matched_alias": resolution.matched_alias,
+                    "canonical_tool_id": resolution.canonical_tool_id,
+                    "invocation": record,
+                })
+            } else {
+                json!(record)
+            };
+            print_success_with_warnings(
+                command_id,
+                data,
+                workspace_key,
+                observation.warnings_after(Vec::new()),
+                json_output,
+                EXIT_SUCCESS,
+            )
+        }
         Err(tools::RunToolError::NotFound(tool_id)) => print_error_with_warnings(
             command_id,
             &CliError::tool_not_found(&tool_id),
@@ -2476,11 +3587,27 @@ fn run_teach_add(
 
 fn run_teach_propose(
     command_id: &'static str,
-    args: &TeachPayloadArgs,
+    args: &TeachProposeArgs,
     json_output: bool,
     observation: &mut CommandObservation,
 ) -> ExitCode {
-    let proposal = match parse_teach_proposal(&args.payload) {
+    run_teach_propose_with_reader(
+        command_id,
+        args,
+        json_output,
+        observation,
+        io::stdin().lock(),
+    )
+}
+
+fn run_teach_propose_with_reader(
+    command_id: &'static str,
+    args: &TeachProposeArgs,
+    json_output: bool,
+    observation: &mut CommandObservation,
+    reader: impl Read,
+) -> ExitCode {
+    let proposal = match teach_proposal_input(args, reader) {
         Ok(proposal) => proposal,
         Err(error) => return print_error(command_id, &error, json_output),
     };
@@ -2492,6 +3619,51 @@ fn run_teach_propose(
         Err(error) => return print_error(command_id, &error, json_output),
     };
     observation.attach_workspace(&workspace_paths);
+
+    if args.apply {
+        return match mutation::mutate_workspace(&workspace_paths, |database, _effects| {
+            let stored = storage::store_teach_proposal(database, args.session_id, &proposal)?;
+            storage::apply_teach_proposal(database, args.session_id, stored.proposal_id)
+        }) {
+            Ok(outcome) => {
+                observation.record_terminal(command_observation_event(
+                    EventType::TeachApplied,
+                    EventOutcome::Applied,
+                    EventPayload::Empty,
+                    None,
+                ));
+                print_observed_mutation_success(
+                    command_id,
+                    outcome,
+                    workspace_key,
+                    observation,
+                    json_output,
+                )
+            }
+            Err(mutation::MutationError::Operation(error)) => {
+                let error = CliError::teach(error);
+                record_failed_observation(observation, EventType::TeachApplied, &error);
+                print_error_with_warnings(
+                    command_id,
+                    &error,
+                    workspace_key,
+                    observation.warnings_after(Vec::new()),
+                    json_output,
+                )
+            }
+            Err(error) => {
+                let error = mutation_infrastructure_error(error);
+                record_failed_observation(observation, EventType::TeachApplied, &error);
+                print_error_with_warnings(
+                    command_id,
+                    &error,
+                    workspace_key,
+                    observation.warnings_after(Vec::new()),
+                    json_output,
+                )
+            }
+        };
+    }
 
     match mutation::mutate_workspace(&workspace_paths, |database, _effects| {
         storage::store_teach_proposal(database, args.session_id, &proposal)
@@ -2830,13 +4002,48 @@ fn remember_to_new_node(args: &RememberArgs) -> Result<storage::NewNode, CliErro
 }
 
 fn parse_teach_payload(payload: &str) -> Result<Value, CliError> {
-    validate_structured_payload_size("teach payload", payload.len())?;
+    validate_teach_payload_text(payload)?;
     serde_json::from_str(payload).map_err(CliError::teach_payload_json)
 }
 
 fn parse_teach_proposal(payload: &str) -> Result<storage::TeachProposalInput, CliError> {
-    validate_structured_payload_size("teach payload", payload.len())?;
+    validate_teach_payload_text(payload)?;
     serde_json::from_str(payload).map_err(CliError::teach_payload_json)
+}
+
+fn teach_proposal_input(
+    args: &TeachProposeArgs,
+    reader: impl Read,
+) -> Result<storage::TeachProposalInput, CliError> {
+    if args.payload_stdin {
+        return parse_teach_proposal(&read_teach_payload(reader)?);
+    }
+
+    let payload = args.payload.as_deref().ok_or_else(CliError::invalid_args)?;
+    parse_teach_proposal(payload)
+}
+
+fn read_teach_payload(reader: impl Read) -> Result<String, CliError> {
+    let mut bytes = Vec::new();
+    reader
+        .take((MAX_STRUCTURED_PAYLOAD_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(CliError::io)?;
+    validate_structured_payload_size("teach payload", bytes.len())?;
+    let payload = String::from_utf8(bytes)
+        .map_err(|_| CliError::invalid_teach_payload("teach payload must be valid UTF-8"))?;
+    validate_teach_payload_text(&payload)?;
+    Ok(payload)
+}
+
+fn validate_teach_payload_text(payload: &str) -> Result<(), CliError> {
+    validate_structured_payload_size("teach payload", payload.len())?;
+    if payload.as_bytes().contains(&0) {
+        return Err(CliError::invalid_teach_payload(
+            "teach payload must not contain NUL bytes",
+        ));
+    }
+    Ok(())
 }
 
 fn parse_reflect_proposal_file(
@@ -3726,6 +4933,38 @@ fn run_observe_export(
                 print_text_warnings(warnings);
                 ExitCode::from(EXIT_SUCCESS)
             }
+        }
+        Err(observability_export::ExportError::Publish(details)) => {
+            let error = CliError::debug_capsule(observability_export::ExportError::Publish(
+                details.clone(),
+            ));
+            if json_output {
+                println!(
+                    "{}",
+                    serialize_envelope(&OutputEnvelope {
+                        ok: false,
+                        command: command_id,
+                        data: None,
+                        warnings: Vec::new(),
+                        errors: vec![OutputError {
+                            code: error.code,
+                            message: error.message,
+                            fix_hint: error.fix_hint,
+                            details: Some(OutputErrorDetails::DebugCapsulePublish(*details)),
+                        }],
+                        meta: OutputMeta {
+                            version: env!("CARGO_PKG_VERSION"),
+                            workspace_key: Some(workspace_key),
+                        },
+                    })
+                );
+            } else {
+                eprintln!(
+                    "{}: {} (phase={}, kind={}, os={:?})",
+                    error.code, error.message, details.phase, details.io_kind, details.raw_os_error
+                );
+            }
+            ExitCode::from(error.exit_code)
         }
         Err(error) => print_error(command_id, &CliError::debug_capsule(error), json_output),
     }
@@ -4646,6 +5885,676 @@ fn run_mcp_get(
     }
 }
 
+fn run_task_start(
+    command_id: &'static str,
+    args: &TaskStartArgs,
+    json_output: bool,
+    observation: &mut CommandObservation,
+) -> ExitCode {
+    if observation.bundle_id.is_some() {
+        return print_error(
+            command_id,
+            &CliError::task_start_global_bundle(),
+            json_output,
+        );
+    }
+    let query = match task_start_query(args) {
+        Ok(query) => query,
+        Err(error) => return print_error(command_id, &error, json_output),
+    };
+    let (workspace_key, workspace_paths) = match current_workspace_read_target() {
+        Ok(workspace) => workspace,
+        Err(error) => return print_error(command_id, &error, json_output),
+    };
+    let connection = match open_workspace_read_connection(&workspace_paths) {
+        Ok(connection) => connection,
+        Err(error) => return print_error(command_id, &error.into_cli_error(), json_output),
+    };
+    if let Err(error) = connection.execute_batch("BEGIN DEFERRED TRANSACTION;") {
+        return print_error(command_id, &CliError::db_schema(error), json_output);
+    }
+    let operational_revision = match storage::operational_recall_revision(&connection) {
+        Ok(revision) => revision,
+        Err(error) => return print_error(command_id, &CliError::db_schema(error), json_output),
+    };
+    let memory_revision =
+        match recall::bind_recall_revision_to_workspace(&workspace_key, &operational_revision) {
+            Ok(revision) => revision,
+            Err(error) => {
+                return print_error(
+                    command_id,
+                    &CliError::task_recall_contract(error),
+                    json_output,
+                )
+            }
+        };
+    let mandatory_nodes = match storage::load_active_mandatory_recall_nodes(&connection) {
+        Ok(nodes) => nodes,
+        Err(error) => return print_error(command_id, &CliError::db_schema(error), json_output),
+    };
+    let mandatory_context = match recall::build_mandatory_recall_context(mandatory_nodes) {
+        Ok(context) => context,
+        Err(recall::MandatoryContextBuildError::Overflow {
+            hard_limit_bytes,
+            offending_node_ids,
+            ..
+        }) => {
+            return print_error(
+                command_id,
+                &CliError::mandatory_context_overflow(hard_limit_bytes, offending_node_ids.len()),
+                json_output,
+            )
+        }
+        Err(error) => {
+            return print_error(command_id, &CliError::recall_contract(error), json_output)
+        }
+    };
+    let recall_outcome =
+        match build_complete_task_recall_response(&connection, &query, mandatory_context) {
+            Ok(outcome) => outcome,
+            Err(error) => return print_error(command_id, &error, json_output),
+        };
+    if let Err(error) = connection.execute_batch("COMMIT;") {
+        return print_error(command_id, &CliError::db_schema(error), json_output);
+    }
+    drop(connection);
+
+    let task_id = match task::TaskId::generate() {
+        Ok(task_id) => task_id,
+        Err(error) => return print_error(command_id, &CliError::task_state(error), json_output),
+    };
+    let task_bundle_id = match task::TaskBundleId::generate() {
+        Ok(bundle_id) => bundle_id,
+        Err(error) => return print_error(command_id, &CliError::task_state(error), json_output),
+    };
+    let recall_bundle_id = match recall::RecallBundleId::parse(task_bundle_id.as_str()) {
+        Ok(bundle_id) => bundle_id,
+        Err(_) => {
+            return print_error(
+                command_id,
+                &CliError::task_state(task::TaskStateError::InvalidUuid),
+                json_output,
+            )
+        }
+    };
+    if let Err(error) = observation.bind_recall_bundle(&recall_bundle_id) {
+        return print_error(command_id, &error, json_output);
+    }
+    let memory_fingerprint = match task::TaskFingerprint::parse(&memory_revision) {
+        Ok(fingerprint) => fingerprint,
+        Err(error) => return print_error(command_id, &CliError::task_state(error), json_output),
+    };
+    let query_fingerprint =
+        match task::TaskFingerprint::parse(&recall::normalized_query_fingerprint(&query)) {
+            Ok(fingerprint) => fingerprint,
+            Err(error) => {
+                return print_error(command_id, &CliError::task_state(error), json_output)
+            }
+        };
+    let bundle_nodes = match task_start_bundle_nodes(&recall_outcome) {
+        Ok(nodes) => nodes,
+        Err(error) => return print_error(command_id, &CliError::task_state(error), json_output),
+    };
+    let start_input = match task::TaskStartInput::new(
+        task_id.clone(),
+        task_bundle_id,
+        &workspace_key,
+        memory_fingerprint,
+        query_fingerprint,
+        recall_outcome.mandatory.complete,
+        recall_outcome.retrieval_complete,
+        recall_outcome.budget_exhausted(),
+        bundle_nodes,
+    ) {
+        Ok(input) => input,
+        Err(error) => return print_error(command_id, &CliError::task_state(error), json_output),
+    };
+    let state = match task::record_started(&workspace_paths, &start_input) {
+        Ok(state) => state,
+        Err(error) => return print_error(command_id, &CliError::task_state(error), json_output),
+    };
+
+    observation.attach_workspace(&workspace_paths);
+    observation.record_terminal(command_observation_event(
+        EventType::TaskStarted,
+        EventOutcome::Started,
+        EventPayload::Task(crate::observability::TaskPayload::new(&task_id)),
+        None,
+    ));
+
+    print_success_with_warnings(
+        command_id,
+        task_start_data(&state, &recall_outcome),
+        workspace_key,
+        observation.warnings_after(Vec::new()),
+        json_output,
+        EXIT_SUCCESS,
+    )
+}
+
+fn task_start_query(args: &TaskStartArgs) -> Result<String, CliError> {
+    if args.query_stdin {
+        return read_task_start_query(io::stdin().lock());
+    }
+    let query = args.query.as_deref().ok_or_else(CliError::invalid_args)?;
+    validate_task_start_query(query)
+}
+
+fn read_task_start_query(reader: impl Read) -> Result<String, CliError> {
+    let mut bytes = Vec::new();
+    reader
+        .take((MAX_TASK_QUERY_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(CliError::io)?;
+    if bytes.len() > MAX_TASK_QUERY_BYTES {
+        return Err(CliError::invalid_task_query(
+            "task query exceeds the 65536-byte input limit",
+        ));
+    }
+    let query = String::from_utf8(bytes)
+        .map_err(|_| CliError::invalid_task_query("task query must be valid UTF-8"))?;
+    validate_task_start_query(&query)
+}
+
+fn validate_task_start_query(query: &str) -> Result<String, CliError> {
+    if query.len() > MAX_TASK_QUERY_BYTES {
+        return Err(CliError::invalid_task_query(
+            "task query exceeds the 65536-byte input limit",
+        ));
+    }
+    if query.as_bytes().contains(&0) {
+        return Err(CliError::invalid_task_query(
+            "task query must not contain NUL bytes",
+        ));
+    }
+    let query = query.trim();
+    if query.is_empty() {
+        return Err(CliError::invalid_task_query("task query must not be blank"));
+    }
+    Ok(query.to_string())
+}
+
+fn task_start_bundle_nodes(
+    outcome: &CompleteTaskRecallOutcome,
+) -> Result<Vec<task::TaskBundleNode>, task::TaskStateError> {
+    outcome
+        .mandatory
+        .nodes
+        .iter()
+        .map(|selected| {
+            task::TaskBundleNode::new(
+                selected.node.id,
+                task_state_node_type(&selected.node.node_type),
+                task::TaskContextKind::Mandatory,
+            )
+        })
+        .chain(outcome.task.nodes.iter().map(|selected| {
+            task::TaskBundleNode::new(
+                selected.node.id,
+                task_state_node_type(&selected.node.node_type),
+                task::TaskContextKind::Task,
+            )
+        }))
+        .collect()
+}
+
+fn task_state_node_type(node_type: &str) -> &str {
+    match node_type {
+        "lesson" | "incident_scar" => "correction",
+        _ => node_type,
+    }
+}
+
+fn task_start_node_ids(outcome: &CompleteTaskRecallOutcome, node_types: &[&str]) -> Vec<i64> {
+    outcome
+        .mandatory
+        .nodes
+        .iter()
+        .chain(outcome.task.nodes.iter())
+        .filter(|selected| node_types.contains(&selected.node.node_type.as_str()))
+        .map(|selected| selected.node.id)
+        .collect()
+}
+
+fn task_start_data(state: &task::TaskState, outcome: &CompleteTaskRecallOutcome) -> Value {
+    let selection_reasons = outcome
+        .mandatory
+        .nodes
+        .iter()
+        .chain(outcome.task.nodes.iter())
+        .map(|selected| {
+            json!({
+                "node_id": selected.node.id,
+                "reasons": selected.selection_reasons,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "task_id": state.task_id,
+        "bundle_id": state.bundle_id,
+        "workspace_key": state.workspace_key,
+        "memory_revision": state.memory_revision,
+        "mandatory_context_complete": outcome.mandatory.complete,
+        "retrieval_complete": outcome.retrieval_complete,
+        "budget_exhausted": outcome.budget_exhausted(),
+        "mandatory_nodes": outcome.mandatory.nodes,
+        "task_nodes": outcome.task.nodes,
+        "applicable_gates": task_start_node_ids(outcome, &["gate"]),
+        "applicable_rules": task_start_node_ids(outcome, &["rule"]),
+        "candidate_workflows": task_start_node_ids(outcome, &["workflow"]),
+        "candidate_tools": task_start_node_ids(outcome, &["tool_contract"]),
+        "relevant_corrections": task_start_node_ids(
+            outcome,
+            &["correction", "lesson", "incident_scar"],
+        ),
+        "relevant_failure_modes": task_start_node_ids(outcome, &["failure_mode"]),
+        "hunches": task_start_node_ids(outcome, &["hunch_source"]),
+        "selection_reasons": selection_reasons,
+        "budget": outcome.budget,
+        "budget_exhaustion": {
+            "canonical_json_bytes": outcome.byte_budget_exhausted,
+            "candidate_scan": outcome.scan_budget_exhausted,
+        },
+        "candidate_limit_per_layer": TASK_START_MAX_CANDIDATES_PER_LAYER,
+        "candidate_scan_limit_bytes": storage::TASK_RECALL_CANDIDATE_SCAN_MAX_BYTES,
+    })
+}
+
+fn run_task_apply(
+    command_id: &'static str,
+    args: &TaskApplyArgs,
+    json_output: bool,
+    observation: &mut CommandObservation,
+) -> ExitCode {
+    let recall_bundle_id = match observation.bundle_id.clone() {
+        Some(bundle_id) => bundle_id,
+        None => return print_error(command_id, &CliError::task_bundle_required(), json_output),
+    };
+    let task_id = match task::TaskId::parse(&args.task_id) {
+        Ok(task_id) => task_id,
+        Err(error) => return print_error(command_id, &CliError::task_state(error), json_output),
+    };
+    let bundle_id = match task::TaskBundleId::parse(recall_bundle_id.as_str()) {
+        Ok(bundle_id) => bundle_id,
+        Err(error) => return print_error(command_id, &CliError::task_state(error), json_output),
+    };
+    let nodes = match task_apply_nodes(args) {
+        Ok(nodes) => nodes,
+        Err(error) => return print_error(command_id, &CliError::task_state(error), json_output),
+    };
+    let (workspace_key, workspace_paths) = match current_workspace_read_target() {
+        Ok(workspace) => workspace,
+        Err(error) => return print_error(command_id, &error, json_output),
+    };
+    let current = match task::load(&workspace_paths, &task_id) {
+        Ok(state) => state,
+        Err(error) => return print_error(command_id, &CliError::task_state(error), json_output),
+    };
+    if current.workspace_key != workspace_key {
+        return print_error(
+            command_id,
+            &CliError::task_state(task::TaskStateError::WrongWorkspace),
+            json_output,
+        );
+    }
+    if current.bundle_id != bundle_id {
+        return print_error(
+            command_id,
+            &CliError::task_state(task::TaskStateError::ForeignBundle),
+            json_output,
+        );
+    }
+    let input = match task::TaskApplyInput::for_request(
+        task_id.clone(),
+        bundle_id,
+        &workspace_key,
+        current.memory_revision.clone(),
+        args.none_relevant,
+        nodes,
+    ) {
+        Ok(input) => input,
+        Err(error) => return print_error(command_id, &CliError::task_state(error), json_output),
+    };
+
+    if current.apply_fingerprint.is_some() || current.status != task::TaskStatus::Started {
+        let replayed = current.apply_fingerprint.as_ref() == Some(&input.replay_fingerprint);
+        let state = match task::record_context_applied(&workspace_paths, &input) {
+            Ok(state) => state,
+            Err(error) => {
+                return print_error(command_id, &CliError::task_state(error), json_output)
+            }
+        };
+        return print_success(
+            command_id,
+            task_apply_data(&state, replayed),
+            workspace_key,
+            json_output,
+            EXIT_SUCCESS,
+        );
+    }
+
+    let connection = match open_workspace_read_connection(&workspace_paths) {
+        Ok(connection) => connection,
+        Err(error) => return print_error(command_id, &error.into_cli_error(), json_output),
+    };
+    if let Err(error) = connection.execute_batch("BEGIN DEFERRED TRANSACTION;") {
+        return print_error(command_id, &CliError::db_schema(error), json_output);
+    }
+    let operational_revision = match storage::operational_recall_revision(&connection) {
+        Ok(revision) => revision,
+        Err(error) => return print_error(command_id, &CliError::db_schema(error), json_output),
+    };
+    let bound_revision =
+        match recall::bind_recall_revision_to_workspace(&workspace_key, &operational_revision) {
+            Ok(revision) => revision,
+            Err(error) => {
+                return print_error(
+                    command_id,
+                    &CliError::task_recall_contract(error),
+                    json_output,
+                )
+            }
+        };
+    let current_fingerprint = match task::TaskFingerprint::parse(&bound_revision) {
+        Ok(fingerprint) => fingerprint,
+        Err(error) => return print_error(command_id, &CliError::task_state(error), json_output),
+    };
+    if current.memory_revision != current_fingerprint {
+        return print_error(
+            command_id,
+            &CliError::task_state(task::TaskStateError::StaleRevision),
+            json_output,
+        );
+    }
+    if let Err(error) = validate_task_apply_snapshot(&connection, &current, &input.nodes) {
+        return print_error(command_id, &error, json_output);
+    }
+    let state = match task::record_context_applied(&workspace_paths, &input) {
+        Ok(state) => state,
+        Err(error) => return print_error(command_id, &CliError::task_state(error), json_output),
+    };
+    drop(connection);
+
+    observation.attach_workspace(&workspace_paths);
+    observation.record_terminal(command_observation_event(
+        EventType::TaskContextApplied,
+        EventOutcome::Applied,
+        EventPayload::Task(crate::observability::TaskPayload::new(&task_id)),
+        None,
+    ));
+    print_success_with_warnings(
+        command_id,
+        task_apply_data(&state, false),
+        workspace_key,
+        observation.warnings_after(Vec::new()),
+        json_output,
+        EXIT_SUCCESS,
+    )
+}
+
+fn run_task_complete(
+    command_id: &'static str,
+    args: &TaskCompleteArgs,
+    json_output: bool,
+    observation: &mut CommandObservation,
+) -> ExitCode {
+    let task_id = match task::TaskId::parse(&args.task_id) {
+        Ok(task_id) => task_id,
+        Err(error) => return print_error(command_id, &CliError::task_state(error), json_output),
+    };
+    let (workspace_key, workspace_paths) = match current_workspace_read_target() {
+        Ok(workspace) => workspace,
+        Err(error) => return print_error(command_id, &error, json_output),
+    };
+    let current = match task::load(&workspace_paths, &task_id) {
+        Ok(state) => state,
+        Err(error) => return print_error(command_id, &CliError::task_state(error), json_output),
+    };
+    if current.workspace_key != workspace_key {
+        return print_error(
+            command_id,
+            &CliError::task_state(task::TaskStateError::WrongWorkspace),
+            json_output,
+        );
+    }
+    if let Some(incoming_bundle) = observation.bundle_id.as_ref() {
+        if incoming_bundle.as_str() != current.bundle_id.as_str() {
+            return print_error(
+                command_id,
+                &CliError::task_state(task::TaskStateError::ForeignBundle),
+                json_output,
+            );
+        }
+    }
+    let recall_bundle_id = match recall::RecallBundleId::parse(current.bundle_id.as_str()) {
+        Ok(bundle_id) => bundle_id,
+        Err(_) => {
+            return print_error(
+                command_id,
+                &CliError::task_state(task::TaskStateError::StoreUnavailable),
+                json_output,
+            )
+        }
+    };
+    if let Err(error) = observation.bind_recall_bundle(&recall_bundle_id) {
+        return print_error(command_id, &error, json_output);
+    }
+    let input = match task::TaskCompletionInput::for_request(
+        task_id.clone(),
+        current.bundle_id.clone(),
+        &workspace_key,
+        current.memory_revision.clone(),
+        args.result,
+        args.error_code.as_deref(),
+        args.reason.as_deref(),
+    ) {
+        Ok(input) => input,
+        Err(error) => return print_error(command_id, &CliError::task_state(error), json_output),
+    };
+    let replayed = current.completion_fingerprint.as_ref() == Some(&input.replay_fingerprint);
+    let state = match task::record_completed(&workspace_paths, &input) {
+        Ok(state) => state,
+        Err(error) => return print_error(command_id, &CliError::task_state(error), json_output),
+    };
+
+    if !replayed {
+        observation.attach_workspace(&workspace_paths);
+        let (event_type, event_outcome, error_code) = match state.result {
+            Some(task::TaskResult::Failed) => (
+                EventType::TaskFailed,
+                EventOutcome::Failure,
+                state.error_code.as_deref(),
+            ),
+            Some(task::TaskResult::Success | task::TaskResult::Partial) => {
+                (EventType::TaskCompleted, EventOutcome::Success, None)
+            }
+            None => {
+                return print_error(
+                    command_id,
+                    &CliError::task_state(task::TaskStateError::StoreUnavailable),
+                    json_output,
+                )
+            }
+        };
+        let event = command_observation_event(
+            event_type,
+            event_outcome,
+            EventPayload::Task(crate::observability::TaskPayload::new(&task_id)),
+            error_code,
+        )
+        .and_then(|event| {
+            event.with_duration_ms(
+                state
+                    .duration_ms
+                    .ok_or(CollectorInputError::Serialization)?,
+            )
+        });
+        observation.record(event);
+    }
+
+    print_success_with_warnings(
+        command_id,
+        task_complete_data(&state, replayed),
+        workspace_key,
+        observation.warnings_after(Vec::new()),
+        json_output,
+        EXIT_SUCCESS,
+    )
+}
+
+fn task_apply_nodes(
+    args: &TaskApplyArgs,
+) -> Result<Vec<task::AppliedTaskNode>, task::TaskStateError> {
+    args.applied_gate_ids
+        .iter()
+        .map(|node_id| task::AppliedTaskNode::new(*node_id, task::AppliedNodeKind::Gate))
+        .chain(
+            args.applied_rule_ids
+                .iter()
+                .map(|node_id| task::AppliedTaskNode::new(*node_id, task::AppliedNodeKind::Rule)),
+        )
+        .chain(
+            args.selected_workflow_ids.iter().map(|node_id| {
+                task::AppliedTaskNode::new(*node_id, task::AppliedNodeKind::Workflow)
+            }),
+        )
+        .chain(
+            args.selected_tool_ids
+                .iter()
+                .map(|node_id| task::AppliedTaskNode::new(*node_id, task::AppliedNodeKind::Tool)),
+        )
+        .chain(
+            args.selected_correction_ids.iter().map(|node_id| {
+                task::AppliedTaskNode::new(*node_id, task::AppliedNodeKind::Correction)
+            }),
+        )
+        .chain(args.selected_failure_mode_ids.iter().map(|node_id| {
+            task::AppliedTaskNode::new(*node_id, task::AppliedNodeKind::FailureMode)
+        }))
+        .collect()
+}
+
+fn validate_task_apply_snapshot(
+    connection: &rusqlite::Connection,
+    state: &task::TaskState,
+    applied_nodes: &[task::AppliedTaskNode],
+) -> Result<(), CliError> {
+    let requested_ids = applied_nodes
+        .iter()
+        .map(|node| node.node_id)
+        .collect::<Vec<_>>();
+    let requested_json = json!(requested_ids).to_string();
+    let mut statement = connection
+        .prepare(
+            "WITH requested(node_id) AS (
+                SELECT CAST(value AS INTEGER) FROM json_each(?1)
+             )
+             SELECT requested.node_id, nodes.node_type, nodes.status
+             FROM requested
+             LEFT JOIN nodes ON nodes.id = requested.node_id
+             ORDER BY requested.node_id",
+        )
+        .map_err(CliError::db_schema)?;
+    let rows = statement
+        .query_map([requested_json], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })
+        .map_err(CliError::db_schema)?;
+    let mut operational_nodes = Vec::new();
+    for row in rows {
+        operational_nodes.push(row.map_err(CliError::db_schema)?);
+    }
+    if operational_nodes.len() != applied_nodes.len() {
+        return Err(CliError::task_state(task::TaskStateError::StoreUnavailable));
+    }
+
+    for (applied, (node_id, node_type, status)) in applied_nodes.iter().zip(operational_nodes) {
+        if applied.node_id != node_id {
+            return Err(CliError::task_state(task::TaskStateError::StoreUnavailable));
+        }
+        let bundle = state
+            .bundle_nodes
+            .binary_search_by_key(&applied.node_id, |node| node.node_id)
+            .ok()
+            .and_then(|index| state.bundle_nodes.get(index))
+            .ok_or_else(|| CliError::task_state(task::TaskStateError::NodeOutsideBundle))?;
+        if !applied.kind.matches_node_type(&bundle.node_type) {
+            return Err(CliError::task_state(task::TaskStateError::NodeKindMismatch));
+        }
+        let node_type =
+            node_type.ok_or_else(|| CliError::task_state(task::TaskStateError::UnknownNode))?;
+        if !applied.kind.matches_node_type(&node_type) {
+            return Err(CliError::task_state(task::TaskStateError::NodeKindMismatch));
+        }
+        match status.as_deref() {
+            Some("draft" | "active") => {}
+            Some("deprecated" | "superseded" | "broken") => {
+                return Err(CliError::task_state(task::TaskStateError::InactiveNode))
+            }
+            _ => return Err(CliError::task_state(task::TaskStateError::StoreUnavailable)),
+        }
+    }
+    Ok(())
+}
+
+fn task_applied_node_ids(state: &task::TaskState, kind: task::AppliedNodeKind) -> Vec<i64> {
+    state
+        .applied_nodes
+        .iter()
+        .filter(|node| node.kind == kind)
+        .map(|node| node.node_id)
+        .collect()
+}
+
+fn task_apply_data(state: &task::TaskState, replayed: bool) -> Value {
+    json!({
+        "task_id": state.task_id,
+        "bundle_id": state.bundle_id,
+        "workspace_key": state.workspace_key,
+        "memory_revision": state.memory_revision,
+        "status": state.status,
+        "applied_at": state.applied_at,
+        "none_relevant": state.none_relevant,
+        "applied_gate_ids": task_applied_node_ids(state, task::AppliedNodeKind::Gate),
+        "applied_rule_ids": task_applied_node_ids(state, task::AppliedNodeKind::Rule),
+        "selected_workflow_ids": task_applied_node_ids(state, task::AppliedNodeKind::Workflow),
+        "selected_tool_ids": task_applied_node_ids(state, task::AppliedNodeKind::Tool),
+        "selected_correction_ids": task_applied_node_ids(
+            state,
+            task::AppliedNodeKind::Correction,
+        ),
+        "selected_failure_mode_ids": task_applied_node_ids(
+            state,
+            task::AppliedNodeKind::FailureMode,
+        ),
+        "replayed": replayed,
+    })
+}
+
+fn task_complete_data(state: &task::TaskState, replayed: bool) -> Value {
+    json!({
+        "task_id": state.task_id,
+        "bundle_id": state.bundle_id,
+        "workspace_key": state.workspace_key,
+        "memory_revision": state.memory_revision,
+        "status": state.status,
+        "result": state.result,
+        "duration_ms": state.duration_ms,
+        "error_code": state.error_code,
+        "selected_workflow_ids": task_applied_node_ids(
+            state,
+            task::AppliedNodeKind::Workflow,
+        ),
+        "selected_tool_ids": task_applied_node_ids(state, task::AppliedNodeKind::Tool),
+        "finished_at": state.finished_at,
+        "replayed": replayed,
+    })
+}
+
 struct RecallObservationFacts {
     payload: Result<RecallPayload, CollectorInputError>,
     bundle_nodes: Result<Vec<RecallBundleNode>, CollectorInputError>,
@@ -5298,6 +7207,63 @@ fn insert_continuation_seen_node(
 
 fn canonicalize_continuation_seen_nodes(state: &mut recall::RecallContinuationState) {
     state.seen_node_ids.sort_unstable();
+}
+
+#[derive(Debug)]
+struct CompleteTaskRecallOutcome {
+    mandatory: recall::RecallSection,
+    task: recall::RecallSection,
+    retrieval_complete: bool,
+    byte_budget_exhausted: bool,
+    scan_budget_exhausted: bool,
+    budget: recall::RecallBudgetMetadata,
+}
+
+impl CompleteTaskRecallOutcome {
+    fn budget_exhausted(&self) -> bool {
+        self.byte_budget_exhausted || self.scan_budget_exhausted
+    }
+}
+
+fn build_complete_task_recall_response(
+    connection: &rusqlite::Connection,
+    query: &str,
+    mandatory_context: recall::MandatoryRecallContext,
+) -> Result<CompleteTaskRecallOutcome, CliError> {
+    build_complete_task_recall_response_with_limit(
+        connection,
+        query,
+        mandatory_context,
+        TASK_START_MAX_CANDIDATES_PER_LAYER,
+    )
+}
+
+fn build_complete_task_recall_response_with_limit(
+    connection: &rusqlite::Connection,
+    query: &str,
+    mandatory_context: recall::MandatoryRecallContext,
+    candidate_limit: usize,
+) -> Result<CompleteTaskRecallOutcome, CliError> {
+    let candidates = storage::load_task_recall_candidates(connection, query, candidate_limit)
+        .map_err(CliError::db_schema)?;
+    let scan_budget_exhausted = candidates.more_results;
+    let task_context = recall::build_task_recall_context(candidates, &mandatory_context.section)
+        .map_err(CliError::recall_model)?;
+    let budget = recall::RecallBudgetMetadata::with_task_state(
+        mandatory_context.used_bytes,
+        task_context.used_bytes,
+        task_context.byte_budget_exhausted,
+    )
+    .map_err(CliError::recall_model)?;
+
+    Ok(CompleteTaskRecallOutcome {
+        mandatory: mandatory_context.section,
+        retrieval_complete: task_context.section.complete,
+        task: task_context.section,
+        byte_budget_exhausted: task_context.byte_budget_exhausted,
+        scan_budget_exhausted,
+        budget,
+    })
 }
 
 fn build_task_recall_response(
@@ -5999,6 +7965,49 @@ fn open_current_workspace_read_context(
     Ok((key, workspace_paths, connection))
 }
 
+fn open_current_workspace_immutable_context(
+) -> Result<(String, storage::WorkspacePaths, rusqlite::Connection), CliError> {
+    let (key, workspace_paths) = current_workspace_read_target()?;
+    let connection = storage::open_workspace_db_immutable(&workspace_paths)
+        .map_err(|error| match error {
+            storage::OpenWorkspaceReadOnlyError::Missing(path) => WorkspaceReadOpenError::Missing(
+                CliError::workspace_db_missing(&path.display().to_string()),
+            ),
+            storage::OpenWorkspaceReadOnlyError::UnsafePath(error) => {
+                WorkspaceReadOpenError::Existing(CliError::io(error))
+            }
+            storage::OpenWorkspaceReadOnlyError::Db(error) => {
+                WorkspaceReadOpenError::Existing(CliError::db_schema(error))
+            }
+        })
+        .map_err(WorkspaceReadOpenError::into_cli_error)?;
+    Ok((key, workspace_paths, connection))
+}
+
+fn open_tool_creation_preflight_connection(
+    workspace_paths: &storage::WorkspacePaths,
+) -> Result<rusqlite::Connection, CliError> {
+    match storage::open_workspace_db_immutable(workspace_paths) {
+        Ok(connection) => Ok(connection),
+        Err(storage::OpenWorkspaceReadOnlyError::UnsafePath(error))
+            if error.kind() == io::ErrorKind::WouldBlock =>
+        {
+            storage::open_workspace_db_read_only(workspace_paths).map_err(|error| match error {
+                storage::OpenWorkspaceReadOnlyError::Missing(path) => {
+                    CliError::workspace_db_missing(&path.display().to_string())
+                }
+                storage::OpenWorkspaceReadOnlyError::UnsafePath(error) => CliError::io(error),
+                storage::OpenWorkspaceReadOnlyError::Db(error) => CliError::db_schema(error),
+            })
+        }
+        Err(storage::OpenWorkspaceReadOnlyError::Missing(path)) => {
+            Err(CliError::workspace_db_missing(&path.display().to_string()))
+        }
+        Err(storage::OpenWorkspaceReadOnlyError::UnsafePath(error)) => Err(CliError::io(error)),
+        Err(storage::OpenWorkspaceReadOnlyError::Db(error)) => Err(CliError::db_schema(error)),
+    }
+}
+
 fn current_workspace_mutation_target() -> Result<(String, storage::WorkspacePaths), CliError> {
     let repo_root = storage::resolve_current_workspace_root().map_err(CliError::io)?;
     let paths = storage::resolve_paths().map_err(CliError::path)?;
@@ -6116,6 +8125,70 @@ fn print_mutation_success_with_warnings<T: Serialize>(
         json_output,
         EXIT_SUCCESS,
     )
+}
+
+fn print_tool_creation_guard_block(
+    command_id: &'static str,
+    decision: tools::ToolCreationGuardDecision,
+    workspace_key: String,
+    warnings: Vec<OutputWarning>,
+    json_output: bool,
+) -> ExitCode {
+    let (code, candidate, writes_performed) = match decision {
+        tools::ToolCreationGuardDecision::Duplicate {
+            candidate,
+            writes_performed,
+        } => ("TOOL_DUPLICATE", candidate, writes_performed),
+        tools::ToolCreationGuardDecision::OverlapReviewRequired {
+            candidate,
+            writes_performed,
+        } => ("TOOL_OVERLAP_REVIEW_REQUIRED", candidate, writes_performed),
+        tools::ToolCreationGuardDecision::Allowed { .. } => {
+            return print_error(
+                command_id,
+                &CliError::tool_creation_guard_failed(
+                    "allowed creation decision was passed to block output".to_string(),
+                ),
+                json_output,
+            )
+        }
+    };
+    let error = CliError::tool_creation_block(code);
+    if json_output {
+        println!(
+            "{}",
+            serialize_envelope(&OutputEnvelope {
+                ok: false,
+                command: command_id,
+                data: None,
+                warnings,
+                errors: vec![OutputError {
+                    code: error.code,
+                    message: error.message,
+                    fix_hint: error.fix_hint,
+                    details: Some(OutputErrorDetails::ToolCreationGuard(
+                        ToolCreationGuardDetails {
+                            canonical_tool_id: candidate.canonical_tool_id,
+                            alias_suggestion: candidate.alias_suggestion,
+                            duplicate_class: candidate.class,
+                            reasons: candidate.reasons,
+                            writes_performed,
+                        },
+                    )),
+                }],
+                meta: OutputMeta {
+                    version: env!("CARGO_PKG_VERSION"),
+                    workspace_key: Some(workspace_key),
+                },
+            })
+        );
+    } else {
+        eprintln!("{}: {}", error.code, error.message);
+        eprintln!("canonical_tool_id: {}", candidate.canonical_tool_id);
+        eprintln!("alias_suggestion: {}", candidate.alias_suggestion);
+        print_text_warnings(warnings);
+    }
+    ExitCode::from(error.exit_code)
 }
 
 fn print_error(command_id: &'static str, error: &CliError, json_output: bool) -> ExitCode {
@@ -6557,6 +8630,11 @@ fn command_id(command: &Command) -> &'static str {
             SourceCommand::List(_) => "source_list",
         },
         Command::Recall(_) => "recall",
+        Command::Task { command } => match command {
+            TaskCommand::Start(_) => "task_start",
+            TaskCommand::Apply(_) => "task_apply",
+            TaskCommand::Complete(_) => "task_complete",
+        },
         Command::Remember(_) => "remember",
         Command::Teach { command } => match command {
             TeachCommand::Start(_) => "teach_start",
@@ -6577,6 +8655,18 @@ fn command_id(command: &Command) -> &'static str {
             ToolCommand::Get(_) => "tool_get",
             ToolCommand::Run(_) => "tool_run",
             ToolCommand::Validate(_) => "tool_validate",
+            ToolCommand::Alias { command } => match command {
+                ToolAliasCommand::Add(_) => "tool_alias_add",
+                ToolAliasCommand::List(_) => "tool_alias_list",
+                ToolAliasCommand::Remove(_) => "tool_alias_remove",
+            },
+            ToolCommand::Resolve(_) => "tool_resolve",
+            ToolCommand::Dedupe {
+                command: ToolDedupeCommand::Plan,
+            } => "tool_dedupe_plan",
+            ToolCommand::Dedupe {
+                command: ToolDedupeCommand::Apply(_),
+            } => "tool_dedupe_apply",
         },
         Command::Mcp { command } => match command {
             McpCommand::List(_) => "mcp_list",
@@ -6600,10 +8690,19 @@ fn command_id(command: &Command) -> &'static str {
             ObserveCommand::Export(_) => "observe_export",
         },
         Command::Upgrade { command } => match command {
+            UpgradeCommand::Backup(_) => "upgrade_backup",
+            UpgradeCommand::Stage(_) => "upgrade_stage",
             UpgradeCommand::Prepare(_) => "upgrade_prepare",
             UpgradeCommand::Plan(_) => "upgrade_plan",
             UpgradeCommand::Apply(_) => "upgrade_apply",
+            UpgradeCommand::Publish => "upgrade_publish",
         },
+        Command::Platform {
+            command: PlatformCommand::Check,
+        } => "platform_check",
+        Command::Audit {
+            command: AuditCommand::Repair(_),
+        } => "audit_repair",
         Command::Ui(_) => "ui",
     }
 }
@@ -6623,6 +8722,92 @@ impl CliError {
             code: "INVALID_ARGS",
             message: "invalid command line arguments".to_string(),
             fix_hint: "run `aopmem --help` to see supported commands".to_string(),
+        }
+    }
+
+    fn audit_repair_discovery() -> Self {
+        Self {
+            exit_code: EXIT_IO_ERROR,
+            code: "AUDIT_REPAIR_DISCOVERY_FAILED",
+            message: "workspace discovery failed safely".to_string(),
+            fix_hint:
+                "preserve pending markers, fix the local workspace root, and rerun audit repair"
+                    .to_string(),
+        }
+    }
+
+    fn invalid_task_query(message: &str) -> Self {
+        Self {
+            exit_code: EXIT_INVALID_ARGS,
+            code: "INVALID_ARGS",
+            message: message.to_string(),
+            fix_hint: "provide one non-empty task query with `--query` or `--query-stdin`"
+                .to_string(),
+        }
+    }
+
+    fn task_start_global_bundle() -> Self {
+        Self {
+            exit_code: EXIT_INVALID_ARGS,
+            code: "INVALID_ARGS",
+            message: "task start allocates its own bundle id".to_string(),
+            fix_hint: "omit global `--bundle-id` when running `aopmem task start`".to_string(),
+        }
+    }
+
+    fn task_bundle_required() -> Self {
+        Self {
+            exit_code: EXIT_INVALID_ARGS,
+            code: "TASK_BUNDLE_REQUIRED",
+            message: "task apply requires the task bundle id".to_string(),
+            fix_hint: "pass the exact task start bundle with global `--bundle-id`".to_string(),
+        }
+    }
+
+    fn task_recall_contract(error: recall::RecallCursorError) -> Self {
+        Self {
+            exit_code: EXIT_DB_SCHEMA_ERROR,
+            code: "TASK_RECALL_CONTRACT_ERROR",
+            message: format!("task recall contract failed: {error}"),
+            fix_hint: "preserve the workspace, run `aopmem doctor`, and retry task start"
+                .to_string(),
+        }
+    }
+
+    fn task_state(error: task::TaskStateError) -> Self {
+        let exit_code = match error {
+            task::TaskStateError::InvalidUuid
+            | task::TaskStateError::InvalidFingerprint
+            | task::TaskStateError::InvalidWorkspaceKey
+            | task::TaskStateError::InvalidNodeId
+            | task::TaskStateError::InvalidNodeType
+            | task::TaskStateError::DuplicateNode
+            | task::TaskStateError::TooManyNodes
+            | task::TaskStateError::EmptyApplication
+            | task::TaskStateError::MandatoryContextIncomplete
+            | task::TaskStateError::InvalidRetrievalState
+            | task::TaskStateError::InvalidCompletionDetails
+            | task::TaskStateError::InvalidErrorCode
+            | task::TaskStateError::InvalidReason => EXIT_INVALID_ARGS,
+            task::TaskStateError::StoreUnavailable => EXIT_DB_SCHEMA_ERROR,
+            task::TaskStateError::RandomSourceUnavailable => EXIT_IO_ERROR,
+            task::TaskStateError::NotFoundOrExpired
+            | task::TaskStateError::WrongWorkspace
+            | task::TaskStateError::ForeignBundle
+            | task::TaskStateError::StaleRevision
+            | task::TaskStateError::InvalidTransition
+            | task::TaskStateError::ConflictingReplay
+            | task::TaskStateError::NodeOutsideBundle
+            | task::TaskStateError::UnknownNode
+            | task::TaskStateError::InactiveNode
+            | task::TaskStateError::NodeKindMismatch
+            | task::TaskStateError::NoneRelevantConflict => EXIT_VALIDATION_FAILED,
+        };
+        Self {
+            exit_code,
+            code: error.code(),
+            message: error.to_string(),
+            fix_hint: "preserve task state, fix the reported protocol condition, and retry the same task command".to_string(),
         }
     }
 
@@ -6654,12 +8839,21 @@ impl CliError {
         }
     }
 
-    fn upgrade_apply(error: upgrade::UpgradeApplyError) -> Self {
+    fn upgrade_recovery(error: &upgrade::RecoveryError) -> Self {
+        let fix_hint = match error {
+            upgrade::RecoveryError::Publish(details)
+                if details.operation == "publish_installed_binary" && details.committed =>
+            {
+                "the installed binary is already committed; rerun only `aopmem upgrade publish --json` to confirm the published checkpoint".to_string()
+            }
+            upgrade::RecoveryError::ApplyOutcomeUnknown => "preserve every backup and checkpoint; do not retry apply because its outcome is unknown".to_string(),
+            _ => "preserve every backup and checkpoint; follow the exact recovery phase and never retry an unknown apply".to_string(),
+        };
         Self {
             exit_code: EXIT_IO_ERROR,
-            code: "UPGRADE_APPLY_FAILED",
+            code: "UPGRADE_RECOVERY_FAILED",
             message: error.to_string(),
-            fix_hint: "preserve all backups and rerun `aopmem upgrade plan --all-workspaces --json` after fixing the reported local error".to_string(),
+            fix_hint,
         }
     }
 
@@ -6808,12 +9002,29 @@ impl CliError {
             observability_export::ExportError::Observability(error) => {
                 Self::observability_read(error)
             }
+            observability_export::ExportError::Publish(details) => Self {
+                exit_code: EXIT_IO_ERROR,
+                code: details.code,
+                message: if details.committed {
+                    "debug capsule was published, but final validation or durability failed"
+                        .to_string()
+                } else {
+                    "debug capsule publication failed before commit".to_string()
+                },
+                fix_hint: if details.committed {
+                    "keep the final file, inspect structured state, and do not retry to the same path"
+                        .to_string()
+                } else {
+                    "inspect structured publish details, then retry with a new output path"
+                        .to_string()
+                },
+            },
             observability_export::ExportError::TemporaryFile
             | observability_export::ExportError::RandomFailed
             | observability_export::ExportError::Serialization
             | observability_export::ExportError::Zip
             | observability_export::ExportError::Sync
-            | observability_export::ExportError::Publish => Self {
+            | observability_export::ExportError::Redaction => Self {
                 exit_code: EXIT_IO_ERROR,
                 code: "EXPORT_FAILED",
                 message: "debug capsule export failed before publication".to_string(),
@@ -6986,6 +9197,59 @@ impl CliError {
             message: format!("tool not found: {id}"),
             fix_hint: "run `aopmem tool create-draft --id <tool-id> --name <name>` first"
                 .to_string(),
+        }
+    }
+
+    fn tool_alias(message: String) -> Self {
+        Self {
+            exit_code: EXIT_VALIDATION_FAILED,
+            code: "TOOL_ALIAS_ERROR",
+            message,
+            fix_hint: "use a unique alias and a direct active canonical tool id".to_string(),
+        }
+    }
+
+    fn invalid_technical_distinction() -> Self {
+        Self {
+            exit_code: EXIT_INVALID_ARGS,
+            code: "INVALID_ARGS",
+            message: "technical distinction must be non-blank UTF-8 without NUL and at most 1024 bytes"
+                .to_string(),
+            fix_hint:
+                "provide a short technical difference; the text is used only for this overlap review"
+                    .to_string(),
+        }
+    }
+
+    fn tool_creation_guard_failed(message: String) -> Self {
+        Self {
+            exit_code: EXIT_VALIDATION_FAILED,
+            code: "TOOL_CREATION_GUARD_FAILED",
+            message,
+            fix_hint:
+                "repair the reported registry or tool filesystem issue, then rerun create-draft"
+                    .to_string(),
+        }
+    }
+
+    fn tool_creation_block(code: &'static str) -> Self {
+        let (message, fix_hint) = if code == "TOOL_DUPLICATE" {
+            (
+                "tool creation blocked by an existing exact registry collision".to_string(),
+                "reuse the canonical tool or add the suggested alias".to_string(),
+            )
+        } else {
+            (
+                "tool creation requires review of a possible overlap".to_string(),
+                "reuse the canonical tool, add an alias, or rerun with a bounded technical distinction"
+                    .to_string(),
+            )
+        };
+        Self {
+            exit_code: EXIT_UNSAFE_ACTION_BLOCKED,
+            code,
+            message,
+            fix_hint,
         }
     }
 
@@ -7164,6 +9428,16 @@ impl CliError {
                 "tool contract drift detected between SQLite and tool.json: {tool_id}"
             ),
             fix_hint: "sync the local tool.json export back to the canonical SQLite tool contract"
+                .to_string(),
+        }
+    }
+
+    fn tool_dedupe_plan(message: String) -> Self {
+        Self {
+            exit_code: EXIT_VALIDATION_FAILED,
+            code: "TOOL_DEDUPE_PLAN_FAILED",
+            message,
+            fix_hint: "repair unsafe or drifting tool contracts before retrying the read-only plan"
                 .to_string(),
         }
     }
@@ -7360,8 +9634,18 @@ impl CliError {
             exit_code: EXIT_INVALID_ARGS,
             code: "INVALID_ARGS",
             message: format!("invalid teach payload json: {error}"),
-            fix_hint: "pass deterministic JSON in `--payload`, for example {\"items\":[...]}"
-                .to_string(),
+            fix_hint: "pass deterministic JSON with `--payload`, or use direct stdin with `--payload-stdin`".to_string(),
+        }
+    }
+
+    fn invalid_teach_payload(message: &str) -> Self {
+        Self {
+            exit_code: EXIT_INVALID_ARGS,
+            code: "INVALID_ARGS",
+            message: message.to_string(),
+            fix_hint:
+                "pass bounded UTF-8 JSON with no NUL bytes through exactly one teach payload transport"
+                    .to_string(),
         }
     }
 
@@ -7404,6 +9688,35 @@ enum OutputErrorDetails {
     ToolRunLimit(ToolRunLimitDetails),
     ToolRunHardOverflow(ToolRunHardOverflowDetails),
     ArtifactCleanup(ArtifactCleanupErrorDetails),
+    ToolCreationGuard(ToolCreationGuardDetails),
+    PlatformCheck(platform_check::PlatformCheckFailure),
+    DebugCapsulePublish(observability_export::DebugCapsulePublishFailure),
+    UpgradeRecoveryPublish(UpgradeRecoveryPublishDetails),
+}
+
+#[derive(Debug, Serialize)]
+struct UpgradeRecoveryPublishDetails {
+    operation: String,
+    source_role: String,
+    destination_role: String,
+    mode: String,
+    phase: String,
+    strategy: String,
+    io_kind: String,
+    raw_os_error: Option<i32>,
+    final_validated: bool,
+    committed: bool,
+    durability_confirmed: bool,
+    temporary_cleanup_confirmed: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ToolCreationGuardDetails {
+    canonical_tool_id: String,
+    alias_suggestion: String,
+    duplicate_class: tools::ToolCreationGuardClass,
+    reasons: Vec<String>,
+    writes_performed: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -7542,6 +9855,159 @@ mod tests {
             .expect("observability events should collect")
     }
 
+    fn observed_event_count(workspace_paths: &storage::WorkspacePaths, event_type: &str) -> i64 {
+        let connection = rusqlite::Connection::open(workspace_paths.observability_db())
+            .expect("observability DB should open");
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM observability_events WHERE event_type = ?1",
+                [event_type],
+                |row| row.get(0),
+            )
+            .expect("observability event count should query")
+    }
+
+    fn create_task_protocol_node(
+        connection: &rusqlite::Connection,
+        node_type: &str,
+        status: &str,
+        title: &str,
+    ) -> i64 {
+        storage::create_node(
+            connection,
+            &storage::NewNode {
+                node_type: node_type.to_string(),
+                status: status.to_string(),
+                title: title.to_string(),
+                summary: None,
+                body: None,
+                source_ref: (status == "active").then(|| "source=test".to_string()),
+                confidence: (status == "active").then_some(1.0),
+                trust_level: (status == "active").then(|| "high".to_string()),
+            },
+        )
+        .expect("task protocol node should create")
+        .id
+    }
+
+    fn record_task_protocol_start(
+        workspace_paths: &storage::WorkspacePaths,
+        workspace_key: &str,
+        operational: &rusqlite::Connection,
+        nodes: Vec<task::TaskBundleNode>,
+        retrieval_complete: bool,
+        budget_exhausted: bool,
+    ) -> task::TaskState {
+        let revision =
+            storage::operational_recall_revision(operational).expect("revision should build");
+        let memory_revision = recall::bind_recall_revision_to_workspace(workspace_key, &revision)
+            .expect("revision should bind");
+        let input = task::TaskStartInput::new(
+            task::TaskId::generate().expect("task id should generate"),
+            task::TaskBundleId::generate().expect("bundle id should generate"),
+            workspace_key,
+            task::TaskFingerprint::parse(&memory_revision)
+                .expect("memory fingerprint should parse"),
+            task::TaskFingerprint::parse("0123456789abcdef0123456789abcdef")
+                .expect("query fingerprint should parse"),
+            true,
+            retrieval_complete,
+            budget_exhausted,
+            nodes,
+        )
+        .expect("task start input should validate");
+        task::record_started(workspace_paths, &input).expect("task state should persist")
+    }
+
+    fn operational_task_snapshot(workspace_paths: &storage::WorkspacePaths) -> (String, [i64; 9]) {
+        let connection = storage::open_workspace_db_read_only(workspace_paths)
+            .expect("operational DB should open read-only");
+        let revision =
+            storage::operational_recall_revision(&connection).expect("revision should build");
+        let counts = connection
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM nodes),
+                    (SELECT COUNT(*) FROM links),
+                    (SELECT COUNT(*) FROM aliases),
+                    (SELECT COUNT(*) FROM tags),
+                    (SELECT COUNT(*) FROM sources),
+                    (SELECT COUNT(*) FROM events),
+                    (SELECT COUNT(*) FROM registries),
+                    (SELECT COUNT(*) FROM tool_contracts),
+                    (SELECT COUNT(*) FROM mcp_profiles)",
+                [],
+                |row| {
+                    Ok([
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                    ])
+                },
+            )
+            .expect("operational row counts should query");
+        (revision, counts)
+    }
+
+    fn run_task_apply_cli(
+        task_id: &task::TaskId,
+        bundle_id: Option<&task::TaskBundleId>,
+        selections: &[(&str, i64)],
+        none_relevant: bool,
+    ) -> ExitCode {
+        let mut arguments = vec![
+            "aopmem".to_string(),
+            "--json".to_string(),
+            "task".to_string(),
+            "apply".to_string(),
+            "--task-id".to_string(),
+            task_id.as_str().to_string(),
+        ];
+        if let Some(bundle_id) = bundle_id {
+            arguments.extend(["--bundle-id".to_string(), bundle_id.as_str().to_string()]);
+        }
+        for (flag, node_id) in selections {
+            arguments.extend([(*flag).to_string(), node_id.to_string()]);
+        }
+        if none_relevant {
+            arguments.push("--none-relevant".to_string());
+        }
+        let cli = Cli::try_parse_from(arguments).expect("task apply should parse");
+        run_parsed(&cli)
+    }
+
+    fn run_task_complete_cli(
+        task_id: &task::TaskId,
+        result: &str,
+        error_code: Option<&str>,
+        reason: Option<&str>,
+    ) -> ExitCode {
+        let mut arguments = vec![
+            "aopmem".to_string(),
+            "--json".to_string(),
+            "task".to_string(),
+            "complete".to_string(),
+            "--task-id".to_string(),
+            task_id.as_str().to_string(),
+            "--result".to_string(),
+            result.to_string(),
+        ];
+        if let Some(error_code) = error_code {
+            arguments.extend(["--error-code".to_string(), error_code.to_string()]);
+        }
+        if let Some(reason) = reason {
+            arguments.extend(["--reason".to_string(), reason.to_string()]);
+        }
+        let cli = Cli::try_parse_from(arguments).expect("task complete should parse");
+        run_parsed(&cli)
+    }
+
     fn seed_recall_parent(
         workspace_paths: &storage::WorkspacePaths,
         bundle_id: &recall::RecallBundleId,
@@ -7602,6 +10068,114 @@ mod tests {
     }
 
     #[test]
+    fn teach_propose_stdin_is_exclusive_bounded_utf8_and_canary_safe_on_error() {
+        const CANARY: &str = "TEST_ONLY_TOKEN_STAGE009_TRANSPORT_CANARY";
+
+        let stdin = Cli::try_parse_from([
+            "aopmem",
+            "teach",
+            "propose",
+            "--session-id",
+            "11",
+            "--apply",
+            "--payload-stdin",
+        ])
+        .expect("stdin teach proposal should parse");
+        let Command::Teach {
+            command: TeachCommand::Propose(stdin_args),
+        } = stdin.command
+        else {
+            panic!("teach propose should parse");
+        };
+        assert!(stdin_args.payload.is_none());
+        assert!(stdin_args.payload_stdin);
+        assert!(stdin_args.apply);
+
+        for invalid in [
+            vec!["aopmem", "teach", "propose", "--session-id", "11"],
+            vec![
+                "aopmem",
+                "teach",
+                "propose",
+                "--session-id",
+                "11",
+                "--payload-stdin",
+            ],
+            vec![
+                "aopmem",
+                "teach",
+                "propose",
+                "--session-id",
+                "11",
+                "--payload",
+                "{\"items\":[]}",
+                "--payload-stdin",
+            ],
+        ] {
+            assert!(
+                Cli::try_parse_from(invalid).is_err(),
+                "missing or ambiguous payload transport must fail"
+            );
+        }
+
+        assert_eq!(
+            read_teach_payload(Cursor::new(b"{\"items\":[]}"))
+                .expect("bounded UTF-8 payload should read"),
+            "{\"items\":[]}"
+        );
+        assert_eq!(
+            read_teach_payload(Cursor::new(vec![b'x'; MAX_STRUCTURED_PAYLOAD_BYTES + 1]))
+                .expect_err("oversized stdin payload should fail")
+                .code,
+            "INVALID_ARGS"
+        );
+        assert_eq!(
+            read_teach_payload(Cursor::new([0xff]))
+                .expect_err("non-UTF-8 stdin payload should fail")
+                .message,
+            "teach payload must be valid UTF-8"
+        );
+        assert_eq!(
+            read_teach_payload(Cursor::new(b"{\"items\":[]}\0"))
+                .expect_err("NUL stdin payload should fail")
+                .message,
+            "teach payload must not contain NUL bytes"
+        );
+
+        let malformed = format!("{{\"items\":[{{\"body\":\"{CANARY}\"}}]");
+        let error =
+            parse_teach_proposal(&malformed).expect_err("malformed proposal should fail safely");
+        assert!(!error.message.contains(CANARY));
+        assert!(!error.fix_hint.contains(CANARY));
+    }
+
+    #[test]
+    fn stage_009_secret_contract_allows_use_and_requires_atomic_tagged_persistence() {
+        let skill = include_str!("../../templates/skills/memory-keeper/SKILL.md");
+        let keeper_doc = include_str!("../../docs/MEMORY_KEEPER_V2.md");
+        let secret_doc = include_str!("../../docs/SECRET_HANDLING.md");
+        let managed_block = include_str!("../../templates/managed-block/AGENTS.managed-block.md");
+
+        for contract in [skill, keeper_doc, secret_doc, managed_block] {
+            assert!(!contract.contains("Do not store secrets"));
+        }
+        for contract in [skill, secret_doc] {
+            assert!(contract.contains("force a placeholder"));
+            assert!(contract.contains("teach propose --apply --payload-stdin"));
+            assert!(contract.contains("sensitivity:test_secret"));
+            assert!(contract.contains("Never put"));
+        }
+        assert!(skill.contains("user-provided or authorized"));
+        assert!(secret_doc.contains("provided or authorized by the user"));
+        assert!(skill.contains("Never use `remember` followed by `tag add`"));
+        assert!(secret_doc.contains("Do not split a secret-bearing"));
+        assert!(secret_doc.contains("Secret presence never changes the action class"));
+        assert!(managed_block.contains(
+            "Approval is determined by the action class, not by the presence of a secret."
+        ));
+    }
+
+    #[test]
     fn global_bundle_id_parser_accepts_only_canonical_lowercase_uuid_v4() {
         const CANONICAL: &str = "550e8400-e29b-41d4-a716-446655440000";
         let parsed = Cli::try_parse_from(["aopmem", "--bundle-id", CANONICAL, "status"])
@@ -7642,6 +10216,212 @@ mod tests {
                 .as_ref()
                 .map(recall::RecallBundleId::as_str),
             Some(CANONICAL)
+        );
+    }
+
+    #[test]
+    fn task_start_requires_exactly_one_bounded_query_transport() {
+        let inline = Cli::try_parse_from([
+            "aopmem",
+            "--json",
+            "task",
+            "start",
+            "--query",
+            "inspect release",
+        ])
+        .expect("inline task query should parse");
+        assert_eq!(command_id(&inline.command), "task_start");
+        let Command::Task {
+            command: TaskCommand::Start(inline_args),
+        } = inline.command
+        else {
+            panic!("task start should parse");
+        };
+        assert_eq!(inline_args.query.as_deref(), Some("inspect release"));
+        assert!(!inline_args.query_stdin);
+
+        let stdin = Cli::try_parse_from(["aopmem", "--json", "task", "start", "--query-stdin"])
+            .expect("stdin task query should parse");
+        let Command::Task {
+            command: TaskCommand::Start(stdin_args),
+        } = stdin.command
+        else {
+            panic!("stdin task start should parse");
+        };
+        assert!(stdin_args.query.is_none());
+        assert!(stdin_args.query_stdin);
+
+        for invalid in [
+            vec!["aopmem", "task", "start"],
+            vec!["aopmem", "task", "start", "--query", "x", "--query-stdin"],
+        ] {
+            assert!(
+                Cli::try_parse_from(invalid).is_err(),
+                "missing or ambiguous query transport must fail"
+            );
+        }
+
+        assert_eq!(
+            read_task_start_query(Cursor::new(b"  exact request  \n"))
+                .expect("UTF-8 stdin query should parse"),
+            "exact request"
+        );
+        assert_eq!(
+            read_task_start_query(Cursor::new(vec![b'x'; MAX_TASK_QUERY_BYTES + 1]))
+                .expect_err("oversized stdin query should fail")
+                .code,
+            "INVALID_ARGS"
+        );
+        assert_eq!(
+            read_task_start_query(Cursor::new([0xff]))
+                .expect_err("non-UTF-8 stdin query should fail")
+                .code,
+            "INVALID_ARGS"
+        );
+        assert_eq!(
+            validate_task_start_query(&"x".repeat(MAX_TASK_QUERY_BYTES))
+                .expect("exact inline byte limit should pass")
+                .len(),
+            MAX_TASK_QUERY_BYTES
+        );
+        for invalid in ["", " \n\t", "query\0tail"] {
+            assert_eq!(
+                validate_task_start_query(invalid)
+                    .expect_err("blank and NUL inline queries should fail")
+                    .code,
+                "INVALID_ARGS"
+            );
+        }
+        assert_eq!(
+            validate_task_start_query(&"x".repeat(MAX_TASK_QUERY_BYTES + 1))
+                .expect_err("oversized inline query should fail")
+                .code,
+            "INVALID_ARGS"
+        );
+        assert_eq!(
+            read_task_start_query(Cursor::new(b"query\0tail"))
+                .expect_err("NUL stdin query should fail")
+                .code,
+            "INVALID_ARGS"
+        );
+    }
+
+    #[test]
+    fn task_apply_and_complete_parse_minimal_stable_contract() {
+        const TASK_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
+        const BUNDLE_ID: &str = "550e8400-e29b-41d4-a716-446655440001";
+        let apply = Cli::try_parse_from([
+            "aopmem",
+            "task",
+            "apply",
+            "--task-id",
+            TASK_ID,
+            "--selected-workflow-id",
+            "7",
+            "--applied-gate-id",
+            "3",
+            "--bundle-id",
+            BUNDLE_ID,
+            "--json",
+        ])
+        .expect("global bundle should parse after task apply");
+        assert_eq!(command_id(&apply.command), "task_apply");
+        assert_eq!(
+            apply.bundle_id.as_ref().map(recall::RecallBundleId::as_str),
+            Some(BUNDLE_ID)
+        );
+        let Command::Task {
+            command: TaskCommand::Apply(apply_args),
+        } = apply.command
+        else {
+            panic!("task apply should parse");
+        };
+        assert_eq!(apply_args.applied_gate_ids, [3]);
+        assert_eq!(apply_args.selected_workflow_ids, [7]);
+
+        let complete = Cli::try_parse_from([
+            "aopmem",
+            "--json",
+            "task",
+            "complete",
+            "--task-id",
+            TASK_ID,
+            "--result",
+            "failed",
+            "--error-code",
+            "TOOL_FAILED",
+            "--reason",
+            "bounded reason",
+        ])
+        .expect("minimal task complete should parse");
+        assert_eq!(command_id(&complete.command), "task_complete");
+        let Command::Task {
+            command: TaskCommand::Complete(complete_args),
+        } = complete.command
+        else {
+            panic!("task complete should parse");
+        };
+        assert_eq!(complete_args.result, task::TaskResult::Failed);
+        assert_eq!(complete_args.error_code.as_deref(), Some("TOOL_FAILED"));
+        assert_eq!(complete_args.reason.as_deref(), Some("bounded reason"));
+        assert_eq!(
+            CliError::task_bundle_required().code,
+            "TASK_BUNDLE_REQUIRED"
+        );
+    }
+
+    #[test]
+    fn task_start_state_node_bound_covers_byte_bounded_recall_packages() {
+        const ID_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+        const ID_B: &str = "550e8400-e29b-41d4-a716-446655440001";
+        const FINGERPRINT: &str = "0123456789abcdef0123456789abcdef";
+        let build_input = |count: usize, retrieval_complete: bool, budget_exhausted: bool| {
+            let nodes = (1..=count)
+                .map(|node_id| {
+                    task::TaskBundleNode::new(
+                        i64::try_from(node_id).expect("fixture id should fit i64"),
+                        "raw_note",
+                        task::TaskContextKind::Task,
+                    )
+                    .expect("fixture bundle node should build")
+                })
+                .collect();
+            task::TaskStartInput::new(
+                task::TaskId::parse(ID_A).expect("fixture task id should parse"),
+                task::TaskBundleId::parse(ID_B).expect("fixture bundle id should parse"),
+                "bounded-workspace",
+                task::TaskFingerprint::parse(FINGERPRINT)
+                    .expect("fixture memory fingerprint should parse"),
+                task::TaskFingerprint::parse(FINGERPRINT)
+                    .expect("fixture query fingerprint should parse"),
+                true,
+                retrieval_complete,
+                budget_exhausted,
+                nodes,
+            )
+        };
+
+        assert!(
+            build_input(8_192, false, true).is_ok(),
+            "state cap must cover the 1 MiB mandatory plus 256 KiB task package"
+        );
+        assert_eq!(
+            build_input(8_193, false, true).expect_err("state count must remain bounded"),
+            task::TaskStateError::TooManyNodes
+        );
+        for (retrieval_complete, budget_exhausted) in [(true, true), (false, false)] {
+            assert_eq!(
+                build_input(0, retrieval_complete, budget_exhausted)
+                    .expect_err("completeness and budget facts must agree"),
+                task::TaskStateError::InvalidRetrievalState
+            );
+        }
+
+        let generated_bundle =
+            task::TaskBundleId::generate().expect("fallible bundle allocation should succeed");
+        assert!(
+            recall::RecallBundleId::parse(generated_bundle.as_str()).is_ok(),
+            "one fallible task bundle id must also be the recall correlation id"
         );
     }
 
@@ -8800,7 +11580,7 @@ mod tests {
         assert_eq!(envelope["data"], serde_json::json!({}));
         assert_eq!(envelope["warnings"], serde_json::json!([]));
         assert_eq!(envelope["errors"], serde_json::json!([]));
-        assert_eq!(envelope["meta"]["version"], "0.2.0-rc4");
+        assert_eq!(envelope["meta"]["version"], "0.2.0-rc5");
     }
 
     #[test]
@@ -8822,7 +11602,7 @@ mod tests {
             envelope["errors"][0]["message"],
             "command is not implemented yet: node_create"
         );
-        assert_eq!(envelope["meta"]["version"], "0.2.0-rc4");
+        assert_eq!(envelope["meta"]["version"], "0.2.0-rc5");
     }
 
     #[test]
@@ -9002,7 +11782,7 @@ mod tests {
             envelope["errors"][0]["fix_hint"],
             "run `aopmem --help` to see supported commands"
         );
-        assert_eq!(envelope["meta"]["version"], "0.2.0-rc4");
+        assert_eq!(envelope["meta"]["version"], "0.2.0-rc5");
     }
 
     #[test]
@@ -9050,8 +11830,8 @@ mod tests {
             "propose",
             "--session-id",
             "11",
-            "--payload",
-            "{\"items\":[{\"op\":\"create_node\",\"node_ref\":\"lesson_1\",\"node_type\":\"lesson\",\"status\":\"draft\",\"title\":\"Write it down\"}]}",
+            "--payload-stdin",
+            "--apply",
         ])
         .expect("teach propose should parse");
         let apply = Cli::try_parse_from([
@@ -9088,7 +11868,9 @@ mod tests {
                 command: TeachCommand::Propose(args),
             } => {
                 assert_eq!(args.session_id, 11);
-                assert!(args.payload.contains("\"create_node\""));
+                assert!(args.payload.is_none());
+                assert!(args.payload_stdin);
+                assert!(args.apply);
             }
             _ => panic!("expected teach propose command"),
         }
@@ -9297,8 +12079,8 @@ mod tests {
             Command::Tool {
                 command: ToolCommand::List(args),
             } => {
-                assert_eq!(args.limit, 5);
-                assert_eq!(args.after_id.as_deref(), Some("alpha"));
+                assert_eq!(args.page.limit, 5);
+                assert_eq!(args.page.after_id.as_deref(), Some("alpha"));
             }
             _ => panic!("expected tool page command"),
         }
@@ -9550,7 +12332,7 @@ mod tests {
         match tool.command {
             Command::Tool {
                 command: ToolCommand::List(args),
-            } => assert_eq!(args.cursor.as_deref(), Some(tool_cursor.as_str())),
+            } => assert_eq!(args.page.cursor.as_deref(), Some(tool_cursor.as_str())),
             _ => panic!("expected tool list"),
         }
         match mcp.command {
@@ -10241,6 +13023,214 @@ mod tests {
     }
 
     #[test]
+    fn tool_dedupe_plan_parses_stage_012_json_contract() {
+        let plan = Cli::try_parse_from(["aopmem", "tool", "dedupe", "plan", "--json"])
+            .expect("tool dedupe plan should parse with trailing global JSON");
+        assert!(plan.json);
+        assert_eq!(command_id(&plan.command), "tool_dedupe_plan");
+        assert!(matches!(
+            plan.command,
+            Command::Tool {
+                command: ToolCommand::Dedupe {
+                    command: ToolDedupeCommand::Plan
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn stage_014_dedupe_apply_requires_exact_only_json_syntax() {
+        let apply = Cli::try_parse_from([
+            "aopmem",
+            "tool",
+            "dedupe",
+            "apply",
+            "--exact-only",
+            "--json",
+        ])
+        .expect("exact-only apply should parse");
+        assert!(apply.json);
+        assert_eq!(command_id(&apply.command), "tool_dedupe_apply");
+        assert!(Cli::try_parse_from(["aopmem", "tool", "dedupe", "apply", "--json"]).is_err());
+        let plan = Cli::try_parse_from(["aopmem", "tool", "dedupe", "plan", "--json"])
+            .expect("plan remains available");
+        assert_eq!(command_id(&plan.command), "tool_dedupe_plan");
+    }
+
+    #[test]
+    fn stage_014_dedupe_apply_io_error_never_exposes_raw_path() {
+        let canary = "/private/aopmem/RAW_APPLY_IO_PATH_CANARY";
+        let error =
+            tool_dedupe_apply_cli_error(tools::ToolDedupeApplyError::Io(io::Error::other(canary)));
+        let text = format!("{}: {}", error.code, error.message);
+        let json = error_envelope("tool_dedupe_apply", &error);
+
+        assert_eq!(error.code, "TOOL_DEDUPE_PLAN_FAILED");
+        assert_eq!(error.message, "TOOL_DEDUPE_FILESYSTEM_UNSAFE");
+        assert!(text.contains("TOOL_DEDUPE_FILESYSTEM_UNSAFE"));
+        assert!(json.contains("TOOL_DEDUPE_FILESYSTEM_UNSAFE"));
+        assert!(!text.contains(canary));
+        assert!(!json.contains(canary));
+    }
+
+    #[test]
+    fn stage_013_tool_alias_resolve_list_and_distinction_syntax_parse() {
+        let add = Cli::try_parse_from([
+            "aopmem",
+            "tool",
+            "alias",
+            "add",
+            "short-reader",
+            "--to",
+            "canonical-reader",
+        ])
+        .expect("tool alias add should parse");
+        let list = Cli::try_parse_from([
+            "aopmem",
+            "tool",
+            "list",
+            "--include-aliases",
+            "--limit",
+            "7",
+        ])
+        .expect("tool list alias rows should parse");
+        let remove = Cli::try_parse_from(["aopmem", "tool", "alias", "remove", "short-reader"])
+            .expect("tool alias remove should parse");
+        let resolve = Cli::try_parse_from(["aopmem", "tool", "resolve", "short-reader"])
+            .expect("tool resolve should parse");
+        let create = Cli::try_parse_from([
+            "aopmem",
+            "tool",
+            "create-draft",
+            "--id",
+            "different-reader",
+            "--name",
+            "Different Reader",
+            "--technical-distinction",
+            "uses another wire protocol",
+        ])
+        .expect("bounded distinction transport should parse without value echo validation");
+
+        assert_eq!(command_id(&add.command), "tool_alias_add");
+        assert_eq!(command_id(&remove.command), "tool_alias_remove");
+        assert_eq!(command_id(&resolve.command), "tool_resolve");
+        match list.command {
+            Command::Tool {
+                command: ToolCommand::List(args),
+            } => {
+                assert!(args.include_aliases);
+                assert_eq!(args.page.limit, 7);
+            }
+            _ => panic!("expected tool list"),
+        }
+        match create.command {
+            Command::Tool {
+                command: ToolCommand::CreateDraft(args),
+            } => assert!(args.technical_distinction.is_some()),
+            _ => panic!("expected guarded draft create"),
+        }
+    }
+
+    #[test]
+    fn stage_013_technical_distinction_errors_never_echo_raw_canary() {
+        let canary = "STAGE_013_PRIVATE_DISTINCTION";
+        let error = CliError::invalid_technical_distinction();
+        let envelope = error_envelope("tool_create_draft", &error);
+        assert!(!error.message.contains(canary));
+        assert!(!error.fix_hint.contains(canary));
+        assert!(!envelope.contains(canary));
+
+        let parsed = Cli::try_parse_from([
+            "aopmem",
+            "tool",
+            "create-draft",
+            "--id",
+            "reader",
+            "--name",
+            "Reader",
+            "--technical-distinction",
+            canary,
+        ])
+        .expect("clap must accept raw distinction without echoing parser validation");
+        match parsed.command {
+            Command::Tool {
+                command: ToolCommand::CreateDraft(args),
+            } => {
+                assert!(tools::validate_technical_distinction(
+                    args.technical_distinction
+                        .as_deref()
+                        .expect("distinction should remain invocation-local")
+                )
+                .is_ok());
+            }
+            _ => panic!("expected create draft"),
+        }
+    }
+
+    #[test]
+    fn stage_013_tool_list_rows_keep_canonical_page_semantics() {
+        let contract = tools::ToolContract {
+            tool_id: "canonical".to_string(),
+            name: "Canonical".to_string(),
+            status: "active".to_string(),
+            owner_workflow: None,
+            command: tools::ToolCommand {
+                entrypoint: "bin/run".to_string(),
+            },
+            args_schema: json!({"type":"object"}),
+            output_schema: json!({"type":"object"}),
+            side_effects: "none".to_string(),
+            approval_requirement: "none".to_string(),
+            examples: vec![tools::ToolExample {
+                name: "run".to_string(),
+                args: Vec::new(),
+                description: None,
+            }],
+            runtime: tools::ToolRuntimeInfo {
+                executable_path: "bin/run".to_string(),
+                runtime_dir: Some("runtime".to_string()),
+                timeout_ms: tools::DEFAULT_TOOL_TIMEOUT_MS,
+                stdout_limit_bytes: tools::DEFAULT_TOOL_OUTPUT_LIMIT_BYTES,
+                stderr_limit_bytes: tools::DEFAULT_TOOL_OUTPUT_LIMIT_BYTES,
+                supports_dry_run: false,
+                output_mode: tools::ToolOutputMode::Inline,
+            },
+            platform_launchers: std::collections::BTreeMap::new(),
+        };
+        let record = tools::ToolContractRecord {
+            contract: contract.clone(),
+            created_at: "2026-01-01".to_string(),
+            updated_at: "2026-01-01".to_string(),
+        };
+        let aliases = std::collections::BTreeMap::from([(
+            "canonical".to_string(),
+            vec![tools::ToolAlias {
+                alias: "short".to_string(),
+                canonical_tool_id: "canonical".to_string(),
+                created_at: "2026-01-01".to_string(),
+                source: "test".to_string(),
+                status: "active".to_string(),
+            }],
+        )]);
+        let data = tool_list_data(
+            storage::Page {
+                items: vec![record],
+                next_after_id: Some("canonical".to_string()),
+                more_results: true,
+            },
+            aliases,
+            true,
+        )
+        .expect("tool rows should serialize");
+        assert_eq!(data["canonical_count"], 1);
+        assert_eq!(data["tools"].as_array().map(Vec::len), Some(2));
+        assert_eq!(data["tools"][0]["aliases"][0], "short");
+        assert_eq!(data["tools"][1]["row_type"], "alias");
+        assert!(data["more_results"].as_bool().unwrap_or(false));
+        assert!(data["next_cursor"].is_string());
+    }
+
+    #[test]
     fn tool_run_parses_stage_035_args() {
         let run = Cli::try_parse_from([
             "aopmem",
@@ -10709,6 +13699,154 @@ mod tests {
 
         assert_eq!(exit_code, ExitCode::from(EXIT_SUCCESS));
 
+        drop(_cwd);
+        fs::remove_dir_all(&override_home).expect("temp AOPMEM_HOME should be removed");
+        fs::remove_dir_all(&repo_root).expect("temp repo root should be removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stage_009_authorized_auth_read_uses_exact_canary_without_memory_write_or_approval() {
+        const CANARY: &str = "TEST_ONLY_TOKEN_STAGE009_AUTH_CANARY";
+
+        let _lock = install::test_env_lock()
+            .lock()
+            .expect("test lock should not be poisoned");
+        let override_home = temp_path("stage-009-auth-home");
+        let home = temp_path("stage-009-auth-fallback-home");
+        let repo_root = temp_path("stage-009-auth-repo");
+        let _aopmem_home = EnvGuard::set(AOPMEM_HOME_ENV, &override_home);
+        let _home = EnvGuard::set(HOME_ENV, &home);
+        fs::create_dir_all(&repo_root).expect("repo root should be created");
+        let _cwd = CurrentDirGuard::set(&repo_root);
+
+        for (tool_id, name, side_effects) in [
+            (
+                "stage-009-auth-read",
+                "Stage 009 Auth Read",
+                "external_read",
+            ),
+            (
+                "stage-009-external-write",
+                "Stage 009 External Write",
+                "external_write",
+            ),
+        ] {
+            let create = Cli::try_parse_from([
+                "aopmem",
+                "--json",
+                "tool",
+                "create-draft",
+                "--id",
+                tool_id,
+                "--name",
+                name,
+                "--side-effects",
+                side_effects,
+                "--approval-requirement",
+                "none",
+            ])
+            .expect("stage 009 tool draft should parse");
+            assert_eq!(
+                run_command(&create.command, create.json),
+                ExitCode::from(EXIT_SUCCESS)
+            );
+        }
+
+        let (_workspace_key, workspace_paths, connection) =
+            open_current_workspace_context().expect("workspace context should open");
+        let auth_executable = tools::tool_dir(&workspace_paths, "stage-009-auth-read")
+            .join("bin/stage-009-auth-read");
+        write_executable(
+            &auth_executable,
+            &format!(
+                "#!/bin/sh\n[ \"$1\" = '{CANARY}' ] || exit 41\nprintf 'authenticated-read\\n'\n"
+            ),
+        );
+        let write_marker = workspace_paths.artifacts().join("stage-009-write.txt");
+        let write_executable_path = tools::tool_dir(&workspace_paths, "stage-009-external-write")
+            .join("bin/stage-009-external-write");
+        write_executable(
+            &write_executable_path,
+            &format!(
+                "#!/bin/sh\n[ \"$1\" = '{CANARY}' ] || exit 42\nprintf approved > '{}'\n",
+                write_marker.display()
+            ),
+        );
+
+        let baseline_revision = storage::operational_recall_revision(&connection)
+            .expect("baseline revision should build");
+        let baseline_node_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM nodes", [], |row| row.get(0))
+            .expect("baseline nodes should count");
+        let baseline_tag_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM tags", [], |row| row.get(0))
+            .expect("baseline tags should count");
+        let credential_args = vec![CANARY.to_string()];
+
+        let authenticated = tools::run_tool(
+            &workspace_paths,
+            &connection,
+            "stage-009-auth-read",
+            &credential_args,
+            None,
+        )
+        .expect("authorized external read should use the exact credential without approval");
+        assert_eq!(authenticated.stdout, "authenticated-read\n");
+        assert!(authenticated.stderr.is_empty());
+        assert_eq!(
+            storage::operational_recall_revision(&connection)
+                .expect("post-read revision should build"),
+            baseline_revision
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM nodes", [], |row| row.get::<_, i64>(0))
+                .expect("post-read nodes should count"),
+            baseline_node_count
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM tags", [], |row| row.get::<_, i64>(0))
+                .expect("post-read tags should count"),
+            baseline_tag_count
+        );
+
+        let blocked = tools::run_tool(
+            &workspace_paths,
+            &connection,
+            "stage-009-external-write",
+            &credential_args,
+            None,
+        )
+        .expect_err("external write should stay blocked without approval");
+        assert!(matches!(
+            blocked,
+            tools::RunToolError::UnsafeActionBlocked { .. }
+        ));
+        assert!(!write_marker.exists());
+
+        let approved = tools::run_tool(
+            &workspace_paths,
+            &connection,
+            "stage-009-external-write",
+            &credential_args,
+            Some("+++"),
+        )
+        .expect("standalone exact approval should allow the external write fixture");
+        assert_eq!(approved.exit_code, 0);
+        assert_eq!(
+            fs::read_to_string(&write_marker).expect("approved write marker should read"),
+            "approved"
+        );
+        assert_eq!(
+            storage::operational_recall_revision(&connection)
+                .expect("post-write revision should build"),
+            baseline_revision,
+            "tool execution must not create operational memory"
+        );
+
+        drop(connection);
         drop(_cwd);
         fs::remove_dir_all(&override_home).expect("temp AOPMEM_HOME should be removed");
         fs::remove_dir_all(&repo_root).expect("temp repo root should be removed");
@@ -11262,7 +14400,7 @@ mod tests {
     }
 
     #[test]
-    fn existing_unopenable_recall_database_records_atomic_correlated_failure() {
+    fn existing_unopenable_recall_database_disables_observability() {
         let _lock = install::test_env_lock()
             .lock()
             .expect("env lock should not be poisoned");
@@ -11294,47 +14432,22 @@ mod tests {
             run_recall("recall", args, cli.json, &mut observation),
             ExitCode::from(EXIT_IO_ERROR)
         );
-        assert!(observation.warnings_after(Vec::new()).is_empty());
+        assert_eq!(
+            observation
+                .warnings_after(Vec::new())
+                .iter()
+                .map(|warning| warning.code)
+                .collect::<Vec<_>>(),
+            [OBSERVABILITY_WRITE_FAILED]
+        );
         let bundle_id = observation
             .bundle_id
             .clone()
             .expect("failed recall should retain its chosen bundle");
-
-        let observability = rusqlite::Connection::open(workspace_paths.observability_db())
-            .expect("observability DB should open");
-        let parent: (String, String, String, i64, String) = observability
-            .query_row(
-                "SELECT bundle_id, outcome, error_code, duration_ms, correlation_id \
-                 FROM recall_bundles",
-                [],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                    ))
-                },
-            )
-            .expect("failed recall parent should query");
-        assert_eq!(parent.0, bundle_id.as_str());
-        assert_eq!(parent.1, "failure");
-        assert_eq!(parent.2, "IO_ERROR");
-        assert!(parent.3 >= 0);
-        let events = observed_command_events(&workspace_paths, "recall");
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].event_type, "recall.started");
-        assert_eq!(events[0].outcome, "started");
-        assert_eq!(events[0].bundle_id.as_deref(), Some(bundle_id.as_str()));
-        assert_eq!(events[0].correlation_id, parent.4);
-        assert_eq!(events[0].duration_ms, None);
-        assert_eq!(events[1].event_type, "recall.failed");
-        assert_eq!(events[1].outcome, "failure");
-        assert_eq!(events[1].error_code.as_deref(), Some("IO_ERROR"));
-        assert_eq!(events[1].bundle_id.as_deref(), Some(bundle_id.as_str()));
-        assert_eq!(events[1].correlation_id, parent.4);
-        assert_eq!(events[1].duration_ms, Some(parent.3));
+        assert!(
+            !workspace_paths.observability_db().exists(),
+            "an unreadable tagged-value source must not create observability"
+        );
 
         let rendered = recall_error_envelope_with_meta_and_warnings(
             "recall",
@@ -11355,7 +14468,6 @@ mod tests {
             bundle_id.as_str()
         );
 
-        drop(observability);
         drop(_cwd);
         fs::remove_dir_all(override_home).expect("temp AOPMEM_HOME should remove");
         fs::remove_dir_all(repo_root).expect("temp repo root should remove");
@@ -11842,6 +14954,1765 @@ mod tests {
         assert_eq!(value["budget"]["task"]["used_bytes"], task_bytes);
         assert!(value.get("bundle").is_none());
         assert!(value.get("content_truncated").is_none());
+    }
+
+    #[test]
+    fn complete_task_recall_reads_all_layers_once_and_merges_selection_reasons() {
+        let query = "internalcompleteproof";
+        let mut connection = rusqlite::Connection::open_in_memory()
+            .expect("in-memory DB should open for complete task recall");
+        crate::schema::apply_migrations(&mut connection).expect("migrations should apply");
+        let first_root = storage::create_node(
+            &connection,
+            &storage::NewNode {
+                node_type: "workflow".to_string(),
+                status: "active".to_string(),
+                title: query.to_string(),
+                summary: Some("canonical workflow".to_string()),
+                body: Some(query.to_string()),
+                source_ref: Some("source=user_instruction".to_string()),
+                confidence: Some(1.0),
+                trust_level: Some("high".to_string()),
+            },
+        )
+        .expect("first root should create");
+        let second_root = storage::create_node(
+            &connection,
+            &storage::NewNode {
+                node_type: "workflow".to_string(),
+                status: "active".to_string(),
+                title: query.to_string(),
+                summary: Some("linked workflow".to_string()),
+                body: Some(query.to_string()),
+                source_ref: Some("source=teach/session".to_string()),
+                confidence: Some(0.9),
+                trust_level: Some("medium".to_string()),
+            },
+        )
+        .expect("second root should create");
+        storage::create_link(
+            &connection,
+            &storage::NewLink {
+                source_node_id: second_root.id,
+                target_node_id: first_root.id,
+                link_type: "uses".to_string(),
+            },
+        )
+        .expect("cross-layer link should create");
+        for index in 0..130 {
+            storage::create_node(
+                &connection,
+                &storage::NewNode {
+                    node_type: "raw_note".to_string(),
+                    status: "draft".to_string(),
+                    title: format!("Candidate {index}"),
+                    summary: None,
+                    body: Some(format!("{query} evidence {index}")),
+                    source_ref: None,
+                    confidence: None,
+                    trust_level: None,
+                },
+            )
+            .expect("task candidate should create");
+        }
+        let mandatory = recall::build_mandatory_recall_context(Vec::new())
+            .expect("empty mandatory context should fit");
+
+        let outcome = build_complete_task_recall_response(&connection, query, mandatory)
+            .expect("complete task recall should build");
+
+        assert!(outcome.retrieval_complete);
+        assert!(!outcome.budget_exhausted());
+        assert!(!outcome.budget.task.exhausted);
+        assert_eq!(outcome.task.nodes.len(), 132);
+        let selected = outcome
+            .task
+            .nodes
+            .iter()
+            .find(|selected| selected.node.id == first_root.id)
+            .expect("first root should be selected once");
+        assert!(selected
+            .selection_reasons
+            .iter()
+            .any(|reason| matches!(reason, recall::RecallSelectionReason::TypedRoot { .. })));
+        assert!(selected
+            .selection_reasons
+            .iter()
+            .any(|reason| matches!(reason, recall::RecallSelectionReason::FtsBm25 { .. })));
+        assert!(selected
+            .selection_reasons
+            .iter()
+            .any(|reason| matches!(reason, recall::RecallSelectionReason::DirectLink { .. })));
+        assert!(selected
+            .selection_reasons
+            .iter()
+            .any(|reason| matches!(reason, recall::RecallSelectionReason::GraphTraversal { .. })));
+    }
+
+    #[test]
+    fn complete_task_recall_consumes_more_than_128_candidates_from_every_layer() {
+        const LAYER_SIZE: usize = 129;
+        let query = "q";
+        let mut connection = rusqlite::Connection::open_in_memory()
+            .expect("in-memory DB should open for all-layer recall");
+        crate::schema::apply_migrations(&mut connection).expect("migrations should apply");
+        let mut roots = Vec::with_capacity(LAYER_SIZE);
+        let mut correction_family_ids = Vec::with_capacity(LAYER_SIZE * 2);
+        for index in 0..LAYER_SIZE {
+            let root_type = match index % 4 {
+                0 => "workflow",
+                1 => "tool_contract",
+                2 => "correction",
+                _ => "failure_mode",
+            };
+            let root = storage::create_node(
+                &connection,
+                &storage::NewNode {
+                    node_type: root_type.to_string(),
+                    status: "draft".to_string(),
+                    title: query.to_string(),
+                    summary: None,
+                    body: None,
+                    source_ref: None,
+                    confidence: None,
+                    trust_level: None,
+                },
+            )
+            .expect("typed root should create");
+            storage::create_node(
+                &connection,
+                &storage::NewNode {
+                    node_type: "raw_note".to_string(),
+                    status: "draft".to_string(),
+                    title: format!("n{index}"),
+                    summary: None,
+                    body: Some(query.to_string()),
+                    source_ref: None,
+                    confidence: None,
+                    trust_level: None,
+                },
+            )
+            .expect("FTS candidate should create");
+            let direct = storage::create_node(
+                &connection,
+                &storage::NewNode {
+                    node_type: "lesson".to_string(),
+                    status: "draft".to_string(),
+                    title: format!("d{index}"),
+                    summary: None,
+                    body: None,
+                    source_ref: None,
+                    confidence: None,
+                    trust_level: None,
+                },
+            )
+            .expect("direct candidate should create");
+            let graph = storage::create_node(
+                &connection,
+                &storage::NewNode {
+                    node_type: "incident_scar".to_string(),
+                    status: "draft".to_string(),
+                    title: format!("g{index}"),
+                    summary: None,
+                    body: None,
+                    source_ref: None,
+                    confidence: None,
+                    trust_level: None,
+                },
+            )
+            .expect("graph candidate should create");
+            correction_family_ids.extend([direct.id, graph.id]);
+            storage::create_link(
+                &connection,
+                &storage::NewLink {
+                    source_node_id: root.id,
+                    target_node_id: direct.id,
+                    link_type: "has_lesson".to_string(),
+                },
+            )
+            .expect("direct link should create");
+            storage::create_link(
+                &connection,
+                &storage::NewLink {
+                    source_node_id: direct.id,
+                    target_node_id: graph.id,
+                    link_type: "uses".to_string(),
+                },
+            )
+            .expect("graph link should create");
+            roots.push(root);
+        }
+        storage::create_link(
+            &connection,
+            &storage::NewLink {
+                source_node_id: roots[1].id,
+                target_node_id: roots[0].id,
+                link_type: "uses".to_string(),
+            },
+        )
+        .expect("cross-layer merge link should create");
+
+        let candidates = storage::load_task_recall_candidates(
+            &connection,
+            query,
+            TASK_START_MAX_CANDIDATES_PER_LAYER,
+        )
+        .expect("all candidate layers should load");
+        assert!(candidates.typed_roots.len() > 128);
+        assert!(candidates.fts_results.len() > 128);
+        assert!(candidates.direct_nodes.len() > 128);
+        assert!(candidates.graph_nodes.len() > 128);
+        assert!(!candidates.more_results);
+
+        let outcome = build_complete_task_recall_response(
+            &connection,
+            query,
+            recall::build_mandatory_recall_context(Vec::new())
+                .expect("empty mandatory context should fit"),
+        )
+        .expect("all-layer task recall should build");
+
+        assert!(outcome.retrieval_complete);
+        assert!(!outcome.scan_budget_exhausted);
+        assert_eq!(outcome.task.nodes.len(), LAYER_SIZE * 4);
+        let merged = outcome
+            .task
+            .nodes
+            .iter()
+            .find(|selected| selected.node.id == roots[0].id)
+            .expect("cross-layer root should be selected");
+        assert!(merged
+            .selection_reasons
+            .iter()
+            .any(|reason| matches!(reason, recall::RecallSelectionReason::TypedRoot { .. })));
+        assert!(merged
+            .selection_reasons
+            .iter()
+            .any(|reason| matches!(reason, recall::RecallSelectionReason::FtsBm25 { .. })));
+        assert!(merged
+            .selection_reasons
+            .iter()
+            .any(|reason| matches!(reason, recall::RecallSelectionReason::DirectLink { .. })));
+        assert!(merged
+            .selection_reasons
+            .iter()
+            .any(|reason| matches!(reason, recall::RecallSelectionReason::GraphTraversal { .. })));
+        for root_type in ["correction", "failure_mode"] {
+            assert!(outcome.task.nodes.iter().any(|selected| {
+                selected.selection_reasons.iter().any(|reason| {
+                    matches!(
+                        reason,
+                        recall::RecallSelectionReason::GraphTraversal {
+                            root_node_type,
+                            ..
+                        } if root_node_type == root_type
+                    )
+                })
+            }));
+        }
+        assert!(outcome.task.nodes.iter().any(|selected| {
+            selected.selection_reasons.iter().any(|reason| {
+                matches!(
+                    reason,
+                    recall::RecallSelectionReason::Expansion {
+                        expansion_type: recall::RecallExpansionType::FailureMode,
+                        ..
+                    }
+                )
+            })
+        }));
+        let state_nodes =
+            task_start_bundle_nodes(&outcome).expect("state bundle nodes should normalize");
+        for node_id in &correction_family_ids[..2] {
+            assert_eq!(
+                state_nodes
+                    .iter()
+                    .find(|node| node.node_id == *node_id)
+                    .expect("correction-family node should be persisted")
+                    .node_type,
+                "correction"
+            );
+        }
+        let relevant_corrections =
+            task_start_node_ids(&outcome, &["correction", "lesson", "incident_scar"]);
+        assert!(correction_family_ids
+            .iter()
+            .all(|node_id| relevant_corrections.contains(node_id)));
+    }
+
+    #[test]
+    fn complete_task_recall_keeps_scan_and_byte_budget_exhaustion_distinct() {
+        let query = "scanbudgetproof";
+        let mut connection = rusqlite::Connection::open_in_memory()
+            .expect("in-memory DB should open for task budget proof");
+        crate::schema::apply_migrations(&mut connection).expect("migrations should apply");
+        for index in 0..2 {
+            storage::create_node(
+                &connection,
+                &storage::NewNode {
+                    node_type: "workflow".to_string(),
+                    status: "draft".to_string(),
+                    title: query.to_string(),
+                    summary: Some(format!("candidate {index}")),
+                    body: Some(query.to_string()),
+                    source_ref: None,
+                    confidence: None,
+                    trust_level: None,
+                },
+            )
+            .expect("scan candidate should create");
+        }
+
+        let scan_limited = build_complete_task_recall_response_with_limit(
+            &connection,
+            query,
+            recall::build_mandatory_recall_context(Vec::new())
+                .expect("empty mandatory context should fit"),
+            1,
+        )
+        .expect("scan-limited task recall should build");
+
+        assert!(!scan_limited.retrieval_complete);
+        assert!(scan_limited.scan_budget_exhausted);
+        assert!(!scan_limited.byte_budget_exhausted);
+        assert!(scan_limited.budget_exhausted());
+        assert!(!scan_limited.budget.task.exhausted);
+        assert!(scan_limited.budget.task.remaining_bytes > 0);
+
+        let byte_query = "bytebudgetproof";
+        for marker in ['a', 'b'] {
+            storage::create_node(
+                &connection,
+                &storage::NewNode {
+                    node_type: "workflow".to_string(),
+                    status: "draft".to_string(),
+                    title: byte_query.to_string(),
+                    summary: None,
+                    body: Some(marker.to_string().repeat(150_000)),
+                    source_ref: None,
+                    confidence: None,
+                    trust_level: None,
+                },
+            )
+            .expect("large byte candidate should create");
+        }
+        let byte_limited = build_complete_task_recall_response_with_limit(
+            &connection,
+            byte_query,
+            recall::build_mandatory_recall_context(Vec::new())
+                .expect("empty mandatory context should fit"),
+            10,
+        )
+        .expect("byte-limited task recall should build");
+
+        assert!(!byte_limited.retrieval_complete);
+        assert!(!byte_limited.scan_budget_exhausted);
+        assert!(byte_limited.byte_budget_exhausted);
+        assert!(byte_limited.budget_exhausted());
+        assert!(byte_limited.budget.task.exhausted);
+        assert_eq!(byte_limited.task.nodes.len(), 1);
+    }
+
+    #[test]
+    fn complete_task_recall_caps_full_candidate_payload_before_packing() {
+        let query = "hugebudgetproof";
+        let mut connection = rusqlite::Connection::open_in_memory()
+            .expect("in-memory DB should open for resident scan budget proof");
+        crate::schema::apply_migrations(&mut connection).expect("migrations should apply");
+        for index in 0..17 {
+            let body = format!(
+                "{query} {}",
+                "x".repeat(storage::MAX_NODE_BODY_BYTES - query.len() - 1)
+            );
+            assert_eq!(body.len(), storage::MAX_NODE_BODY_BYTES);
+            storage::create_node(
+                &connection,
+                &storage::NewNode {
+                    node_type: "raw_note".to_string(),
+                    status: "draft".to_string(),
+                    title: format!("Huge candidate {index}"),
+                    summary: None,
+                    body: Some(body),
+                    source_ref: None,
+                    confidence: None,
+                    trust_level: None,
+                },
+            )
+            .expect("maximum-body candidate should create");
+        }
+
+        let candidates = storage::load_task_recall_candidates(
+            &connection,
+            query,
+            TASK_START_MAX_CANDIDATES_PER_LAYER,
+        )
+        .expect("resident-bounded candidate scan should succeed");
+        assert!(candidates.more_results);
+        assert!(!candidates.fts_results.is_empty());
+        assert!(candidates.fts_results.len() < 17);
+        assert!(
+            candidates
+                .fts_results
+                .iter()
+                .map(|result| result.node.body.as_ref().map_or(0, String::len))
+                .sum::<usize>()
+                <= storage::TASK_RECALL_CANDIDATE_SCAN_MAX_BYTES
+        );
+
+        let outcome = build_complete_task_recall_response(
+            &connection,
+            query,
+            recall::build_mandatory_recall_context(Vec::new())
+                .expect("empty mandatory context should fit"),
+        )
+        .expect("resident-bounded task package should build");
+        assert!(outcome.scan_budget_exhausted);
+        assert!(outcome.byte_budget_exhausted);
+        assert!(!outcome.retrieval_complete);
+        assert!(outcome.budget_exhausted());
+    }
+
+    #[test]
+    fn task_start_is_durable_private_and_operationally_read_only() {
+        let _lock = install::test_env_lock()
+            .lock()
+            .expect("env lock should not be poisoned");
+        let override_home = temp_path("task-start-private-home");
+        let repo_root = temp_path("task-start-private-repo");
+        let _aopmem_home = EnvGuard::set(AOPMEM_HOME_ENV, &override_home);
+        fs::create_dir_all(&repo_root).expect("repo root should create");
+        let _cwd = CurrentDirGuard::set(&repo_root);
+        let (workspace_key, workspace_paths, connection) =
+            open_current_workspace_context().expect("workspace should initialize");
+        storage::create_node(
+            &connection,
+            &storage::NewNode {
+                node_type: "gate".to_string(),
+                status: "active".to_string(),
+                title: "Always use task memory".to_string(),
+                summary: None,
+                body: Some("apply mandatory constraints".to_string()),
+                source_ref: Some("source=user_instruction".to_string()),
+                confidence: Some(1.0),
+                trust_level: Some("high".to_string()),
+            },
+        )
+        .expect("mandatory gate should create");
+        storage::create_node(
+            &connection,
+            &storage::NewNode {
+                node_type: "workflow".to_string(),
+                status: "draft".to_string(),
+                title: "Privacy workflow".to_string(),
+                summary: Some("safe task start".to_string()),
+                body: Some("privacy workflow context".to_string()),
+                source_ref: None,
+                confidence: None,
+                trust_level: None,
+            },
+        )
+        .expect("task workflow should create");
+        let revision_before =
+            storage::operational_recall_revision(&connection).expect("revision should build");
+        drop(connection);
+
+        let raw_query = "privacycanary workflow";
+        let cli = Cli::try_parse_from(["aopmem", "--json", "task", "start", "--query", raw_query])
+            .expect("task start should parse");
+
+        assert_eq!(run_command(&cli.command, cli.json), ExitCode::SUCCESS);
+
+        let operational = storage::open_workspace_db_read_only(&workspace_paths)
+            .expect("operational DB should reopen read-only");
+        let revision_after =
+            storage::operational_recall_revision(&operational).expect("revision should rebuild");
+        assert_eq!(revision_after, revision_before);
+        drop(operational);
+
+        let observability = rusqlite::Connection::open(workspace_paths.observability_db())
+            .expect("observability DB should open");
+        let (task_id, bundle_id, stored_workspace, stored_revision, status): (
+            String,
+            String,
+            String,
+            String,
+            String,
+        ) = observability
+            .query_row(
+                "SELECT task_id, bundle_id, workspace_key, memory_revision, status
+                 FROM tasks",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("authoritative task state should query");
+        assert_eq!(stored_workspace, workspace_key);
+        assert_eq!(status, "started");
+        assert!(task::TaskId::parse(&task_id).is_ok());
+        assert!(task::TaskBundleId::parse(&bundle_id).is_ok());
+        assert_eq!(
+            observability
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .expect("observability version should query"),
+            2
+        );
+        assert!(
+            observability
+                .query_row("SELECT COUNT(*) FROM task_bundle_nodes", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("bundle count should query")
+                >= 2
+        );
+        drop(observability);
+
+        let state = task::load(
+            &workspace_paths,
+            &task::TaskId::parse(&task_id).expect("stored task id should parse"),
+        )
+        .expect("stored task should load");
+        assert_eq!(state.bundle_id.as_str(), bundle_id);
+        assert_eq!(state.memory_revision.as_str(), stored_revision);
+        let operational = storage::open_workspace_db_read_only(&workspace_paths)
+            .expect("operational DB should reopen for output contract");
+        let mandatory = recall::build_mandatory_recall_context(
+            storage::load_active_mandatory_recall_nodes(&operational)
+                .expect("mandatory nodes should reload"),
+        )
+        .expect("mandatory context should rebuild");
+        let outcome = build_complete_task_recall_response(&operational, raw_query, mandatory)
+            .expect("task recall output should rebuild");
+        let data = task_start_data(&state, &outcome);
+        for field in [
+            "task_id",
+            "bundle_id",
+            "workspace_key",
+            "memory_revision",
+            "mandatory_context_complete",
+            "retrieval_complete",
+            "budget_exhausted",
+            "mandatory_nodes",
+            "task_nodes",
+            "applicable_gates",
+            "applicable_rules",
+            "candidate_workflows",
+            "candidate_tools",
+            "relevant_corrections",
+            "relevant_failure_modes",
+            "hunches",
+            "selection_reasons",
+        ] {
+            assert!(data.get(field).is_some(), "required output field {field}");
+        }
+        assert!(data.get("continuation_cursor").is_none());
+        assert!(
+            !serde_json::to_string(&data)
+                .expect("task start data should serialize")
+                .contains(raw_query),
+            "raw query must not be echoed by the task package"
+        );
+        drop(operational);
+        let events = observed_command_events(&workspace_paths, "task_start");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "task.started");
+        assert_eq!(events[0].outcome, "started");
+        assert_eq!(events[0].bundle_id.as_deref(), Some(bundle_id.as_str()));
+        assert!(events[0].payload_json.contains(&task_id));
+
+        let persisted_paths = [
+            workspace_paths.db().clone(),
+            PathBuf::from(format!("{}-wal", workspace_paths.db().display())),
+            workspace_paths.observability_db().clone(),
+            PathBuf::from(format!(
+                "{}-wal",
+                workspace_paths.observability_db().display()
+            )),
+        ];
+        for path in persisted_paths {
+            if let Ok(bytes) = fs::read(&path) {
+                assert!(
+                    !bytes
+                        .windows(raw_query.len())
+                        .any(|window| window == raw_query.as_bytes()),
+                    "raw task query leaked into {}",
+                    path.display()
+                );
+            }
+        }
+
+        drop(_cwd);
+        fs::remove_dir_all(override_home).expect("temp AOPMEM_HOME should remove");
+        fs::remove_dir_all(repo_root).expect("temp repo root should remove");
+    }
+
+    #[test]
+    fn task_start_mandatory_overflow_is_exact_and_atomic() {
+        let _lock = install::test_env_lock()
+            .lock()
+            .expect("env lock should not be poisoned");
+        let override_home = temp_path("task-start-overflow-home");
+        let repo_root = temp_path("task-start-overflow-repo");
+        let _aopmem_home = EnvGuard::set(AOPMEM_HOME_ENV, &override_home);
+        fs::create_dir_all(&repo_root).expect("repo root should create");
+        let _cwd = CurrentDirGuard::set(&repo_root);
+        let (_workspace_key, workspace_paths, connection) =
+            open_current_workspace_context().expect("workspace should initialize");
+        storage::create_node(
+            &connection,
+            &storage::NewNode {
+                node_type: "gate".to_string(),
+                status: "active".to_string(),
+                title: "Overflow gate".to_string(),
+                summary: None,
+                body: Some("x".repeat(recall::MANDATORY_RECALL_HARD_BUDGET_BYTES)),
+                source_ref: Some("source=user_instruction".to_string()),
+                confidence: Some(1.0),
+                trust_level: Some("high".to_string()),
+            },
+        )
+        .expect("maximum-size mandatory node should create");
+        let revision_before =
+            storage::operational_recall_revision(&connection).expect("revision should build");
+        let overflow = recall::build_mandatory_recall_context(
+            storage::load_active_mandatory_recall_nodes(&connection)
+                .expect("mandatory node should load"),
+        )
+        .expect_err("canonical selected node overhead must exceed the hard budget");
+        let (hard_limit_bytes, offending_count) = match overflow {
+            recall::MandatoryContextBuildError::Overflow {
+                hard_limit_bytes,
+                offending_node_ids,
+                ..
+            } => (hard_limit_bytes, offending_node_ids.len()),
+            error => panic!("expected exact overflow, got {error}"),
+        };
+        assert_eq!(hard_limit_bytes, recall::MANDATORY_RECALL_HARD_BUDGET_BYTES);
+        assert_eq!(
+            CliError::mandatory_context_overflow(hard_limit_bytes, offending_count).code,
+            "MANDATORY_CONTEXT_OVERFLOW"
+        );
+        drop(connection);
+
+        let cli = Cli::try_parse_from([
+            "aopmem",
+            "--json",
+            "task",
+            "start",
+            "--query",
+            "overflow proof",
+        ])
+        .expect("task start should parse");
+        assert_eq!(
+            run_command(&cli.command, cli.json),
+            ExitCode::from(EXIT_GENERIC_ERROR)
+        );
+
+        let operational = storage::open_workspace_db_read_only(&workspace_paths)
+            .expect("operational DB should remain readable");
+        assert_eq!(
+            storage::operational_recall_revision(&operational)
+                .expect("revision should remain readable"),
+            revision_before
+        );
+        assert!(
+            !workspace_paths.observability_db().exists(),
+            "failed mandatory package must not create task or event state"
+        );
+
+        drop(operational);
+        drop(_cwd);
+        fs::remove_dir_all(override_home).expect("temp AOPMEM_HOME should remove");
+        fs::remove_dir_all(repo_root).expect("temp repo root should remove");
+    }
+
+    #[test]
+    fn task_start_authority_survives_best_effort_projection_failure() {
+        let _lock = install::test_env_lock()
+            .lock()
+            .expect("env lock should not be poisoned");
+        let override_home = temp_path("task-start-projection-home");
+        let repo_root = temp_path("task-start-projection-repo");
+        let _aopmem_home = EnvGuard::set(AOPMEM_HOME_ENV, &override_home);
+        fs::create_dir_all(&repo_root).expect("repo root should create");
+        let _cwd = CurrentDirGuard::set(&repo_root);
+        let (_workspace_key, workspace_paths, connection) =
+            open_current_workspace_context().expect("workspace should initialize");
+        storage::create_node(
+            &connection,
+            &storage::NewNode {
+                node_type: "workflow".to_string(),
+                status: "draft".to_string(),
+                title: "Projection proof".to_string(),
+                summary: None,
+                body: Some("authoritative start survives".to_string()),
+                source_ref: None,
+                confidence: None,
+                trust_level: None,
+            },
+        )
+        .expect("workflow should create");
+        drop(connection);
+
+        let cli = Cli::try_parse_from([
+            "aopmem",
+            "--json",
+            "task",
+            "start",
+            "--query",
+            "Projection proof",
+        ])
+        .expect("task start should parse");
+        let Command::Task {
+            command: TaskCommand::Start(args),
+        } = &cli.command
+        else {
+            panic!("task start arguments should parse");
+        };
+        let mut observation = CommandObservation::new("task_start", None);
+        observation.attach_attempted = true;
+        observation.latch_write_warning();
+
+        assert_eq!(
+            run_task_start("task_start", args, cli.json, &mut observation),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            observation
+                .warnings_after(Vec::new())
+                .iter()
+                .map(|warning| warning.code)
+                .collect::<Vec<_>>(),
+            [OBSERVABILITY_WRITE_FAILED]
+        );
+        let observability = rusqlite::Connection::open(workspace_paths.observability_db())
+            .expect("authoritative task store should open");
+        assert_eq!(
+            observability
+                .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get::<_, i64>(0))
+                .expect("task count should query"),
+            1
+        );
+        assert_eq!(
+            observability
+                .query_row("SELECT COUNT(*) FROM observability_events", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("event count should query"),
+            0
+        );
+
+        drop(observability);
+        drop(_cwd);
+        fs::remove_dir_all(override_home).expect("temp AOPMEM_HOME should remove");
+        fs::remove_dir_all(repo_root).expect("temp repo root should remove");
+    }
+
+    #[test]
+    fn task_start_missing_memory_fails_closed_without_observability_state() {
+        let _lock = install::test_env_lock()
+            .lock()
+            .expect("env lock should not be poisoned");
+        let override_home = temp_path("task-start-missing-home");
+        let repo_root = temp_path("task-start-missing-repo");
+        let _aopmem_home = EnvGuard::set(AOPMEM_HOME_ENV, &override_home);
+        fs::create_dir_all(&repo_root).expect("repo root should create");
+        let _cwd = CurrentDirGuard::set(&repo_root);
+        let cli = Cli::try_parse_from([
+            "aopmem",
+            "--json",
+            "task",
+            "start",
+            "--query",
+            "missing memory",
+        ])
+        .expect("task start should parse");
+
+        assert_eq!(
+            run_command(&cli.command, cli.json),
+            ExitCode::from(EXIT_WORKSPACE_NOT_FOUND)
+        );
+        assert!(
+            !override_home.exists(),
+            "failed task start must not create observability or workspace state"
+        );
+
+        drop(_cwd);
+        fs::remove_dir_all(repo_root).expect("temp repo root should remove");
+    }
+
+    #[test]
+    fn task_apply_complete_are_exactly_idempotent_and_operationally_read_only() {
+        let _lock = install::test_env_lock()
+            .lock()
+            .expect("env lock should not be poisoned");
+        let override_home = temp_path("task-lifecycle-home");
+        let repo_root = temp_path("task-lifecycle-repo");
+        let _aopmem_home = EnvGuard::set(AOPMEM_HOME_ENV, &override_home);
+        fs::create_dir_all(&repo_root).expect("repo root should create");
+        let _cwd = CurrentDirGuard::set(&repo_root);
+        let (workspace_key, workspace_paths, operational) =
+            open_current_workspace_context().expect("workspace should initialize");
+        let workflow_id =
+            create_task_protocol_node(&operational, "workflow", "draft", "Draft workflow");
+        let tool_id =
+            create_task_protocol_node(&operational, "tool_contract", "active", "Active tool");
+        let lesson_id =
+            create_task_protocol_node(&operational, "lesson", "draft", "Relevant lesson");
+        let started = record_task_protocol_start(
+            &workspace_paths,
+            &workspace_key,
+            &operational,
+            vec![
+                task::TaskBundleNode::new(workflow_id, "workflow", task::TaskContextKind::Task)
+                    .expect("workflow bundle node should validate"),
+                task::TaskBundleNode::new(tool_id, "tool_contract", task::TaskContextKind::Task)
+                    .expect("tool bundle node should validate"),
+                task::TaskBundleNode::new(lesson_id, "correction", task::TaskContextKind::Task)
+                    .expect("normalized lesson bundle node should validate"),
+            ],
+            true,
+            false,
+        );
+        drop(operational);
+        let operational_before_apply = operational_task_snapshot(&workspace_paths);
+        let selections = [
+            ("--selected-workflow-id", workflow_id),
+            ("--selected-tool-id", tool_id),
+            ("--selected-correction-id", lesson_id),
+        ];
+
+        assert_eq!(
+            run_task_apply_cli(
+                &started.task_id,
+                Some(&started.bundle_id),
+                &selections,
+                false,
+            ),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            operational_task_snapshot(&workspace_paths),
+            operational_before_apply,
+            "task apply must not change operational content or row counts"
+        );
+
+        let applied =
+            task::load(&workspace_paths, &started.task_id).expect("applied state should load");
+        assert_eq!(applied.status, task::TaskStatus::Applied);
+        let apply_data = task_apply_data(&applied, false);
+        assert_eq!(apply_data["selected_workflow_ids"], json!([workflow_id]));
+        assert_eq!(apply_data["selected_tool_ids"], json!([tool_id]));
+        assert_eq!(apply_data["selected_correction_ids"], json!([lesson_id]));
+        assert_eq!(apply_data["replayed"], false);
+        let apply_events = observed_command_events(&workspace_paths, "task_apply");
+        assert_eq!(apply_events.len(), 1);
+        assert_eq!(apply_events[0].event_type, "task.context_applied");
+        assert_eq!(apply_events[0].outcome, "applied");
+        assert_eq!(
+            apply_events[0].bundle_id.as_deref(),
+            Some(started.bundle_id.as_str())
+        );
+        assert!(apply_events[0]
+            .payload_json
+            .contains(started.task_id.as_str()));
+
+        let operational =
+            storage::open_workspace_db(&workspace_paths).expect("operational DB should open");
+        create_task_protocol_node(
+            &operational,
+            "raw_note",
+            "draft",
+            "Revision changes after apply",
+        );
+        drop(operational);
+        assert_eq!(
+            run_task_apply_cli(
+                &started.task_id,
+                Some(&started.bundle_id),
+                &selections,
+                false,
+            ),
+            ExitCode::SUCCESS,
+            "exact replay must not re-read a now-stale operational revision"
+        );
+        assert_eq!(
+            observed_command_events(&workspace_paths, "task_apply").len(),
+            1,
+            "exact replay must not duplicate task.context_applied"
+        );
+        assert_eq!(
+            run_task_apply_cli(
+                &started.task_id,
+                Some(&started.bundle_id),
+                &[("--selected-workflow-id", workflow_id)],
+                false,
+            ),
+            ExitCode::from(EXIT_VALIDATION_FAILED),
+            "different apply replay must conflict before stale revalidation"
+        );
+
+        let operational_before_complete = operational_task_snapshot(&workspace_paths);
+        assert_eq!(
+            run_task_complete_cli(&started.task_id, "success", None, None),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            operational_task_snapshot(&workspace_paths),
+            operational_before_complete,
+            "task complete must not write operational memory"
+        );
+        let completed =
+            task::load(&workspace_paths, &started.task_id).expect("completed state should load");
+        assert_eq!(completed.status, task::TaskStatus::Completed);
+        assert_eq!(completed.result, Some(task::TaskResult::Success));
+        assert!(completed.duration_ms.is_some());
+        let complete_data = task_complete_data(&completed, false);
+        assert_eq!(complete_data["selected_workflow_ids"], json!([workflow_id]));
+        assert_eq!(complete_data["selected_tool_ids"], json!([tool_id]));
+        for field in [
+            "task_id",
+            "bundle_id",
+            "workspace_key",
+            "memory_revision",
+            "status",
+            "result",
+            "duration_ms",
+            "error_code",
+            "selected_workflow_ids",
+            "selected_tool_ids",
+            "finished_at",
+            "replayed",
+        ] {
+            assert!(
+                complete_data.get(field).is_some(),
+                "completion output field {field}"
+            );
+        }
+        let complete_events = observed_command_events(&workspace_paths, "task_complete");
+        assert_eq!(complete_events.len(), 1);
+        assert_eq!(complete_events[0].event_type, "task.completed");
+        assert_eq!(complete_events[0].outcome, "success");
+        assert_eq!(
+            complete_events[0].bundle_id.as_deref(),
+            Some(started.bundle_id.as_str())
+        );
+        assert_eq!(
+            complete_events[0].duration_ms,
+            completed
+                .duration_ms
+                .and_then(|value| i64::try_from(value).ok())
+        );
+
+        assert_eq!(
+            run_task_complete_cli(&started.task_id, "success", None, None),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            observed_command_events(&workspace_paths, "task_complete").len(),
+            1,
+            "exact completion replay must not duplicate task.completed"
+        );
+        assert_eq!(
+            run_task_complete_cli(&started.task_id, "partial", None, None),
+            ExitCode::from(EXIT_VALIDATION_FAILED)
+        );
+        assert_eq!(
+            run_task_apply_cli(
+                &started.task_id,
+                Some(&started.bundle_id),
+                &selections,
+                false,
+            ),
+            ExitCode::SUCCESS,
+            "exact apply replay remains valid after terminal completion"
+        );
+        let immutable =
+            task::load(&workspace_paths, &started.task_id).expect("terminal state should load");
+        assert_eq!(immutable.status, task::TaskStatus::Completed);
+        assert_eq!(immutable.result, Some(task::TaskResult::Success));
+
+        drop(_cwd);
+        fs::remove_dir_all(override_home).expect("temp AOPMEM_HOME should remove");
+        fs::remove_dir_all(repo_root).expect("temp repo root should remove");
+    }
+
+    #[test]
+    fn task_apply_tp04_through_tp08_fail_closed_with_stable_errors() {
+        let _lock = install::test_env_lock()
+            .lock()
+            .expect("env lock should not be poisoned");
+        let override_home = temp_path("task-apply-negative-home");
+        let repo_root = temp_path("task-apply-negative-repo");
+        let _aopmem_home = EnvGuard::set(AOPMEM_HOME_ENV, &override_home);
+        fs::create_dir_all(&repo_root).expect("repo root should create");
+        let _cwd = CurrentDirGuard::set(&repo_root);
+        let (workspace_key, workspace_paths, operational) =
+            open_current_workspace_context().expect("workspace should initialize");
+        let workflow_id =
+            create_task_protocol_node(&operational, "workflow", "active", "Current workflow");
+        let stale = record_task_protocol_start(
+            &workspace_paths,
+            &workspace_key,
+            &operational,
+            vec![
+                task::TaskBundleNode::new(workflow_id, "workflow", task::TaskContextKind::Task)
+                    .expect("workflow bundle node should validate"),
+            ],
+            true,
+            false,
+        );
+        create_task_protocol_node(
+            &operational,
+            "raw_note",
+            "draft",
+            "Makes stored revision stale",
+        );
+        let inactive_ids = ["deprecated", "superseded", "broken"].map(|status| {
+            (
+                status,
+                create_task_protocol_node(
+                    &operational,
+                    "workflow",
+                    status,
+                    &format!("{status} workflow"),
+                ),
+            )
+        });
+
+        assert_eq!(
+            run_task_apply_cli(
+                &stale.task_id,
+                Some(&stale.bundle_id),
+                &[("--selected-workflow-id", workflow_id)],
+                false,
+            ),
+            ExitCode::from(EXIT_VALIDATION_FAILED)
+        );
+        assert_eq!(
+            CliError::task_state(task::TaskStateError::StaleRevision).code,
+            "TASK_STALE_REVISION"
+        );
+
+        let unknown_id = 9_999_999;
+        let unknown = record_task_protocol_start(
+            &workspace_paths,
+            &workspace_key,
+            &operational,
+            vec![
+                task::TaskBundleNode::new(unknown_id, "workflow", task::TaskContextKind::Task)
+                    .expect("unknown bundle node should validate"),
+            ],
+            true,
+            false,
+        );
+        assert_eq!(
+            run_task_apply_cli(
+                &unknown.task_id,
+                Some(&unknown.bundle_id),
+                &[("--selected-workflow-id", unknown_id)],
+                false,
+            ),
+            ExitCode::from(EXIT_VALIDATION_FAILED)
+        );
+        assert_eq!(
+            CliError::task_state(task::TaskStateError::UnknownNode).code,
+            "TASK_UNKNOWN_NODE"
+        );
+
+        let outside = record_task_protocol_start(
+            &workspace_paths,
+            &workspace_key,
+            &operational,
+            Vec::new(),
+            true,
+            false,
+        );
+        assert_eq!(
+            run_task_apply_cli(
+                &outside.task_id,
+                Some(&outside.bundle_id),
+                &[("--selected-workflow-id", workflow_id)],
+                false,
+            ),
+            ExitCode::from(EXIT_VALIDATION_FAILED)
+        );
+        assert_eq!(
+            CliError::task_state(task::TaskStateError::NodeOutsideBundle).code,
+            "TASK_NODE_OUTSIDE_BUNDLE"
+        );
+
+        for (status, node_id) in inactive_ids {
+            let inactive = record_task_protocol_start(
+                &workspace_paths,
+                &workspace_key,
+                &operational,
+                vec![
+                    task::TaskBundleNode::new(node_id, "workflow", task::TaskContextKind::Task)
+                        .expect("inactive bundle node should validate"),
+                ],
+                true,
+                false,
+            );
+            assert_eq!(
+                run_task_apply_cli(
+                    &inactive.task_id,
+                    Some(&inactive.bundle_id),
+                    &[("--selected-workflow-id", node_id)],
+                    false,
+                ),
+                ExitCode::from(EXIT_VALIDATION_FAILED),
+                "{status} nodes must be rejected"
+            );
+            assert_eq!(
+                task::load(&workspace_paths, &inactive.task_id)
+                    .expect("inactive rejection state should load")
+                    .status,
+                task::TaskStatus::Started
+            );
+        }
+        assert_eq!(
+            CliError::task_state(task::TaskStateError::InactiveNode).code,
+            "TASK_NODE_INACTIVE"
+        );
+
+        let wrong_kind = record_task_protocol_start(
+            &workspace_paths,
+            &workspace_key,
+            &operational,
+            vec![
+                task::TaskBundleNode::new(workflow_id, "workflow", task::TaskContextKind::Task)
+                    .expect("workflow bundle node should validate"),
+            ],
+            true,
+            false,
+        );
+        assert_eq!(
+            run_task_apply_cli(
+                &wrong_kind.task_id,
+                Some(&wrong_kind.bundle_id),
+                &[("--selected-tool-id", workflow_id)],
+                false,
+            ),
+            ExitCode::from(EXIT_VALIDATION_FAILED)
+        );
+        assert_eq!(
+            CliError::task_state(task::TaskStateError::NodeKindMismatch).code,
+            "TASK_NODE_KIND_MISMATCH"
+        );
+
+        let wrong_bundle =
+            task::TaskBundleId::generate().expect("foreign bundle id should generate");
+        assert_eq!(
+            run_task_apply_cli(
+                &wrong_kind.task_id,
+                Some(&wrong_bundle),
+                &[("--selected-workflow-id", workflow_id)],
+                false,
+            ),
+            ExitCode::from(EXIT_VALIDATION_FAILED)
+        );
+        assert_eq!(
+            run_task_apply_cli(
+                &wrong_kind.task_id,
+                None,
+                &[("--selected-workflow-id", workflow_id)],
+                false,
+            ),
+            ExitCode::from(EXIT_INVALID_ARGS)
+        );
+
+        let wrong_workspace = record_task_protocol_start(
+            &workspace_paths,
+            &workspace_key,
+            &operational,
+            vec![
+                task::TaskBundleNode::new(workflow_id, "workflow", task::TaskContextKind::Task)
+                    .expect("workflow bundle node should validate"),
+            ],
+            true,
+            false,
+        );
+        let observability = rusqlite::Connection::open(workspace_paths.observability_db())
+            .expect("observability DB should open");
+        observability
+            .execute(
+                "UPDATE tasks SET workspace_key = 'foreign-workspace' WHERE task_id = ?1",
+                [wrong_workspace.task_id.as_str()],
+            )
+            .expect("foreign workspace fixture should inject");
+        drop(observability);
+        assert_eq!(
+            run_task_apply_cli(
+                &wrong_workspace.task_id,
+                Some(&wrong_workspace.bundle_id),
+                &[("--selected-workflow-id", workflow_id)],
+                false,
+            ),
+            ExitCode::from(EXIT_VALIDATION_FAILED)
+        );
+        assert_eq!(
+            CliError::task_state(task::TaskStateError::WrongWorkspace).code,
+            "TASK_WRONG_WORKSPACE"
+        );
+        assert!(
+            observed_command_events(&workspace_paths, "task_apply").is_empty(),
+            "rejected apply attempts must not project success events"
+        );
+
+        drop(operational);
+        drop(_cwd);
+        fs::remove_dir_all(override_home).expect("temp AOPMEM_HOME should remove");
+        fs::remove_dir_all(repo_root).expect("temp repo root should remove");
+    }
+
+    #[test]
+    fn task_apply_normalizes_corrections_and_enforces_none_relevant_proof() {
+        let _lock = install::test_env_lock()
+            .lock()
+            .expect("env lock should not be poisoned");
+        let override_home = temp_path("task-none-relevant-home");
+        let repo_root = temp_path("task-none-relevant-repo");
+        let _aopmem_home = EnvGuard::set(AOPMEM_HOME_ENV, &override_home);
+        fs::create_dir_all(&repo_root).expect("repo root should create");
+        let _cwd = CurrentDirGuard::set(&repo_root);
+        let (workspace_key, workspace_paths, operational) =
+            open_current_workspace_context().expect("workspace should initialize");
+        let gate_id = create_task_protocol_node(&operational, "gate", "active", "Mandatory gate");
+        let correction_family = ["correction", "lesson", "incident_scar"].map(|node_type| {
+            (
+                node_type,
+                create_task_protocol_node(
+                    &operational,
+                    node_type,
+                    "draft",
+                    &format!("{node_type} candidate"),
+                ),
+            )
+        });
+        let workflow_id =
+            create_task_protocol_node(&operational, "workflow", "draft", "Task workflow");
+
+        let corrections = record_task_protocol_start(
+            &workspace_paths,
+            &workspace_key,
+            &operational,
+            correction_family
+                .iter()
+                .map(|(_, node_id)| {
+                    task::TaskBundleNode::new(*node_id, "correction", task::TaskContextKind::Task)
+                        .expect("normalized correction bundle node should validate")
+                })
+                .collect(),
+            true,
+            false,
+        );
+        let correction_selections = correction_family
+            .iter()
+            .map(|(_, node_id)| ("--selected-correction-id", *node_id))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            run_task_apply_cli(
+                &corrections.task_id,
+                Some(&corrections.bundle_id),
+                &correction_selections,
+                false,
+            ),
+            ExitCode::SUCCESS
+        );
+        let applied_corrections = task::load(&workspace_paths, &corrections.task_id)
+            .expect("correction state should load");
+        assert_eq!(
+            task_applied_node_ids(&applied_corrections, task::AppliedNodeKind::Correction),
+            correction_family
+                .iter()
+                .map(|(_, node_id)| *node_id)
+                .collect::<Vec<_>>()
+        );
+
+        let none_positive = record_task_protocol_start(
+            &workspace_paths,
+            &workspace_key,
+            &operational,
+            vec![
+                task::TaskBundleNode::new(gate_id, "gate", task::TaskContextKind::Mandatory)
+                    .expect("mandatory gate should validate"),
+            ],
+            true,
+            false,
+        );
+        for flag in [
+            "--selected-workflow-id",
+            "--selected-tool-id",
+            "--selected-correction-id",
+            "--selected-failure-mode-id",
+        ] {
+            assert_eq!(
+                run_task_apply_cli(
+                    &none_positive.task_id,
+                    Some(&none_positive.bundle_id),
+                    &[(flag, gate_id)],
+                    true,
+                ),
+                ExitCode::from(EXIT_VALIDATION_FAILED),
+                "{flag} must conflict with --none-relevant"
+            );
+        }
+        assert_eq!(
+            run_task_apply_cli(
+                &none_positive.task_id,
+                Some(&none_positive.bundle_id),
+                &[("--applied-gate-id", gate_id)],
+                true,
+            ),
+            ExitCode::SUCCESS,
+            "mandatory gate facts may accompany a zero-task-node proof"
+        );
+        let none_state = task::load(&workspace_paths, &none_positive.task_id)
+            .expect("none-relevant state should load");
+        assert_eq!(none_state.status, task::TaskStatus::Applied);
+        assert!(none_state.none_relevant);
+        assert_eq!(
+            task_applied_node_ids(&none_state, task::AppliedNodeKind::Gate),
+            [gate_id]
+        );
+
+        let task_nodes_present = record_task_protocol_start(
+            &workspace_paths,
+            &workspace_key,
+            &operational,
+            vec![
+                task::TaskBundleNode::new(workflow_id, "workflow", task::TaskContextKind::Task)
+                    .expect("task workflow should validate"),
+            ],
+            true,
+            false,
+        );
+        assert_eq!(
+            run_task_apply_cli(
+                &task_nodes_present.task_id,
+                Some(&task_nodes_present.bundle_id),
+                &[],
+                true,
+            ),
+            ExitCode::from(EXIT_VALIDATION_FAILED)
+        );
+
+        let budget_exhausted = record_task_protocol_start(
+            &workspace_paths,
+            &workspace_key,
+            &operational,
+            Vec::new(),
+            false,
+            true,
+        );
+        assert_eq!(
+            run_task_apply_cli(
+                &budget_exhausted.task_id,
+                Some(&budget_exhausted.bundle_id),
+                &[],
+                true,
+            ),
+            ExitCode::from(EXIT_VALIDATION_FAILED)
+        );
+
+        let empty_application = record_task_protocol_start(
+            &workspace_paths,
+            &workspace_key,
+            &operational,
+            Vec::new(),
+            true,
+            false,
+        );
+        assert_eq!(
+            run_task_apply_cli(
+                &empty_application.task_id,
+                Some(&empty_application.bundle_id),
+                &[],
+                false,
+            ),
+            ExitCode::from(EXIT_INVALID_ARGS)
+        );
+        assert_eq!(
+            CliError::task_state(task::TaskStateError::EmptyApplication).code,
+            "TASK_EMPTY_APPLICATION"
+        );
+        assert_eq!(
+            CliError::task_state(task::TaskStateError::NoneRelevantConflict).code,
+            "TASK_NONE_RELEVANT_CONFLICT"
+        );
+        assert_eq!(
+            observed_command_events(&workspace_paths, "task_apply").len(),
+            2,
+            "only correction apply and proven none-relevant apply should project"
+        );
+
+        drop(operational);
+        drop(_cwd);
+        fs::remove_dir_all(override_home).expect("temp AOPMEM_HOME should remove");
+        fs::remove_dir_all(repo_root).expect("temp repo root should remove");
+    }
+
+    #[test]
+    fn task_complete_tp09_handles_partial_failure_privacy_and_bundle_binding() {
+        let _lock = install::test_env_lock()
+            .lock()
+            .expect("env lock should not be poisoned");
+        let override_home = temp_path("task-complete-home");
+        let repo_root = temp_path("task-complete-repo");
+        let _aopmem_home = EnvGuard::set(AOPMEM_HOME_ENV, &override_home);
+        fs::create_dir_all(&repo_root).expect("repo root should create");
+        let _cwd = CurrentDirGuard::set(&repo_root);
+        let (workspace_key, workspace_paths, operational) =
+            open_current_workspace_context().expect("workspace should initialize");
+        let workflow_id =
+            create_task_protocol_node(&operational, "workflow", "draft", "Partial workflow");
+        let failed_from_started = record_task_protocol_start(
+            &workspace_paths,
+            &workspace_key,
+            &operational,
+            Vec::new(),
+            true,
+            false,
+        );
+        let secret_one = "sk-abcdefghijklmnopqrstuvwxyz123456";
+        let secret_two = "sk-zyxwvutsrqponmlkjihgfedcba654321";
+        let reason_one = format!("provider rejected token {secret_one}");
+        let reason_two = format!("provider rejected token {secret_two}");
+        let fingerprint_one = task::TaskCompletionInput::for_request(
+            failed_from_started.task_id.clone(),
+            failed_from_started.bundle_id.clone(),
+            &workspace_key,
+            failed_from_started.memory_revision.clone(),
+            task::TaskResult::Failed,
+            Some("TOOL_FAILED"),
+            Some(&reason_one),
+        )
+        .expect("first failure should validate");
+        let fingerprint_two = task::TaskCompletionInput::for_request(
+            failed_from_started.task_id.clone(),
+            failed_from_started.bundle_id.clone(),
+            &workspace_key,
+            failed_from_started.memory_revision.clone(),
+            task::TaskResult::Failed,
+            Some("TOOL_FAILED"),
+            Some(&reason_two),
+        )
+        .expect("second failure should validate");
+        assert_ne!(
+            fingerprint_one.replay_fingerprint, fingerprint_two.replay_fingerprint,
+            "different raw reasons must remain conflicting after persistence redaction"
+        );
+        drop(operational);
+        let operational_before_failure = operational_task_snapshot(&workspace_paths);
+
+        assert_eq!(
+            run_task_complete_cli(
+                &failed_from_started.task_id,
+                "failed",
+                Some("TOOL_FAILED"),
+                Some(&reason_one),
+            ),
+            ExitCode::SUCCESS,
+            "failed completion is allowed directly from started"
+        );
+        assert_eq!(
+            operational_task_snapshot(&workspace_paths),
+            operational_before_failure
+        );
+        let failed = task::load(&workspace_paths, &failed_from_started.task_id)
+            .expect("failed state should load");
+        assert_eq!(failed.status, task::TaskStatus::Failed);
+        assert_eq!(failed.result, Some(task::TaskResult::Failed));
+        assert_eq!(failed.error_code.as_deref(), Some("TOOL_FAILED"));
+        let stored_reason = failed.reason.as_deref().expect("reason should be stored");
+        assert!(stored_reason.contains("[REDACTED]"));
+        assert!(!stored_reason.contains(secret_one));
+        let failed_events = observed_command_events(&workspace_paths, "task_complete");
+        assert_eq!(failed_events.len(), 1);
+        assert_eq!(failed_events[0].event_type, "task.failed");
+        assert_eq!(failed_events[0].outcome, "failure");
+        assert_eq!(failed_events[0].error_code.as_deref(), Some("TOOL_FAILED"));
+        assert_eq!(
+            failed_events[0].bundle_id.as_deref(),
+            Some(failed_from_started.bundle_id.as_str())
+        );
+        assert_eq!(
+            failed_events[0].duration_ms,
+            failed
+                .duration_ms
+                .and_then(|value| i64::try_from(value).ok())
+        );
+
+        assert_eq!(
+            run_task_complete_cli(
+                &failed_from_started.task_id,
+                "failed",
+                Some("TOOL_FAILED"),
+                Some(&reason_one),
+            ),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            run_task_complete_cli(
+                &failed_from_started.task_id,
+                "failed",
+                Some("TOOL_FAILED"),
+                Some(&reason_two),
+            ),
+            ExitCode::from(EXIT_VALIDATION_FAILED)
+        );
+        assert_eq!(
+            observed_command_events(&workspace_paths, "task_complete").len(),
+            1,
+            "exact replay and conflicting replay must not append events"
+        );
+
+        let operational =
+            storage::open_workspace_db(&workspace_paths).expect("operational DB should open");
+        let partial = record_task_protocol_start(
+            &workspace_paths,
+            &workspace_key,
+            &operational,
+            vec![
+                task::TaskBundleNode::new(workflow_id, "workflow", task::TaskContextKind::Task)
+                    .expect("workflow bundle node should validate"),
+            ],
+            true,
+            false,
+        );
+        let mismatch = record_task_protocol_start(
+            &workspace_paths,
+            &workspace_key,
+            &operational,
+            Vec::new(),
+            true,
+            false,
+        );
+        drop(operational);
+        assert_eq!(
+            run_task_apply_cli(
+                &partial.task_id,
+                Some(&partial.bundle_id),
+                &[("--selected-workflow-id", workflow_id)],
+                false,
+            ),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            run_task_complete_cli(&partial.task_id, "success", Some("SHOULD_NOT_EXIST"), None,),
+            ExitCode::from(EXIT_INVALID_ARGS)
+        );
+        assert_eq!(
+            task::load(&workspace_paths, &partial.task_id)
+                .expect("partial task should remain readable")
+                .status,
+            task::TaskStatus::Applied
+        );
+        assert_eq!(
+            run_task_complete_cli(&partial.task_id, "partial", None, None),
+            ExitCode::SUCCESS
+        );
+        let partial_state =
+            task::load(&workspace_paths, &partial.task_id).expect("partial state should load");
+        assert_eq!(partial_state.result, Some(task::TaskResult::Partial));
+        assert_eq!(
+            task_complete_data(&partial_state, false)["selected_workflow_ids"],
+            json!([workflow_id])
+        );
+
+        let foreign_bundle =
+            task::TaskBundleId::generate().expect("foreign bundle should generate");
+        let mismatch_cli = Cli::try_parse_from([
+            "aopmem",
+            "--json",
+            "task",
+            "complete",
+            "--task-id",
+            mismatch.task_id.as_str(),
+            "--result",
+            "failed",
+            "--error-code",
+            "ABORTED",
+            "--bundle-id",
+            foreign_bundle.as_str(),
+        ])
+        .expect("complete with global bundle should parse");
+        let event_count_before_mismatch =
+            observed_command_events(&workspace_paths, "task_complete").len();
+        assert_eq!(
+            run_parsed(&mismatch_cli),
+            ExitCode::from(EXIT_VALIDATION_FAILED)
+        );
+        assert_eq!(
+            task::load(&workspace_paths, &mismatch.task_id)
+                .expect("mismatched task should remain readable")
+                .status,
+            task::TaskStatus::Started
+        );
+        assert_eq!(
+            observed_command_events(&workspace_paths, "task_complete").len(),
+            event_count_before_mismatch,
+            "foreign complete bundle must not emit an event"
+        );
+
+        for path in [
+            workspace_paths.observability_db().clone(),
+            PathBuf::from(format!(
+                "{}-wal",
+                workspace_paths.observability_db().display()
+            )),
+            PathBuf::from(format!(
+                "{}-shm",
+                workspace_paths.observability_db().display()
+            )),
+        ] {
+            if let Ok(bytes) = fs::read(&path) {
+                for secret in [secret_one, secret_two] {
+                    assert!(
+                        !bytes
+                            .windows(secret.len())
+                            .any(|window| window == secret.as_bytes()),
+                        "raw task reason leaked into {}",
+                        path.display()
+                    );
+                }
+            }
+        }
+
+        drop(_cwd);
+        fs::remove_dir_all(override_home).expect("temp AOPMEM_HOME should remove");
+        fs::remove_dir_all(repo_root).expect("temp repo root should remove");
+    }
+
+    #[test]
+    fn task_apply_complete_authority_survives_projection_failure() {
+        let _lock = install::test_env_lock()
+            .lock()
+            .expect("env lock should not be poisoned");
+        let override_home = temp_path("task-transition-projection-home");
+        let repo_root = temp_path("task-transition-projection-repo");
+        let _aopmem_home = EnvGuard::set(AOPMEM_HOME_ENV, &override_home);
+        fs::create_dir_all(&repo_root).expect("repo root should create");
+        let _cwd = CurrentDirGuard::set(&repo_root);
+        let (workspace_key, workspace_paths, operational) =
+            open_current_workspace_context().expect("workspace should initialize");
+        let workflow_id =
+            create_task_protocol_node(&operational, "workflow", "draft", "Projection workflow");
+        let started = record_task_protocol_start(
+            &workspace_paths,
+            &workspace_key,
+            &operational,
+            vec![
+                task::TaskBundleNode::new(workflow_id, "workflow", task::TaskContextKind::Task)
+                    .expect("workflow bundle node should validate"),
+            ],
+            true,
+            false,
+        );
+        drop(operational);
+
+        let apply_cli = Cli::try_parse_from([
+            "aopmem",
+            "--json",
+            "task",
+            "apply",
+            "--task-id",
+            started.task_id.as_str(),
+            "--selected-workflow-id",
+            &workflow_id.to_string(),
+            "--bundle-id",
+            started.bundle_id.as_str(),
+        ])
+        .expect("task apply should parse");
+        let Command::Task {
+            command: TaskCommand::Apply(apply_args),
+        } = &apply_cli.command
+        else {
+            panic!("task apply arguments should parse");
+        };
+        let recall_bundle = recall::RecallBundleId::parse(started.bundle_id.as_str())
+            .expect("task bundle should parse as recall bundle");
+        let mut apply_observation = CommandObservation::new("task_apply", Some(recall_bundle));
+        apply_observation.attach_attempted = true;
+        apply_observation.latch_write_warning();
+        assert_eq!(
+            run_task_apply(
+                "task_apply",
+                apply_args,
+                apply_cli.json,
+                &mut apply_observation,
+            ),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            task::load(&workspace_paths, &started.task_id)
+                .expect("applied state should load")
+                .status,
+            task::TaskStatus::Applied
+        );
+        assert!(observed_command_events(&workspace_paths, "task_apply").is_empty());
+        assert_eq!(
+            apply_observation
+                .warnings_after(Vec::new())
+                .iter()
+                .map(|warning| warning.code)
+                .collect::<Vec<_>>(),
+            [OBSERVABILITY_WRITE_FAILED]
+        );
+
+        let complete_cli = Cli::try_parse_from([
+            "aopmem",
+            "--json",
+            "task",
+            "complete",
+            "--task-id",
+            started.task_id.as_str(),
+            "--result",
+            "partial",
+        ])
+        .expect("task complete should parse");
+        let Command::Task {
+            command: TaskCommand::Complete(complete_args),
+        } = &complete_cli.command
+        else {
+            panic!("task complete arguments should parse");
+        };
+        let mut complete_observation = CommandObservation::new("task_complete", None);
+        complete_observation.attach_attempted = true;
+        complete_observation.latch_write_warning();
+        assert_eq!(
+            run_task_complete(
+                "task_complete",
+                complete_args,
+                complete_cli.json,
+                &mut complete_observation,
+            ),
+            ExitCode::SUCCESS
+        );
+        let completed =
+            task::load(&workspace_paths, &started.task_id).expect("completed state should load");
+        assert_eq!(completed.status, task::TaskStatus::Completed);
+        assert_eq!(completed.result, Some(task::TaskResult::Partial));
+        assert!(observed_command_events(&workspace_paths, "task_complete").is_empty());
+        assert_eq!(
+            complete_observation
+                .warnings_after(Vec::new())
+                .iter()
+                .map(|warning| warning.code)
+                .collect::<Vec<_>>(),
+            [OBSERVABILITY_WRITE_FAILED]
+        );
+
+        drop(_cwd);
+        fs::remove_dir_all(override_home).expect("temp AOPMEM_HOME should remove");
+        fs::remove_dir_all(repo_root).expect("temp repo root should remove");
     }
 
     #[test]
@@ -12770,6 +17641,11 @@ mod tests {
             .expect("recall read transaction should begin");
         let snapshot_revision =
             storage::operational_recall_revision(&reader).expect("snapshot revision should build");
+        let mandatory = recall::build_mandatory_recall_context(
+            storage::load_active_mandatory_recall_nodes(&reader)
+                .expect("snapshot mandatory nodes should load"),
+        )
+        .expect("snapshot mandatory context should build");
         assert_eq!(
             storage::list_nodes(&reader)
                 .expect("snapshot nodes should list")
@@ -12777,7 +17653,7 @@ mod tests {
             1
         );
 
-        storage::create_node(
+        let concurrent = storage::create_node(
             &writer,
             &storage::NewNode {
                 node_type: "lesson".to_string(),
@@ -12792,6 +17668,11 @@ mod tests {
         )
         .expect("WAL writer should not be blocked by recall reader");
 
+        let snapshot_outcome =
+            build_complete_task_recall_response(&reader, "Concurrent mutation", mandatory)
+                .expect("task pipeline should read one stable snapshot");
+        assert!(snapshot_outcome.task.nodes.is_empty());
+        assert!(snapshot_outcome.retrieval_complete);
         assert_eq!(
             storage::operational_recall_revision(&reader)
                 .expect("reader revision should remain available"),
@@ -12822,6 +17703,18 @@ mod tests {
                 .len(),
             2
         );
+        let fresh_outcome = build_complete_task_recall_response(
+            &fresh_reader,
+            "Concurrent mutation",
+            recall::build_mandatory_recall_context(Vec::new())
+                .expect("empty mandatory context should fit"),
+        )
+        .expect("fresh task pipeline should see committed mutation");
+        assert!(fresh_outcome
+            .task
+            .nodes
+            .iter()
+            .any(|selected| selected.node.id == concurrent.id));
 
         drop(fresh_reader);
         drop(reader);
@@ -13051,15 +17944,34 @@ mod tests {
     }
 
     #[test]
-    fn adapter_seed_command_parses_stage_023_args() {
+    fn adapter_seed_parses_legacy_default_and_all_explicit_stage_008_targets() {
         let default_target = Cli::try_parse_from(["aopmem", "--json", "adapter", "seed"])
             .expect("adapter seed should parse");
-        let explicit_target =
-            Cli::try_parse_from(["aopmem", "--json", "adapter", "seed", "--file", "CLAUDE.md"])
-                .expect("adapter seed with explicit file should parse");
 
         assert_eq!(command_id(&default_target.command), "adapter_seed");
-        assert_eq!(command_id(&explicit_target.command), "adapter_seed");
+        for instruction_file in [
+            "AGENTS.md",
+            "CLAUDE.md",
+            ".cursor/rules/aopmem.mdc",
+            ".github/copilot-instructions.md",
+        ] {
+            let explicit_target = Cli::try_parse_from([
+                "aopmem",
+                "--json",
+                "adapter",
+                "seed",
+                "--file",
+                instruction_file,
+            ])
+            .expect("adapter seed with explicit file should parse");
+            assert_eq!(command_id(&explicit_target.command), "adapter_seed");
+            match explicit_target.command {
+                Command::Adapter {
+                    command: AdapterCommand::Seed(args),
+                } => assert_eq!(args.file.as_deref(), Some(Path::new(instruction_file))),
+                _ => panic!("expected adapter seed command"),
+            }
+        }
     }
 
     #[test]
@@ -13107,7 +18019,7 @@ mod tests {
         let drifted = fs::read_to_string(&instruction_file)
             .expect("seeded adapter should read")
             .replace(
-                "Do not edit inside this block manually.",
+                "Operational memory remains the authority for learned gates, rules,",
                 "Manual drift inside managed block.",
             );
         fs::write(&instruction_file, drifted).expect("drifted adapter should write");
@@ -14339,6 +19251,332 @@ mod tests {
     }
 
     #[test]
+    fn stage_009_explicit_test_secret_is_node_and_tag_atomic_before_one_snapshot() {
+        const CANARY: &str = "TEST_ONLY_TOKEN_STAGE009_ATOMIC_CANARY";
+
+        let _lock = install::test_env_lock()
+            .lock()
+            .expect("test lock should not be poisoned");
+        let override_home = temp_path("stage-009-secret-atomic-home");
+        let home = temp_path("stage-009-secret-atomic-fallback-home");
+        let repo_root = temp_path("stage-009-secret-atomic-repo");
+        let _aopmem_home = EnvGuard::set(AOPMEM_HOME_ENV, &override_home);
+        let _home = EnvGuard::set(HOME_ENV, &home);
+        fs::create_dir_all(&repo_root).expect("repo root should be created");
+        let _cwd = CurrentDirGuard::set(&repo_root);
+
+        let start = Cli::try_parse_from([
+            "aopmem",
+            "--json",
+            "teach",
+            "start",
+            "--title",
+            "Test credential storage",
+        ])
+        .expect("teach start should parse");
+        assert_eq!(
+            run_command(&start.command, start.json),
+            ExitCode::from(EXIT_SUCCESS)
+        );
+
+        let (_workspace_key, workspace_paths, connection) =
+            open_current_workspace_context().expect("workspace context should open");
+        let session_id = storage::list_nodes(&connection)
+            .expect("nodes should list")
+            .last()
+            .expect("teach session should exist")
+            .id;
+        let baseline_revision = storage::operational_recall_revision(&connection)
+            .expect("baseline revision should build");
+        let baseline_snapshots = observed_event_count(&workspace_paths, "audit.snapshot.completed");
+        drop(connection);
+
+        let payload = serde_json::json!({
+            "items": [
+                {
+                    "op": "create_node",
+                    "node_ref": "test_secret",
+                    "node_type": "raw_note",
+                    "status": "active",
+                    "title": "Authorized test credential",
+                    "body": CANARY,
+                    "source_ref": "source=user_instruction",
+                    "confidence": 1.0,
+                    "trust_level": "high"
+                },
+                {
+                    "op": "add_tag",
+                    "node_ref": "test_secret",
+                    "tag": "sensitivity:test_secret"
+                }
+            ]
+        })
+        .to_string();
+        let atomic = Cli::try_parse_from([
+            "aopmem",
+            "--json",
+            "teach",
+            "propose",
+            "--session-id",
+            &session_id.to_string(),
+            "--apply",
+            "--payload-stdin",
+        ])
+        .expect("atomic teach proposal should parse");
+        let Command::Teach {
+            command: TeachCommand::Propose(args),
+        } = atomic.command
+        else {
+            panic!("atomic teach proposal should route");
+        };
+        let mut observation = CommandObservation::new("teach_propose", None);
+        let exit_code = run_teach_propose_with_reader(
+            "teach_propose",
+            &args,
+            atomic.json,
+            &mut observation,
+            Cursor::new(payload.as_bytes()),
+        );
+        drop(observation);
+
+        assert_eq!(exit_code, ExitCode::from(EXIT_SUCCESS));
+        let (_workspace_key, workspace_paths, connection) =
+            open_current_workspace_context().expect("workspace context should reopen");
+        let final_revision =
+            storage::operational_recall_revision(&connection).expect("final revision should build");
+        let nodes = storage::list_nodes(&connection).expect("nodes should list");
+        let created = nodes
+            .iter()
+            .find(|node| node.title == "Authorized test credential")
+            .expect("atomic apply should create the canonical node");
+        let tags =
+            storage::list_tags(&connection, Some(created.id)).expect("secret tags should list");
+
+        assert_ne!(final_revision, baseline_revision);
+        assert_eq!(created.node_type, "raw_note");
+        assert_eq!(created.status, "active");
+        assert_eq!(created.body.as_deref(), Some(CANARY));
+        assert!(created.summary.is_none());
+        assert_eq!(
+            created.source_ref.as_deref(),
+            Some("source=user_instruction")
+        );
+        assert_eq!(created.confidence, Some(1.0));
+        assert_eq!(created.trust_level.as_deref(), Some("high"));
+        assert_eq!(
+            tags.iter().map(|tag| tag.tag.as_str()).collect::<Vec<_>>(),
+            vec!["sensitivity:test_secret"]
+        );
+        assert_eq!(
+            nodes
+                .iter()
+                .filter(|node| node
+                    .body
+                    .as_deref()
+                    .is_some_and(|body| body.contains(CANARY)))
+                .count(),
+            2,
+            "only the target body and atomic proposal body may contain the exact value"
+        );
+        assert!(nodes.iter().all(|node| {
+            !node.title.contains(CANARY)
+                && node
+                    .summary
+                    .as_deref()
+                    .is_none_or(|summary| !summary.contains(CANARY))
+                && node
+                    .source_ref
+                    .as_deref()
+                    .is_none_or(|source| !source.contains(CANARY))
+        }));
+
+        assert_eq!(
+            observed_event_count(&workspace_paths, "audit.snapshot.completed"),
+            baseline_snapshots + 1,
+            "atomic proposal and apply must publish exactly one snapshot"
+        );
+        let snapshot = fs::read_to_string(workspace_paths.audit_git().join("memory.sql"))
+            .expect("audit snapshot should read");
+        assert!(snapshot.contains("Authorized test credential"));
+        assert!(snapshot.contains("sensitivity:test_secret"));
+        assert!(
+            !snapshot.contains(CANARY),
+            "audit export must not retain the tagged exact value"
+        );
+        assert!(snapshot.contains(crate::redaction::TEST_SECRET_REDACTION_MARKER));
+
+        let events = observed_command_events(&workspace_paths, "teach_propose");
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.event_type.as_str())
+                .collect::<Vec<_>>(),
+            vec!["teach.applied", "audit.snapshot.completed"]
+        );
+        assert!(events
+            .iter()
+            .all(|event| !event.payload_json.contains(CANARY)));
+
+        let response_shape = serde_json::to_string(&storage::TeachApplyReport {
+            session_id,
+            proposal_id: 1,
+            receipt_id: 2,
+            created_node_ids: vec![created.id],
+            created_alias_ids: Vec::new(),
+            created_tag_ids: vec![tags[0].id],
+            created_source_ids: Vec::new(),
+            created_link_ids: Vec::new(),
+        })
+        .expect("atomic response shape should serialize");
+        assert!(!response_shape.contains(CANARY));
+
+        drop(connection);
+        drop(_cwd);
+        fs::remove_dir_all(&override_home).expect("temp AOPMEM_HOME should be removed");
+        fs::remove_dir_all(&repo_root).expect("temp repo root should be removed");
+    }
+
+    #[test]
+    fn stage_009_failed_atomic_test_secret_proposal_leaves_no_state_or_snapshot() {
+        const CANARY: &str = "TEST_ONLY_TOKEN_STAGE009_ROLLBACK_CANARY";
+
+        let _lock = install::test_env_lock()
+            .lock()
+            .expect("test lock should not be poisoned");
+        let override_home = temp_path("stage-009-secret-rollback-home");
+        let home = temp_path("stage-009-secret-rollback-fallback-home");
+        let repo_root = temp_path("stage-009-secret-rollback-repo");
+        let _aopmem_home = EnvGuard::set(AOPMEM_HOME_ENV, &override_home);
+        let _home = EnvGuard::set(HOME_ENV, &home);
+        fs::create_dir_all(&repo_root).expect("repo root should be created");
+        let _cwd = CurrentDirGuard::set(&repo_root);
+
+        let start = Cli::try_parse_from([
+            "aopmem",
+            "--json",
+            "teach",
+            "start",
+            "--title",
+            "Failed test credential storage",
+        ])
+        .expect("teach start should parse");
+        assert_eq!(
+            run_command(&start.command, start.json),
+            ExitCode::from(EXIT_SUCCESS)
+        );
+
+        let (_workspace_key, workspace_paths, connection) =
+            open_current_workspace_context().expect("workspace context should open");
+        let session_id = storage::list_nodes(&connection)
+            .expect("nodes should list")
+            .last()
+            .expect("teach session should exist")
+            .id;
+        let baseline_revision = storage::operational_recall_revision(&connection)
+            .expect("baseline revision should build");
+        let baseline_node_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM nodes", [], |row| row.get(0))
+            .expect("baseline nodes should count");
+        let baseline_tag_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM tags", [], |row| row.get(0))
+            .expect("baseline tags should count");
+        let baseline_snapshots = observed_event_count(&workspace_paths, "audit.snapshot.completed");
+        drop(connection);
+
+        let payload = serde_json::json!({
+            "items": [
+                {
+                    "op": "create_node",
+                    "node_ref": "test_secret",
+                    "node_type": "raw_note",
+                    "status": "active",
+                    "title": "Authorized test credential",
+                    "body": CANARY,
+                    "source_ref": "source=user_instruction",
+                    "confidence": 1.0,
+                    "trust_level": "high"
+                },
+                {
+                    "op": "add_tag",
+                    "node_ref": "test_secret",
+                    "tag": "sensitivity:test_secret"
+                },
+                {
+                    "op": "add_tag",
+                    "node_ref": "test_secret",
+                    "tag": "sensitivity:test_secret"
+                }
+            ]
+        })
+        .to_string();
+        let atomic = Cli::try_parse_from([
+            "aopmem",
+            "--json",
+            "teach",
+            "propose",
+            "--session-id",
+            &session_id.to_string(),
+            "--apply",
+            "--payload-stdin",
+        ])
+        .expect("failing atomic proposal should parse");
+        let Command::Teach {
+            command: TeachCommand::Propose(args),
+        } = atomic.command
+        else {
+            panic!("failing atomic proposal should route");
+        };
+        let mut observation = CommandObservation::new("teach_propose", None);
+        let exit_code = run_teach_propose_with_reader(
+            "teach_propose",
+            &args,
+            atomic.json,
+            &mut observation,
+            Cursor::new(payload.as_bytes()),
+        );
+        drop(observation);
+
+        assert_eq!(exit_code, ExitCode::from(EXIT_DB_SCHEMA_ERROR));
+        let (_workspace_key, workspace_paths, connection) =
+            open_current_workspace_context().expect("workspace context should reopen");
+        assert_eq!(
+            storage::operational_recall_revision(&connection).expect("final revision should build"),
+            baseline_revision
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM nodes", [], |row| row.get::<_, i64>(0))
+                .expect("final nodes should count"),
+            baseline_node_count
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM tags", [], |row| row.get::<_, i64>(0))
+                .expect("final tags should count"),
+            baseline_tag_count
+        );
+        assert!(storage::list_nodes(&connection)
+            .expect("nodes should list")
+            .iter()
+            .all(|node| node
+                .body
+                .as_deref()
+                .is_none_or(|body| !body.contains(CANARY))));
+        assert_eq!(
+            observed_event_count(&workspace_paths, "audit.snapshot.completed"),
+            baseline_snapshots
+        );
+        assert!(observed_command_events(&workspace_paths, "teach_propose")
+            .iter()
+            .all(|event| !event.payload_json.contains(CANARY)));
+
+        drop(connection);
+        drop(_cwd);
+        fs::remove_dir_all(&override_home).expect("temp AOPMEM_HOME should be removed");
+        fs::remove_dir_all(&repo_root).expect("temp repo root should be removed");
+    }
+
+    #[test]
     fn teach_flow_stores_session_material_proposal_and_applies_deterministic_data() {
         let _lock = install::test_env_lock()
             .lock()
@@ -15238,6 +20476,218 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn stage_013_alias_run_emits_safe_resolution_before_canonical_run() {
+        let _lock = install::test_env_lock()
+            .lock()
+            .expect("test lock should not be poisoned");
+        let override_home = temp_path("stage-013-alias-observation-home");
+        let home = temp_path("stage-013-alias-observation-fallback-home");
+        let repo_root = temp_path("stage-013-alias-observation-repo");
+        let _aopmem_home = EnvGuard::set(AOPMEM_HOME_ENV, &override_home);
+        let _home = EnvGuard::set(HOME_ENV, &home);
+        fs::create_dir_all(&repo_root).expect("repo root should create");
+        let _cwd = CurrentDirGuard::set(&repo_root);
+
+        let create = Cli::try_parse_from([
+            "aopmem",
+            "--json",
+            "tool",
+            "create-draft",
+            "--id",
+            "canonical-reader",
+            "--name",
+            "Canonical Reader",
+        ])
+        .expect("canonical tool create should parse");
+        assert_eq!(
+            run_command(&create.command, create.json),
+            ExitCode::from(EXIT_SUCCESS)
+        );
+        let (_workspace_key, workspace_paths, connection) =
+            open_current_workspace_context().expect("workspace should open");
+        let mut contract = tools::read_tool_json(&workspace_paths, "canonical-reader")
+            .expect("canonical manifest should read");
+        contract.status = "active".to_string();
+        tools::write_tool_json(&workspace_paths, &contract)
+            .expect("active canonical manifest should write");
+        let contract_json =
+            serde_json::to_string_pretty(&contract).expect("contract should serialize");
+        connection
+            .execute(
+                "UPDATE tool_contracts SET status = 'active', contract_json = ?1 \
+                 WHERE tool_id = 'canonical-reader'",
+                [contract_json],
+            )
+            .expect("canonical registry should activate");
+        tools::add_tool_alias(
+            &connection,
+            &tools::NewToolAlias {
+                alias: "reader-short".to_string(),
+                canonical_tool_id: "canonical-reader".to_string(),
+                source: "stage_013_test".to_string(),
+                status: tools::TOOL_ALIAS_STATUS_ACTIVE.to_string(),
+            },
+        )
+        .expect("tool alias should create");
+        drop(connection);
+        let executable = tools::tool_dir(&workspace_paths, "canonical-reader")
+            .join("bin")
+            .join("canonical-reader");
+        write_executable(&executable, "#!/bin/sh\nprintf canonical\n");
+
+        let run = Cli::try_parse_from(["aopmem", "--json", "tool", "run", "reader-short"])
+            .expect("alias run should parse");
+        assert_eq!(
+            run_command(&run.command, run.json),
+            ExitCode::from(EXIT_SUCCESS)
+        );
+        let events = observed_command_events(&workspace_paths, "tool_run");
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.event_type.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "tool.alias_resolved",
+                "tool.validation",
+                "tool.run.started",
+                "tool.run.completed",
+            ]
+        );
+        assert!(events[0].payload_json.contains("reader-short"));
+        assert!(!events[0].payload_json.contains("technical"));
+        assert!(events[1].payload_json.contains("canonical-reader"));
+        assert!(!tools::tool_dir(&workspace_paths, "reader-short").exists());
+
+        drop(_cwd);
+        fs::remove_dir_all(override_home).expect("temp AOPMEM_HOME should remove");
+        fs::remove_dir_all(repo_root).expect("temp repo root should remove");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stage_015_confluence_alias_commands_and_canonicalized_event_are_safe() {
+        let _lock = install::test_env_lock()
+            .lock()
+            .expect("test lock should not be poisoned");
+        let override_home = temp_path("stage-015-confluence-observation-home");
+        let home = temp_path("stage-015-confluence-observation-fallback-home");
+        let repo_root = temp_path("stage-015-confluence-observation-repo");
+        let _aopmem_home = EnvGuard::set(AOPMEM_HOME_ENV, &override_home);
+        let _home = EnvGuard::set(HOME_ENV, &home);
+        fs::create_dir_all(&repo_root).expect("repo root should create");
+        let _cwd = CurrentDirGuard::set(&repo_root);
+        let (_workspace_key, workspace_paths, connection) =
+            open_current_workspace_context().expect("workspace should open");
+        for tool_id in ["confluence_reader", "confluence_reader_internal"] {
+            let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("fixtures/stage_015/confluence_tools")
+                .join(tool_id);
+            let destination = tools::tool_dir(&workspace_paths, tool_id);
+            fs::create_dir_all(destination.join("bin")).expect("fixture bin should create");
+            fs::copy(fixture.join("tool.json"), destination.join("tool.json"))
+                .expect("fixture manifest should copy");
+            let runner = destination.join("bin/runner");
+            fs::copy(fixture.join("bin/runner"), &runner).expect("fixture runner should copy");
+            let mut permissions = fs::metadata(&runner)
+                .expect("fixture runner metadata should read")
+                .permissions();
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(0o755);
+            fs::set_permissions(&runner, permissions).expect("fixture runner should be executable");
+            let contract: tools::ToolContract = serde_json::from_slice(
+                &fs::read(destination.join("tool.json")).expect("fixture manifest should read"),
+            )
+            .expect("fixture manifest should be valid");
+            tools::create_tool_contract(&connection, &contract)
+                .expect("fixture contract should register");
+        }
+        connection
+            .execute(
+                "UPDATE tool_contracts SET created_at = '2020-01-01 00:00:00' \
+                 WHERE tool_id = 'confluence_reader_internal'",
+                [],
+            )
+            .expect("internal fixture should be older");
+        drop(connection);
+
+        let apply = Cli::try_parse_from([
+            "aopmem",
+            "--json",
+            "tool",
+            "dedupe",
+            "apply",
+            "--exact-only",
+        ])
+        .expect("exact-only apply should parse");
+        assert_eq!(
+            run_command(&apply.command, apply.json),
+            ExitCode::from(EXIT_SUCCESS)
+        );
+        for command in [
+            [
+                "aopmem",
+                "--json",
+                "tool",
+                "get",
+                "confluence_reader_internal",
+            ],
+            [
+                "aopmem",
+                "--json",
+                "tool",
+                "validate",
+                "confluence_reader_internal",
+            ],
+            [
+                "aopmem",
+                "--json",
+                "tool",
+                "run",
+                "confluence_reader_internal",
+            ],
+        ] {
+            let parsed = Cli::try_parse_from(command).expect("old alias command should parse");
+            assert_eq!(
+                run_command(&parsed.command, parsed.json),
+                ExitCode::from(EXIT_SUCCESS)
+            );
+        }
+        let canonicalized = observed_command_events(&workspace_paths, "tool_dedupe_apply");
+        let canonicalized = canonicalized
+            .iter()
+            .filter(|event| event.event_type == "tool.canonicalized")
+            .collect::<Vec<_>>();
+        assert_eq!(canonicalized.len(), 1);
+        let payload = &canonicalized[0].payload_json;
+        assert!(payload.contains("confluence_reader_internal"));
+        for forbidden in [
+            "args",
+            "output",
+            "path",
+            "contract",
+            "runner",
+            "fixture-confluence",
+        ] {
+            assert!(
+                !payload.contains(forbidden),
+                "canonicalization payload leaked {forbidden}"
+            );
+        }
+        let alias_events = observed_command_events(&workspace_paths, "tool_run");
+        assert_eq!(alias_events[0].event_type, "tool.alias_resolved");
+        assert!(alias_events[0]
+            .payload_json
+            .contains("confluence_reader_internal"));
+        assert!(alias_events[1].payload_json.contains("confluence_reader"));
+
+        drop(_cwd);
+        fs::remove_dir_all(override_home).expect("temp AOPMEM_HOME should remove");
+        fs::remove_dir_all(repo_root).expect("temp repo root should remove");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn tool_validation_failure_has_no_fake_run_start() {
         let _lock = install::test_env_lock()
             .lock()
@@ -15667,13 +21117,15 @@ mod tests {
         let doctor = observed_command_events(&workspace_paths, "doctor");
         let verify = observed_command_events(&workspace_paths, "verify");
         assert_eq!(doctor.len(), 2);
-        assert_eq!(verify.len(), 3);
+        assert_eq!(
+            verify.len(),
+            2,
+            "an unreadable tagged-value source must disable observability"
+        );
         assert_eq!(doctor[0].outcome, "success");
         assert_eq!(doctor[1].outcome, "warning");
         assert_eq!(verify[0].outcome, "success");
         assert_eq!(verify[1].outcome, "warning");
-        assert_eq!(verify[2].outcome, "failure");
-        assert_eq!(verify[2].error_code.as_deref(), Some("DB_SCHEMA_ERROR"));
         for (event, expected_keys) in [
             (&doctor[0], vec!["checks", "ready", "missing", "error"]),
             (
@@ -15779,6 +21231,60 @@ mod tests {
             }
         ));
         assert!(Cli::try_parse_from(["aopmem", "upgrade", "apply", "--json"]).is_err());
+        assert!(Cli::try_parse_from([
+            "aopmem",
+            "upgrade",
+            "apply",
+            "--all-workspaces",
+            "--staged-binary",
+            "aopmem",
+            "--staged-sha256",
+            &"0".repeat(64),
+        ])
+        .is_err());
+        let backup = Cli::try_parse_from(["aopmem", "upgrade", "backup", "--json"])
+            .expect("upgrade backup should parse");
+        assert_eq!(command_id(&backup.command), "upgrade_backup");
+        let adopted = Cli::try_parse_from([
+            "aopmem",
+            "upgrade",
+            "backup",
+            "--adopt",
+            "aopmem-home-backup-v0.2.0-rc5-fixture",
+            "--manifest-sha256",
+            &"0".repeat(64),
+            "--json",
+        ])
+        .expect("upgrade backup adoption should parse");
+        assert_eq!(command_id(&adopted.command), "upgrade_backup");
+        assert!(
+            Cli::try_parse_from(["aopmem", "upgrade", "backup", "--adopt", "backup-only",])
+                .is_err()
+        );
+        assert!(Cli::try_parse_from([
+            "aopmem",
+            "upgrade",
+            "backup",
+            "--manifest-sha256",
+            &"0".repeat(64),
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from(["aopmem", "upgrade", "stage", "--json"]).is_err());
+        let stage = Cli::try_parse_from([
+            "aopmem",
+            "upgrade",
+            "stage",
+            "--artifact",
+            "aopmem",
+            "--sha256",
+            &"0".repeat(64),
+            "--json",
+        ])
+        .expect("upgrade stage should parse");
+        assert_eq!(command_id(&stage.command), "upgrade_stage");
+        let publish = Cli::try_parse_from(["aopmem", "upgrade", "publish", "--json"])
+            .expect("upgrade publish should parse");
+        assert_eq!(command_id(&publish.command), "upgrade_publish");
 
         let _lock = install::test_env_lock()
             .lock()
@@ -15793,6 +21299,150 @@ mod tests {
             !override_home.exists(),
             "read-only upgrade plan must not create AOPMEM_HOME"
         );
+    }
+
+    #[test]
+    fn upgrade_recovery_publish_json_is_structured_private_and_phase_aware() {
+        let recovery_error =
+            upgrade::RecoveryError::Publish(Box::new(upgrade::RecoveryPublishFailure {
+                operation: "publish_installed_binary",
+                source_role: "installed_binary_temporary",
+                destination_role: "installed_binary",
+                mode: "ReplaceOrCreate".to_string(),
+                phase: "SyncParent".to_string(),
+                strategy: "WindowsReplaceFileW".to_string(),
+                io_kind: "other",
+                raw_os_error: Some(87),
+                final_validated: true,
+                committed: true,
+                durability_confirmed: false,
+                temporary_cleanup_confirmed: true,
+            }));
+        let error = CliError::upgrade_recovery(&recovery_error);
+        let serialized = serialize_envelope(&OutputEnvelope {
+            ok: false,
+            command: "upgrade_publish",
+            data: None,
+            warnings: Vec::new(),
+            errors: vec![OutputError {
+                code: error.code,
+                message: error.message.clone(),
+                fix_hint: error.fix_hint.clone(),
+                details: upgrade_recovery_error_details(&recovery_error),
+            }],
+            meta: OutputMeta::default(),
+        });
+        let value: Value = serde_json::from_str(&serialized).expect("JSON should parse");
+        let details = &value["errors"][0]["details"];
+        assert_eq!(details["operation"], "publish_installed_binary");
+        assert_eq!(details["source_role"], "installed_binary_temporary");
+        assert_eq!(details["destination_role"], "installed_binary");
+        assert_eq!(details["mode"], "ReplaceOrCreate");
+        assert_eq!(details["phase"], "SyncParent");
+        assert_eq!(details["strategy"], "WindowsReplaceFileW");
+        assert_eq!(details["io_kind"], "other");
+        assert_eq!(details["raw_os_error"], 87);
+        assert_eq!(details["final_validated"], true);
+        assert_eq!(details["committed"], true);
+        assert_eq!(details["durability_confirmed"], false);
+        assert_eq!(details["temporary_cleanup_confirmed"], true);
+        assert!(value["errors"][0]["fix_hint"]
+            .as_str()
+            .expect("fix hint should be text")
+            .contains("upgrade publish"));
+        assert!(!serialized.contains("/Users/"));
+
+        let unknown = CliError::upgrade_recovery(&upgrade::RecoveryError::ApplyOutcomeUnknown);
+        assert!(unknown.fix_hint.contains("do not retry apply"));
+    }
+
+    #[test]
+    fn upgrade_publish_durability_warning_is_top_level_json() {
+        let execution = upgrade::RecoveryExecution {
+            journal_phase: upgrade::RecoveryPhase::Published,
+            resumed: true,
+            apply_invoked: false,
+            binary_published: true,
+            durability_warning: true,
+            home_backup_retained: true,
+            apply: None,
+        };
+        let serialized = success_envelope_with_meta_and_warnings(
+            "upgrade_publish",
+            serde_json::to_value(&execution).expect("execution should serialize"),
+            OutputMeta::default(),
+            upgrade_recovery_warnings(&execution),
+        );
+        let value: Value = serde_json::from_str(&serialized).expect("JSON should parse");
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["data"]["journal_phase"], "published");
+        assert_eq!(value["data"]["durability_warning"], true);
+        assert_eq!(
+            value["warnings"][0]["code"],
+            "UPGRADE_BINARY_DURABILITY_UNCONFIRMED"
+        );
+    }
+
+    #[test]
+    fn debug_capsule_publish_error_is_structured_and_commit_wording_is_truthful() {
+        let details = observability_export::DebugCapsulePublishFailure {
+            code: "PLATFORM_PUBLISH_FAILED",
+            operation: "publish_regular",
+            source: "source_child",
+            destination: "destination_child",
+            mode: "no_replace",
+            strategy: "windows_move_file_ex_w",
+            phase: "os_publish",
+            raw_os_error: Some(87),
+            io_kind: "invalid_input",
+            source_exists: false,
+            destination_exists: false,
+            source_size: Some(128),
+            final_validated: false,
+            committed: false,
+            durability_confirmed: false,
+            temporary_cleanup_confirmed: true,
+        };
+        let before_commit = CliError::debug_capsule(observability_export::ExportError::Publish(
+            Box::new(details.clone()),
+        ));
+        assert_eq!(before_commit.code, "PLATFORM_PUBLISH_FAILED");
+        assert!(before_commit.message.contains("before commit"));
+        assert!(!before_commit.message.contains("was published"));
+
+        let envelope = serialize_envelope(&OutputEnvelope {
+            ok: false,
+            command: "observe_export",
+            data: None,
+            warnings: Vec::new(),
+            errors: vec![OutputError {
+                code: before_commit.code,
+                message: before_commit.message,
+                fix_hint: before_commit.fix_hint,
+                details: Some(OutputErrorDetails::DebugCapsulePublish(details.clone())),
+            }],
+            meta: OutputMeta::default(),
+        });
+        let envelope: Value =
+            serde_json::from_str(&envelope).expect("publish error envelope should parse");
+        assert_eq!(envelope["errors"][0]["details"]["raw_os_error"], 87);
+        assert_eq!(
+            envelope["errors"][0]["details"]["destination"],
+            "destination_child"
+        );
+        assert!(
+            !envelope.to_string().contains(std::path::MAIN_SEPARATOR_STR),
+            "structured details must contain roles, not paths"
+        );
+
+        let mut committed_details = details;
+        committed_details.committed = true;
+        let after_commit = CliError::debug_capsule(observability_export::ExportError::Publish(
+            Box::new(committed_details),
+        ));
+        assert!(after_commit.message.contains("was published"));
+        assert!(!after_commit.message.contains("before publication"));
+        assert!(after_commit.fix_hint.contains("do not retry"));
     }
 
     #[test]
@@ -15890,7 +21540,7 @@ mod tests {
         drop(operational_after);
 
         assert_eq!(event_count, 0, "observe commands must not self-observe");
-        assert_eq!(observability_schema, 1);
+        assert_eq!(observability_schema, 2);
         assert_eq!(operational_schema_after, operational_schema_before);
         assert_eq!(file_fingerprint(workspace_paths.db()), operational_before);
         assert_eq!(
@@ -16045,5 +21695,83 @@ mod tests {
         drop(_cwd);
         fs::remove_dir_all(override_home).expect("temp AOPMEM_HOME should remove");
         fs::remove_dir_all(repo_root).expect("temp repo root should remove");
+    }
+
+    #[test]
+    fn stage_019_cli_requires_one_selector_and_repairs_current_workspace() {
+        assert!(Cli::try_parse_from(["aopmem", "audit", "repair"]).is_err());
+        assert!(Cli::try_parse_from([
+            "aopmem",
+            "audit",
+            "repair",
+            "--all-workspaces",
+            "--current-workspace"
+        ])
+        .is_err());
+
+        let _lock = install::test_env_lock()
+            .lock()
+            .expect("test lock should not be poisoned");
+        let override_home = temp_path("stage-019-cli-home");
+        let repo_root = temp_path("stage-019-cli-repo");
+        let _aopmem_home = EnvGuard::set(AOPMEM_HOME_ENV, &override_home);
+        fs::create_dir_all(&repo_root).expect("repo root should create");
+        let _cwd = CurrentDirGuard::set(&repo_root);
+        let (_workspace_key, workspace_paths, connection) =
+            open_current_workspace_context().expect("workspace should initialize");
+        connection
+            .execute(
+                "INSERT INTO nodes (node_type, status, title) VALUES ('fact', 'active', 'repair');",
+                [],
+            )
+            .expect("fixture node should insert");
+        drop(connection);
+        audit::ensure_pending_snapshot_marker(workspace_paths.audit_git())
+            .expect("pending marker should create");
+        let operational_before = fs::read(workspace_paths.db()).expect("DB bytes should read");
+        let cli =
+            Cli::try_parse_from(["aopmem", "--json", "audit", "repair", "--current-workspace"])
+                .expect("audit repair should parse");
+
+        assert_eq!(
+            run_command(&cli.command, cli.json),
+            ExitCode::from(EXIT_SUCCESS)
+        );
+        assert!(!audit::has_pending_snapshot(workspace_paths.audit_git())
+            .expect("marker should inspect"));
+        assert!(workspace_paths.audit_git().join("memory.sql").is_file());
+        assert_eq!(
+            fs::read(workspace_paths.db()).expect("DB bytes should reread"),
+            operational_before
+        );
+        let events = observed_command_events(&workspace_paths, "audit_repair");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "audit.repair.completed");
+        assert_eq!(events[0].outcome, "success");
+
+        audit::ensure_pending_snapshot_marker(workspace_paths.audit_git())
+            .expect("pending marker should recreate");
+        let git_dir = workspace_paths.audit_git().join(".git");
+        let saved_git = workspace_paths.audit_git().join(".git-stage019-saved");
+        fs::rename(&git_dir, &saved_git).expect("owned Git metadata should move");
+        fs::write(&git_dir, b"not a directory").expect("Git failure fixture should write");
+        assert_eq!(
+            run_command(&cli.command, cli.json),
+            ExitCode::from(EXIT_IO_ERROR)
+        );
+        assert!(audit::has_pending_snapshot(workspace_paths.audit_git())
+            .expect("failed repair must retain marker"));
+        assert_eq!(
+            fs::read(workspace_paths.db()).expect("DB bytes should reread after failure"),
+            operational_before
+        );
+        let events = observed_command_events(&workspace_paths, "audit_repair");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].event_type, "audit.repair.failed");
+        assert_eq!(events[1].outcome, "failure");
+
+        drop(_cwd);
+        fs::remove_dir_all(override_home).expect("temp home should remove");
+        fs::remove_dir_all(repo_root).expect("temp repo should remove");
     }
 }

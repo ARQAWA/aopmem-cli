@@ -27,14 +27,15 @@ use crate::observability::{
     CollectorEvent, CountItem, CountsPayload, EventOutcome, EventPayload, EventType, LocalCollector,
 };
 use crate::output::OutputWarning;
+use crate::platform_publish::{publish_regular, PublishError, PublishMode};
 use crate::schema;
 use crate::storage::{self, AopmemPaths, WorkspacePaths};
 use crate::verify;
 
 const SOURCE_VERSION: &str = "0.1.0-rc3";
-const TARGET_VERSION: &str = "0.2.0-rc4";
+const TARGET_VERSION: &str = "0.2.0-rc5";
 const BACKUPS_DIRECTORY: &str = "backups";
-const BACKUP_RUN_PREFIX: &str = "upgrade-0.2.0-rc4-";
+const BACKUP_RUN_PREFIX: &str = "upgrade-0.2.0-rc5-";
 const COMMAND_ID: &str = "upgrade_apply";
 
 const OWNED_GLOBAL_ASSETS: &[OwnedGlobalAsset] = &[
@@ -416,17 +417,53 @@ pub fn apply_all_workspaces() -> Result<UpgradeApplyExecution, UpgradeApplyError
     apply_all_workspaces_with(&SystemDiskSpaceProbe, &NoFaults)
 }
 
+/// Applies only durable workspace migrations. Installer-owned files, adapter
+/// synchronization and health checks intentionally run after binary publish.
+pub fn apply_core_all_workspaces(
+    expected: &[super::recovery::PlannedWorkspaceIdentity],
+) -> Result<UpgradeApplyExecution, UpgradeApplyError> {
+    apply_all_workspaces_inner(&SystemDiskSpaceProbe, &NoFaults, true, Some(expected))
+}
+
 fn apply_all_workspaces_with(
     probe: &dyn DiskSpaceProbe,
     faults: &dyn ApplyFaultInjector,
+) -> Result<UpgradeApplyExecution, UpgradeApplyError> {
+    apply_all_workspaces_inner(probe, faults, false, None)
+}
+
+fn apply_all_workspaces_inner(
+    probe: &dyn DiskSpaceProbe,
+    faults: &dyn ApplyFaultInjector,
+    core_only: bool,
+    expected: Option<&[super::recovery::PlannedWorkspaceIdentity]>,
 ) -> Result<UpgradeApplyExecution, UpgradeApplyError> {
     let plan = plan_all_workspaces_with_probe(probe)?;
     let paths = storage::resolve_paths().map_err(super::UpgradePlanError::from)?;
     validate_existing_root(paths.home())?;
     validate_optional_managed_directory(paths.home(), paths.workspaces())?;
     let candidates = workspace_candidates(&paths)?;
-    let current_repo = current_repo_context(&paths, &candidates)?;
+    let current_repo = if core_only {
+        None
+    } else {
+        current_repo_context(&paths, &candidates)?
+    };
     let mut report = initial_report(&plan.disk_space, &candidates, current_repo.as_ref());
+
+    if expected.is_some_and(|expected| {
+        super::recovery::validate_frozen_plan(&paths, expected, false).is_err()
+    }) {
+        let failure = failure(
+            "UPGRADE_WORKSPACE_DRIFT",
+            "workspace set or identity changed after the frozen plan",
+            None,
+        );
+        return Ok(failed_execution_with_observability(
+            report,
+            failure,
+            &candidates,
+        ));
+    }
 
     if let Some(failure) = preflight_failure(&plan, &candidates) {
         return Ok(failed_execution_with_observability(
@@ -436,7 +473,11 @@ fn apply_all_workspaces_with(
         ));
     }
 
-    let required_bytes = apply_required_bytes(&paths, &candidates, current_repo.as_ref())?;
+    let required_bytes = if core_only {
+        workspace_backup_bytes(&candidates)?
+    } else {
+        apply_required_bytes(&paths, &candidates, current_repo.as_ref())?
+    };
     let disk_probe_path = nearest_existing_directory(paths.home())?;
     let available_bytes = probe.available_bytes(&disk_probe_path).map_err(|source| {
         UpgradeApplyError::Plan(super::UpgradePlanError::DiskSpace {
@@ -465,18 +506,20 @@ fn apply_all_workspaces_with(
         ));
     }
 
-    if let Some(context) = current_repo.as_ref() {
-        if let Err(error) = preflight_adapter(context) {
-            let failure = failure(
-                "ADAPTER_DRIFT",
-                error.to_string(),
-                Some(&context.workspace_key),
-            );
-            return Ok(failed_execution_with_observability(
-                report,
-                failure,
-                &candidates,
-            ));
+    if !core_only {
+        if let Some(context) = current_repo.as_ref() {
+            if let Err(error) = preflight_adapter(context) {
+                let failure = failure(
+                    "ADAPTER_DRIFT",
+                    error.to_string(),
+                    Some(&context.workspace_key),
+                );
+                return Ok(failed_execution_with_observability(
+                    report,
+                    failure,
+                    &candidates,
+                ));
+            }
         }
     }
 
@@ -493,21 +536,16 @@ fn apply_all_workspaces_with(
     };
     report.backup_root = Some(display_path(&backup_run.root));
 
-    if let Err(error) = faults.check(ApplyFaultPoint::BeforeBinaryBackup, None) {
-        let failure = failure("OLD_BINARY_BACKUP_FAILED", error.to_string(), None);
-        report.global_steps.binary_backup = ApplyStep::failed(failure.clone());
-        return Ok(failed_execution_with_observability(
-            report,
-            failure,
-            &candidates,
-        ));
-    }
-    let binary_state = match backup_installed_binary(&paths, &backup_run) {
-        Ok(state) => {
-            report.global_steps.binary_backup = backup_step(&state, "installed binary backup");
-            state
-        }
-        Err(error) => {
+    let (adapter_state, asset_states) = if core_only {
+        report.global_steps.binary_backup =
+            ApplyStep::not_applicable("post-publish installer responsibility");
+        report.global_steps.adapter_backup =
+            ApplyStep::not_applicable("post-publish installer responsibility");
+        report.global_steps.owned_assets_backup =
+            ApplyStep::not_applicable("post-publish installer responsibility");
+        (None, Vec::new())
+    } else {
+        if let Err(error) = faults.check(ApplyFaultPoint::BeforeBinaryBackup, None) {
             let failure = failure("OLD_BINARY_BACKUP_FAILED", error.to_string(), None);
             report.global_steps.binary_backup = ApplyStep::failed(failure.clone());
             return Ok(failed_execution_with_observability(
@@ -516,51 +554,69 @@ fn apply_all_workspaces_with(
                 &candidates,
             ));
         }
-    };
-    let _preserved_binary = binary_state;
+        let binary_state = match backup_installed_binary(&paths, &backup_run) {
+            Ok(state) => {
+                report.global_steps.binary_backup = backup_step(&state, "installed binary backup");
+                state
+            }
+            Err(error) => {
+                let failure = failure("OLD_BINARY_BACKUP_FAILED", error.to_string(), None);
+                report.global_steps.binary_backup = ApplyStep::failed(failure.clone());
+                return Ok(failed_execution_with_observability(
+                    report,
+                    failure,
+                    &candidates,
+                ));
+            }
+        };
+        let _preserved_binary = binary_state;
 
-    let adapter_state = match backup_adapter(current_repo.as_ref(), &backup_run) {
-        Ok(Some(state)) => {
-            report.global_steps.adapter_backup = backup_step(&state, "adapter exact-byte backup");
-            Some(state)
-        }
-        Ok(None) => {
-            report.global_steps.adapter_backup =
-                ApplyStep::not_applicable("current repository has no matching AOPMem workspace");
-            None
-        }
-        Err(error) => {
-            let failure = failure("ADAPTER_BACKUP_FAILED", error.to_string(), None);
-            report.global_steps.adapter_backup = ApplyStep::failed(failure.clone());
-            return Ok(failed_execution_with_observability(
-                report,
-                failure,
-                &candidates,
-            ));
-        }
-    };
+        let adapter_state = match backup_adapter(current_repo.as_ref(), &backup_run) {
+            Ok(Some(state)) => {
+                report.global_steps.adapter_backup =
+                    backup_step(&state, "adapter exact-byte backup");
+                Some(state)
+            }
+            Ok(None) => {
+                report.global_steps.adapter_backup = ApplyStep::not_applicable(
+                    "current repository has no matching AOPMem workspace",
+                );
+                None
+            }
+            Err(error) => {
+                let failure = failure("ADAPTER_BACKUP_FAILED", error.to_string(), None);
+                report.global_steps.adapter_backup = ApplyStep::failed(failure.clone());
+                return Ok(failed_execution_with_observability(
+                    report,
+                    failure,
+                    &candidates,
+                ));
+            }
+        };
 
-    let asset_states = match backup_owned_assets(&paths, &backup_run) {
-        Ok(states) => {
-            report.global_steps.owned_assets_backup = ApplyStep::completed(
-                Some(&backup_run.assets_dir),
-                None,
-                format!(
-                    "{} owned assets backed up; unrelated files untouched",
-                    states.len()
-                ),
-            );
-            states
-        }
-        Err(error) => {
-            let failure = failure("OWNED_ASSET_BACKUP_FAILED", error.to_string(), None);
-            report.global_steps.owned_assets_backup = ApplyStep::failed(failure.clone());
-            return Ok(failed_execution_with_observability(
-                report,
-                failure,
-                &candidates,
-            ));
-        }
+        let asset_states = match backup_owned_assets(&paths, &backup_run) {
+            Ok(states) => {
+                report.global_steps.owned_assets_backup = ApplyStep::completed(
+                    Some(&backup_run.assets_dir),
+                    None,
+                    format!(
+                        "{} owned assets backed up; unrelated files untouched",
+                        states.len()
+                    ),
+                );
+                states
+            }
+            Err(error) => {
+                let failure = failure("OWNED_ASSET_BACKUP_FAILED", error.to_string(), None);
+                report.global_steps.owned_assets_backup = ApplyStep::failed(failure.clone());
+                return Ok(failed_execution_with_observability(
+                    report,
+                    failure,
+                    &candidates,
+                ));
+            }
+        };
+        (adapter_state, asset_states)
     };
 
     let mut warnings = Vec::new();
@@ -605,7 +661,7 @@ fn apply_all_workspaces_with(
             });
         }
 
-        match backup_and_migrate_workspace(candidate, &backup_run, faults) {
+        match backup_and_migrate_workspace(candidate, &backup_run, faults, core_only) {
             Ok(result) => {
                 let workspace_report = &mut report.workspaces[index];
                 workspace_report.database_backup = ApplyStep::completed(
@@ -724,6 +780,19 @@ fn apply_all_workspaces_with(
                 });
             }
         }
+    }
+
+    if core_only {
+        report.global_steps.owned_assets_refresh =
+            ApplyStep::not_applicable("post-publish installer responsibility");
+        report.global_steps.adapter_sync =
+            ApplyStep::not_applicable("post-publish installer responsibility");
+        report.success = true;
+        return Ok(UpgradeApplyExecution {
+            report,
+            warnings,
+            failure: None,
+        });
     }
 
     if let Err(error) = faults.check(ApplyFaultPoint::BeforeOwnedAssetsRefresh, None) {
@@ -1367,6 +1436,7 @@ fn backup_and_migrate_workspace(
     candidate: &WorkspaceCandidate,
     run: &BackupRun,
     faults: &dyn ApplyFaultInjector,
+    defer_final_audit: bool,
 ) -> Result<WorkspaceMigrationResult, WorkspaceMigrationFailure> {
     let mut partial = WorkspaceApplyReport {
         workspace_key: candidate.key.clone(),
@@ -1710,49 +1780,63 @@ fn backup_and_migrate_workspace(
         return Err(workspace_migration_failure(failure, partial));
     }
 
-    let snapshot_started = Instant::now();
     let (snapshot_step, snapshot_duration_ms, snapshot_bytes, snapshot_pending, warning) =
-        match audit::write_sql_snapshot_locked(
-            candidate.paths.audit_git(),
-            &connection,
-            locks.snapshot_lock(),
-        ) {
-            Ok(snapshot) => {
-                let duration_ms = snapshot.duration_ms;
-                let bytes_written = snapshot.bytes_written;
-                (
-                    ApplyStep::completed(
-                        Some(&snapshot.path),
+        if defer_final_audit {
+            (
+                ApplyStep::not_applicable(
+                    "post-publish audit repair owns final snapshot and Git commit",
+                ),
+                None,
+                None,
+                true,
+                None,
+            )
+        } else {
+            let snapshot_started = Instant::now();
+            match audit::write_sql_snapshot_locked(
+                candidate.paths.audit_git(),
+                &connection,
+                locks.snapshot_lock(),
+            ) {
+                Ok(snapshot) => {
+                    let duration_ms = snapshot.duration_ms;
+                    let bytes_written = snapshot.bytes_written;
+                    (
+                        ApplyStep::completed(
+                            Some(&snapshot.path),
+                            Some(bytes_written),
+                            format!("full SQL audit snapshot completed in {} ms", duration_ms),
+                        ),
+                        Some(duration_ms),
                         Some(bytes_written),
-                        format!("full SQL audit snapshot completed in {} ms", duration_ms),
-                    ),
-                    Some(duration_ms),
-                    Some(bytes_written),
-                    false,
-                    None,
-                )
-            }
-            Err(error) => {
-                let duration_ms =
-                    u64::try_from(snapshot_started.elapsed().as_millis()).unwrap_or(u64::MAX);
-                (
-                    ApplyStep {
-                        status: ApplyStepStatus::Completed,
-                        path: None,
-                        bytes: None,
-                        detail: Some(format!(
+                        false,
+                        None,
+                    )
+                }
+                Err(error) => {
+                    let duration_ms =
+                        u64::try_from(snapshot_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    (
+                        ApplyStep {
+                            status: ApplyStepStatus::Completed,
+                            path: None,
+                            bytes: None,
+                            detail: Some(format!(
                         "database committed; audit snapshot remains pending after {duration_ms} ms"
                     )),
-                        error: None,
-                    },
-                    Some(duration_ms),
-                    None,
-                    true,
-                    Some(OutputWarning {
-                        code: mutation::AUDIT_SNAPSHOT_PENDING,
-                        message: format!("migration committed; audit snapshot pending: {error}"),
-                    }),
-                )
+                            error: None,
+                        },
+                        Some(duration_ms),
+                        None,
+                        true,
+                        Some(OutputWarning {
+                            code: mutation::AUDIT_SNAPSHOT_PENDING,
+                            message: format!(
+                                "migration committed; audit snapshot pending: {error}"
+                            ),
+                        }),
+                    )
+                }
             }
         };
     Ok(WorkspaceMigrationResult {
@@ -2067,16 +2151,15 @@ fn durable_replace(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let mut temporary = directory.create_new_regular_os(OsStr::new(&temporary_name))?;
     temporary.write_all(bytes)?;
     temporary.sync_all()?;
-    if path.exists() {
-        directory.replace_regular(&temporary, &temporary_name, name)?;
-    } else {
-        directory.publish_regular_no_replace_committed_os(
-            &temporary,
-            OsStr::new(&temporary_name),
-            OsStr::new(name),
-        )?;
-    }
-    directory.sync()
+    publish_regular(
+        &directory,
+        temporary,
+        OsStr::new(&temporary_name),
+        OsStr::new(name),
+        PublishMode::ReplaceOrCreate,
+    )
+    .map_err(PublishError::into_io_error)
+    .and_then(crate::platform_publish::require_committed_validated_clean)
 }
 
 fn remove_optional_regular(path: &Path) -> io::Result<()> {
@@ -2640,11 +2723,17 @@ mod tests {
                     '["read"]', '[]', 'external_read', 'none', NULL,
                     'preserve MCP profile'
                 );
-                DELETE FROM schema_migrations WHERE version IN ('002', '003');
+                DELETE FROM schema_migrations WHERE version IN ('002', '003', '004');
                 DROP INDEX IF EXISTS idx_nodes_summary;
                 DROP INDEX IF EXISTS idx_nodes_title_nocase;
                 DROP INDEX IF EXISTS idx_aliases_alias_nocase;
                 DROP INDEX IF EXISTS idx_tags_tag_nocase;
+                DROP TRIGGER tool_aliases_validate_insert;
+                DROP TRIGGER tool_aliases_validate_update;
+                DROP TRIGGER tool_contracts_reject_alias_shadow_insert;
+                DROP TRIGGER tool_contracts_reject_alias_shadow_update;
+                DROP TRIGGER tool_contracts_preserve_alias_target;
+                DROP TABLE tool_aliases;
                 "#,
             )
             .expect("v0.1 fixture data should create");
@@ -2931,7 +3020,7 @@ mod tests {
         let execution = apply_all_workspaces_with(&FixedDiskProbe(u64::MAX), &NoFaults)
             .expect("upgrade apply should run");
 
-        assert!(execution.failure.is_none());
+        assert!(execution.failure.is_none(), "{execution:#?}");
         assert!(execution.report.success);
         assert!(!execution.report.binary_replaced);
         assert_eq!(
@@ -2940,7 +3029,7 @@ mod tests {
         );
         assert_eq!(
             migration_versions(fixture.workspace.db()),
-            vec!["001", "002", "003"]
+            vec!["001", "002", "003", "004"]
         );
         assert_v010_data_preserved(fixture.workspace.db());
         assert_eq!(logical_payload(fixture.workspace.db()), payload_before);
@@ -2992,6 +3081,45 @@ mod tests {
             &fixture.workspace_key,
         )
         .expect("upgrade observability rows should satisfy report contracts");
+
+        drop(cwd_guard);
+        drop(home_guard);
+        fs::remove_dir_all(fixture.root).expect("fixture should remove");
+    }
+
+    #[test]
+    fn core_only_defers_completed_event_and_final_audit_git_until_publish() {
+        let _lock = crate::install::test_env_lock()
+            .lock()
+            .expect("environment lock should not be poisoned");
+        let (root, home, repo) = create_roots("core-only-deferred-post");
+        let home_guard = EnvGuard::set(&home);
+        let cwd_guard = CurrentDirGuard::set(&repo);
+        let fixture = create_current_fixture(root, home, repo);
+        let paths = storage::resolve_paths().expect("paths should resolve");
+        let plan =
+            plan_all_workspaces_with_probe(&FixedDiskProbe(u64::MAX)).expect("plan should inspect");
+        super::super::recovery::ensure_observability_v2(&paths, &plan)
+            .expect("observability v2 should be mandatory before core");
+        let frozen = super::super::recovery::capture_planned_workspaces(&paths, &plan)
+            .expect("planned workspace identities should freeze");
+        let audit_head_before = audit_head(fixture.workspace.audit_git());
+
+        let execution = apply_core_all_workspaces(&frozen).expect("core-only apply should succeed");
+
+        assert!(execution.report.success, "{execution:#?}");
+        assert_eq!(
+            migration_versions(fixture.workspace.db()),
+            vec!["001", "002", "003", "004"]
+        );
+        assert_eq!(audit_head(fixture.workspace.audit_git()), audit_head_before);
+        assert!(audit::has_pending_snapshot(fixture.workspace.audit_git())
+            .expect("pending marker should inspect"));
+        assert!(!event_types(&fixture.workspace)
+            .iter()
+            .any(|event| event.0 == "update.completed"));
+        crate::observability::open_reader(&fixture.workspace)
+            .expect("observability must remain exact v2");
 
         drop(cwd_guard);
         drop(home_guard);
@@ -3276,8 +3404,14 @@ mod tests {
             .workspaces
             .iter()
             .all(|workspace| workspace.status == WorkspaceApplyStatus::Applied));
-        assert_eq!(migration_versions(first.db()), vec!["001", "002", "003"]);
-        assert_eq!(migration_versions(second.db()), vec!["001", "002", "003"]);
+        assert_eq!(
+            migration_versions(first.db()),
+            vec!["001", "002", "003", "004"]
+        );
+        assert_eq!(
+            migration_versions(second.db()),
+            vec!["001", "002", "003", "004"]
+        );
         for workspace in &execution.report.workspaces {
             let backup = workspace
                 .database_backup
@@ -3344,7 +3478,10 @@ mod tests {
             execution.report.workspaces[0].status,
             WorkspaceApplyStatus::Applied
         );
-        assert_eq!(migration_versions(first.db()), vec!["001", "002", "003"]);
+        assert_eq!(
+            migration_versions(first.db()),
+            vec!["001", "002", "003", "004"]
+        );
         assert_eq!(migration_versions(second.db()), vec!["001"]);
         assert_eq!(migration_versions(third.db()), vec!["001"]);
         assert_eq!(
@@ -3400,7 +3537,7 @@ mod tests {
         );
         assert_eq!(
             migration_versions(fixture.workspace.db()),
-            vec!["001", "002", "003"]
+            vec!["001", "002", "003", "004"]
         );
 
         drop(cwd_guard);
@@ -3477,7 +3614,7 @@ mod tests {
         );
         assert_eq!(
             migration_versions(fixture.workspace.db()),
-            vec!["001", "002", "003"]
+            vec!["001", "002", "003", "004"]
         );
         assert_eq!(
             fs::read(&fixture.adapter).expect("adapter should read"),
@@ -3580,7 +3717,7 @@ mod tests {
         assert!(execution.failure.is_none());
         assert_eq!(
             migration_versions(fixture.workspace.db()),
-            vec!["001", "002", "003"]
+            vec!["001", "002", "003", "004"]
         );
         assert!(execution
             .warnings

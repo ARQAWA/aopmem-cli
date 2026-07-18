@@ -19,10 +19,11 @@ const REQUIRED_SCHEMA_TABLES: &[&str] = &[
     "events",
     "registries",
     "tool_contracts",
+    "tool_aliases",
     "mcp_profiles",
 ];
-const REQUIRED_SCHEMA_MIGRATION_VERSION: &str = "003";
-const REQUIRED_SCHEMA_MIGRATION_NAME: &str = "003_task_recall_exact_indexes";
+const REQUIRED_SCHEMA_MIGRATION_VERSION: &str = "004";
+const REQUIRED_SCHEMA_MIGRATION_NAME: &str = "004_task_protocol_and_tool_aliases";
 const REQUIRED_FTS_TABLE: &str = "fts_nodes";
 const REQUIRED_FTS_COLUMNS: &[&str] = &["title", "summary", "body", "aliases"];
 const MIN_REQUIRED_ACTIVE_GATES: usize = 1;
@@ -583,7 +584,7 @@ fn find_pending_audit_snapshot_issues(
         kind: LintIssueKind::PendingAuditSnapshot,
         subject: format!("audit_snapshot:{}", path_string(&marker_path)),
         message: format!(
-            "audit snapshot is pending: marker exists at {}",
+            "audit snapshot is pending: marker exists at {}; fix: aopmem audit repair --current-workspace --json",
             path_string(&marker_path)
         ),
     }])
@@ -949,7 +950,10 @@ fn inspect_audit_snapshot(audit_git_dir: &Path) -> AuditSnapshotHealth {
             status: DoctorStatus::Error,
             pending: true,
             marker_path: path_string(&marker_path),
-            error: Some("pending audit snapshot marker exists".to_string()),
+            error: Some(
+                "pending audit snapshot marker exists; fix: aopmem audit repair --current-workspace --json"
+                    .to_string(),
+            ),
         },
         Err(error) => AuditSnapshotHealth {
             status: DoctorStatus::Error,
@@ -1193,6 +1197,14 @@ mod tests {
         assert!(!doctor.healthy);
         assert_eq!(doctor.checks.audit_snapshot.status, DoctorStatus::Error);
         assert!(doctor.checks.audit_snapshot.pending);
+        assert!(doctor
+            .checks
+            .audit_snapshot
+            .error
+            .as_deref()
+            .is_some_and(|error| {
+                error.contains("aopmem audit repair --current-workspace --json")
+            }));
 
         let lint = run_lint(&repo_root).expect("lint should succeed");
         assert!(!lint.clean);
@@ -1200,6 +1212,9 @@ mod tests {
         assert!(lint.issues.iter().any(|issue| {
             issue.kind == LintIssueKind::PendingAuditSnapshot
                 && issue.subject == format!("audit_snapshot:{}", marker_path.display())
+                && issue
+                    .message
+                    .contains("aopmem audit repair --current-workspace --json")
         }));
 
         fs::remove_dir_all(&override_home).expect("temp AOPMEM_HOME should be removed");
@@ -1520,7 +1535,7 @@ mod tests {
         assert_eq!(report.summary.schema_drift, 1);
         assert!(report.issues.iter().any(|issue| {
             issue.kind == LintIssueKind::SchemaDrift
-                && issue.subject == "schema:schema_migrations:003_task_recall_exact_indexes"
+                && issue.subject == "schema:schema_migrations:004_task_protocol_and_tool_aliases"
         }));
 
         fs::remove_dir_all(&override_home).expect("temp AOPMEM_HOME should be removed");

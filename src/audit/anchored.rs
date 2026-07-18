@@ -13,8 +13,6 @@ use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt as UnixMetadataExt;
 #[cfg(windows)]
-use std::os::windows::ffi::OsStrExt;
-#[cfg(windows)]
 use std::os::windows::fs::MetadataExt;
 #[cfg(windows)]
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
@@ -73,18 +71,12 @@ pub(crate) struct AnchoredDir {
     ancestors: Vec<Arc<File>>,
 }
 
-/// Result of a no-replace publish after the destination became visible.
-///
-/// A directory sync or temporary-link cleanup can fail after the durable file
-/// itself has already been published. Callers must report that state as a
-/// success with a warning, never as a pre-publication failure.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct CommittedPublishOutcome {
-    pub(crate) durability_confirmed: bool,
-    pub(crate) temporary_cleanup_confirmed: bool,
-}
-
 impl AnchoredDir {
+    #[cfg(unix)]
+    pub(crate) fn raw_directory_fd(&self) -> std::os::fd::RawFd {
+        self.handle.as_raw_fd()
+    }
+
     #[cfg(test)]
     pub(super) fn open_or_create_audit_root(audit_root: &Path) -> io::Result<Self> {
         Self::open_or_create_audit_root_with_identity(audit_root, None)
@@ -138,15 +130,47 @@ impl AnchoredDir {
         })
     }
 
-    pub(super) fn logical_path(&self) -> &Path {
+    pub(crate) fn logical_path(&self) -> &Path {
         &self.logical_path
+    }
+
+    pub(crate) fn verify_logical_identity(&self) -> io::Result<()> {
+        let metadata = fs::symlink_metadata(&self.logical_path)?;
+        if metadata_is_reparse(&metadata) || metadata.file_type().is_symlink() || !metadata.is_dir()
+        {
+            return Err(unsafe_entry(
+                &self.logical_path,
+                "anchored directory path is not the opened real directory",
+            ));
+        }
+        #[cfg(unix)]
+        let path_identity = filesystem_identity(&metadata);
+        #[cfg(windows)]
+        let path_identity = WorkspaceIdentity::capture(&self.logical_path)?.0;
+        let handle_identity = filesystem_identity_from_file(&self.handle, &self.logical_path)?;
+        if path_identity != handle_identity {
+            return Err(unsafe_entry(
+                &self.logical_path,
+                "anchored directory path identity changed",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Returns a path-free token for the opened directory identity.
+    ///
+    /// Upgrade recovery persists this token so a same-name directory swap is
+    /// detected before any migration is resumed.
+    pub(crate) fn stable_identity_token(&self) -> io::Result<String> {
+        let identity = filesystem_identity_from_file(&self.handle, &self.logical_path)?;
+        Ok(filesystem_identity_token(identity))
     }
 
     pub(super) fn child_dir(&self, name: &str, create: bool) -> io::Result<Self> {
         self.child_dir_os(OsStr::new(name), create)
     }
 
-    pub(super) fn child_dir_os(&self, name: &OsStr, create: bool) -> io::Result<Self> {
+    pub(crate) fn child_dir_os(&self, name: &OsStr, create: bool) -> io::Result<Self> {
         validate_component(name)?;
         let path = self.logical_path.join(name);
         if create {
@@ -162,6 +186,32 @@ impl AnchoredDir {
         })
     }
 
+    pub(crate) fn create_new_child_dir_os(&self, name: &OsStr) -> io::Result<Self> {
+        validate_component(name)?;
+        let path = self.logical_path.join(name);
+        create_new_child_directory(&self.handle, &self.logical_path, name)?;
+        match open_child_directory(&self.handle, &path, name) {
+            Ok(handle) => {
+                let mut ancestors = self.ancestors.clone();
+                ancestors.push(Arc::clone(&self.handle));
+                Ok(Self {
+                    logical_path: path,
+                    handle: Arc::new(handle),
+                    ancestors,
+                })
+            }
+            Err(error) => {
+                let _ = remove_empty_child_directory(&self.handle, &path, name);
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn remove_empty_child_dir_os(&self, name: &OsStr) -> io::Result<()> {
+        validate_component(name)?;
+        remove_empty_child_directory(&self.handle, &self.logical_path.join(name), name)
+    }
+
     pub(super) fn child_dir_optional(&self, name: &str) -> io::Result<Option<Self>> {
         match self.child_dir(name, false) {
             Ok(directory) => Ok(Some(directory)),
@@ -174,7 +224,7 @@ impl AnchoredDir {
         self.open_regular_os(OsStr::new(name))
     }
 
-    fn open_regular_os(&self, name: &OsStr) -> io::Result<File> {
+    pub(crate) fn open_regular_os(&self, name: &OsStr) -> io::Result<File> {
         self.open_regular_with_os(name, FileOpenMode::ReadOnly)
     }
 
@@ -198,7 +248,7 @@ impl AnchoredDir {
         self.open_regular_with(name, FileOpenMode::OpenOrCreate)
     }
 
-    pub(super) fn create_new_regular(&self, name: &str) -> io::Result<File> {
+    pub(crate) fn create_new_regular(&self, name: &str) -> io::Result<File> {
         self.open_regular_with(name, FileOpenMode::CreateNew)
     }
 
@@ -208,6 +258,24 @@ impl AnchoredDir {
 
     pub(crate) fn open_regular_for_update_os(&self, name: &OsStr) -> io::Result<File> {
         self.open_regular_with_os(name, FileOpenMode::ReadWriteExisting)
+    }
+
+    /// Reopens one anchored child and confirms it still denotes `opened`.
+    /// The file identity remains private to this module.
+    pub(crate) fn regular_child_matches_open_file(
+        &self,
+        name: &OsStr,
+        opened: &File,
+    ) -> io::Result<bool> {
+        let current = self.open_regular_os(name)?;
+        same_file(opened, &current)
+    }
+
+    /// Returns a path-free identity token for one anchored regular child.
+    pub(crate) fn regular_child_identity_token(&self, name: &OsStr) -> io::Result<String> {
+        let file = self.open_regular_os(name)?;
+        let identity = filesystem_identity_from_file(&file, &self.logical_path.join(name))?;
+        Ok(filesystem_identity_token(identity))
     }
 
     fn open_regular_with(&self, name: &str, mode: FileOpenMode) -> io::Result<File> {
@@ -255,7 +323,7 @@ impl AnchoredDir {
         Ok(())
     }
 
-    pub(super) fn remove_regular(&self, name: &str) -> io::Result<()> {
+    pub(crate) fn remove_regular(&self, name: &str) -> io::Result<()> {
         self.remove_regular_os(OsStr::new(name))
     }
 
@@ -264,99 +332,12 @@ impl AnchoredDir {
         remove_child_regular(&self.handle, &self.logical_path.join(name), name)
     }
 
-    pub(crate) fn replace_regular(
-        &self,
-        source: &File,
-        source_name: &str,
-        destination_name: &str,
-    ) -> io::Result<()> {
-        self.rename_regular(source, source_name, destination_name, true)
-    }
-
-    pub(super) fn publish_regular_no_replace(
-        &self,
-        source: &File,
-        source_name: &str,
-        destination_name: &str,
-    ) -> io::Result<()> {
-        self.rename_regular(source, source_name, destination_name, false)
-    }
-
-    pub(crate) fn publish_regular_no_replace_committed_os(
-        &self,
-        source: &File,
-        source_name: &OsStr,
-        destination_name: &OsStr,
-    ) -> io::Result<CommittedPublishOutcome> {
-        validate_component(source_name)?;
-        validate_component(destination_name)?;
-        if let Err(error) =
-            rename_child_regular(&self.handle, source, source_name, destination_name, false)
-        {
-            let destination_is_source = self
-                .open_regular_optional_os(destination_name)
-                .ok()
-                .flatten()
-                .and_then(|destination| same_file(source, &destination).ok())
-                .unwrap_or(false);
-            if destination_is_source {
-                let source_is_unchanged = self
-                    .open_regular_optional_os(source_name)
-                    .ok()
-                    .flatten()
-                    .and_then(|current| same_file(source, &current).ok())
-                    .unwrap_or(false);
-                let cleanup_result = if source_is_unchanged {
-                    self.remove_regular_os(source_name)
-                } else {
-                    Ok(())
-                };
-                let temporary_cleanup_confirmed = self
-                    .open_regular_optional_os(source_name)
-                    .is_ok_and(|current| current.is_none());
-                return Ok(CommittedPublishOutcome {
-                    durability_confirmed: cleanup_result.is_ok(),
-                    temporary_cleanup_confirmed,
-                });
-            }
-            return Err(error);
-        }
-        Ok(CommittedPublishOutcome {
-            durability_confirmed: self.sync().is_ok(),
-            temporary_cleanup_confirmed: true,
-        })
-    }
-
-    fn rename_regular(
-        &self,
-        source: &File,
-        source_name: &str,
-        destination_name: &str,
-        replace: bool,
-    ) -> io::Result<()> {
-        self.rename_regular_os(
-            source,
-            OsStr::new(source_name),
-            OsStr::new(destination_name),
-            replace,
-        )
-    }
-
-    fn rename_regular_os(
-        &self,
-        source: &File,
-        source_name: &OsStr,
-        destination_name: &OsStr,
-        replace: bool,
-    ) -> io::Result<()> {
-        validate_component(source_name)?;
-        validate_component(destination_name)?;
-        rename_child_regular(&self.handle, source, source_name, destination_name, replace)?;
-        self.sync()
-    }
-
     pub(crate) fn sync(&self) -> io::Result<()> {
         sync_directory_handle(&self.handle)
+    }
+
+    pub(crate) fn sync_for_publish(&self) -> io::Result<bool> {
+        sync_directory_handle_strict(&self.handle)
     }
 }
 
@@ -366,6 +347,8 @@ enum FileOpenMode {
     ReadWriteExisting,
     OpenOrCreate,
     CreateNew,
+    #[cfg(windows)]
+    DeleteExisting,
 }
 
 fn validate_component(name: &OsStr) -> io::Result<()> {
@@ -416,6 +399,19 @@ fn same_file(left: &File, right: &File) -> io::Result<bool> {
     let left = filesystem_identity_from_file(left, Path::new("<open audit source>"))?;
     let right = filesystem_identity_from_file(right, Path::new("<anchored audit source>"))?;
     Ok(left == right)
+}
+
+#[cfg(unix)]
+fn filesystem_identity_token(identity: FilesystemIdentity) -> String {
+    format!("unix:{:016x}:{:016x}", identity.device, identity.inode)
+}
+
+#[cfg(windows)]
+fn filesystem_identity_token(identity: FilesystemIdentity) -> String {
+    format!(
+        "windows:{:08x}:{:016x}",
+        identity.volume_serial, identity.file_index
+    )
 }
 
 #[cfg(unix)]
@@ -539,6 +535,40 @@ fn create_child_directory(parent: &File, _parent_path: &Path, name: &OsStr) -> i
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
+fn create_new_child_directory(parent: &File, _parent_path: &Path, name: &OsStr) -> io::Result<()> {
+    let name = c_name(name)?;
+    if system_mkdirat(parent.as_raw_fd(), name.as_ptr(), DIRECTORY_MODE) == 0 {
+        if let Err(error) = sync_directory_handle(parent) {
+            let _ = system_unlinkat(parent.as_raw_fd(), name.as_ptr(), remove_directory_flag());
+            return Err(error);
+        }
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn remove_empty_child_directory(parent: &File, _path: &Path, name: &OsStr) -> io::Result<()> {
+    let name = c_name(name)?;
+    if system_unlinkat(parent.as_raw_fd(), name.as_ptr(), remove_directory_flag()) == 0 {
+        sync_directory_handle(parent)
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "macos")]
+const fn remove_directory_flag() -> i32 {
+    libc::AT_REMOVEDIR
+}
+
+#[cfg(target_os = "linux")]
+const fn remove_directory_flag() -> i32 {
+    0x200
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn open_child_directory(parent: &File, path: &Path, name: &OsStr) -> io::Result<File> {
     let name = c_name(name)?;
     let descriptor = system_openat(parent.as_raw_fd(), name.as_ptr(), unix_directory_flags(), 0);
@@ -587,57 +617,13 @@ fn remove_child_regular(parent: &File, path: &Path, name: &OsStr) -> io::Result<
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn rename_child_regular(
-    parent: &File,
-    source: &File,
-    source_name: &OsStr,
-    destination_name: &OsStr,
-    replace: bool,
-) -> io::Result<()> {
-    let current = open_child_regular(
-        parent,
-        Path::new(source_name),
-        source_name,
-        FileOpenMode::ReadOnly,
-    )?;
-    if !same_file(source, &current)? {
-        return Err(io::Error::other(
-            "anchored audit publish source changed before rename",
-        ));
-    }
-    let source_name = c_name(source_name)?;
-    let destination_name = c_name(destination_name)?;
-    if replace {
-        if system_renameat(
-            parent.as_raw_fd(),
-            source_name.as_ptr(),
-            parent.as_raw_fd(),
-            destination_name.as_ptr(),
-        ) == 0
-        {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
-        }
-    } else if system_linkat(
-        parent.as_raw_fd(),
-        source_name.as_ptr(),
-        parent.as_raw_fd(),
-        destination_name.as_ptr(),
-        0,
-    ) != 0
-    {
-        Err(io::Error::last_os_error())
-    } else if system_unlinkat(parent.as_raw_fd(), source_name.as_ptr(), 0) == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
+fn sync_directory_handle(directory: &File) -> io::Result<()> {
+    directory.sync_all()
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn sync_directory_handle(directory: &File) -> io::Result<()> {
-    directory.sync_all()
+fn sync_directory_handle_strict(directory: &File) -> io::Result<bool> {
+    directory.sync_all().map(|()| true)
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -687,37 +673,6 @@ fn system_mkdirat(parent: i32, name: *const i8, mode: u32) -> i32 {
 fn system_unlinkat(parent: i32, name: *const i8, flags: i32) -> i32 {
     // SAFETY: name is live and NUL-terminated; parent is an open directory.
     unsafe { libc::unlinkat(parent, name, flags) }
-}
-
-#[cfg(target_os = "macos")]
-fn system_renameat(
-    source_parent: i32,
-    source: *const i8,
-    destination_parent: i32,
-    destination: *const i8,
-) -> i32 {
-    // SAFETY: names are NUL-terminated and parents are open directories.
-    unsafe { libc::renameat(source_parent, source, destination_parent, destination) }
-}
-
-#[cfg(target_os = "macos")]
-fn system_linkat(
-    source_parent: i32,
-    source: *const i8,
-    destination_parent: i32,
-    destination: *const i8,
-    flags: i32,
-) -> i32 {
-    // SAFETY: names are NUL-terminated and parents are open directories.
-    unsafe {
-        libc::linkat(
-            source_parent,
-            source,
-            destination_parent,
-            destination,
-            flags,
-        )
-    }
 }
 
 #[cfg(all(test, target_os = "macos"))]
@@ -884,6 +839,17 @@ fn create_child_directory(_parent: &File, parent_path: &Path, name: &OsStr) -> i
 }
 
 #[cfg(windows)]
+fn create_new_child_directory(_parent: &File, parent_path: &Path, name: &OsStr) -> io::Result<()> {
+    fs::create_dir(parent_path.join(name))
+}
+
+#[cfg(windows)]
+fn remove_empty_child_directory(_parent: &File, path: &Path, _name: &OsStr) -> io::Result<()> {
+    let directory = windows_open(path, FileOpenMode::DeleteExisting, true)?;
+    windows_mark_delete(&directory)
+}
+
+#[cfg(windows)]
 fn open_child_directory(_parent: &File, path: &Path, _name: &OsStr) -> io::Result<File> {
     windows_open(path, FileOpenMode::ReadOnly, true)
 }
@@ -906,20 +872,14 @@ fn windows_open(path: &Path, mode: FileOpenMode, directory: bool) -> io::Result<
         FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_ALWAYS, OPEN_EXISTING,
     };
 
-    let mut path_wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
-    if path_wide.contains(&0) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "audit path contains NUL",
-        ));
-    }
-    path_wide.push(0);
+    let path_wide = crate::windows_path::verbatim_wide_path(path)?;
 
     let (access, creation) = match mode {
         FileOpenMode::ReadOnly => (GENERIC_READ | FILE_READ_ATTRIBUTES, OPEN_EXISTING),
         FileOpenMode::ReadWriteExisting => (GENERIC_READ | GENERIC_WRITE | DELETE, OPEN_EXISTING),
         FileOpenMode::OpenOrCreate => (GENERIC_READ | GENERIC_WRITE | DELETE, OPEN_ALWAYS),
         FileOpenMode::CreateNew => (GENERIC_READ | GENERIC_WRITE | DELETE, CREATE_NEW),
+        FileOpenMode::DeleteExisting => (DELETE | FILE_READ_ATTRIBUTES, OPEN_EXISTING),
     };
     let flags = FILE_FLAG_OPEN_REPARSE_POINT
         | if directory {
@@ -954,70 +914,8 @@ fn windows_open(path: &Path, mode: FileOpenMode, directory: bool) -> io::Result<
 
 #[cfg(windows)]
 fn remove_child_regular(_parent: &File, path: &Path, _name: &OsStr) -> io::Result<()> {
-    let file = windows_open(path, FileOpenMode::ReadWriteExisting, false)?;
+    let file = windows_open(path, FileOpenMode::DeleteExisting, false)?;
     windows_mark_delete(&file)
-}
-
-#[cfg(windows)]
-fn rename_child_regular(
-    parent: &File,
-    source: &File,
-    _source_name: &OsStr,
-    destination_name: &OsStr,
-    replace: bool,
-) -> io::Result<()> {
-    use windows_sys::Win32::Storage::FileSystem::{
-        FileRenameInfo, SetFileInformationByHandle, FILE_RENAME_INFO,
-    };
-
-    let destination = destination_name.encode_wide().collect::<Vec<_>>();
-    let extra_units = destination.len().saturating_sub(1);
-    let buffer_size = std::mem::size_of::<FILE_RENAME_INFO>()
-        .checked_add(
-            extra_units
-                .checked_mul(std::mem::size_of::<u16>())
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "audit rename is too long")
-                })?,
-        )
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "audit rename is too long"))?;
-    let words = buffer_size.div_ceil(std::mem::size_of::<usize>());
-    let mut storage = vec![0_usize; words];
-    let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
-    let name_bytes = destination
-        .len()
-        .checked_mul(std::mem::size_of::<u16>())
-        .and_then(|value| u32::try_from(value).ok())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "audit rename is too long"))?;
-
-    // SAFETY: storage is aligned and sized for FILE_RENAME_INFO plus the full
-    // variable-length destination name.
-    unsafe {
-        (*info).Anonymous.ReplaceIfExists = replace;
-        (*info).RootDirectory = parent.as_raw_handle() as _;
-        (*info).FileNameLength = name_bytes;
-        std::ptr::copy_nonoverlapping(
-            destination.as_ptr(),
-            (*info).FileName.as_mut_ptr(),
-            destination.len(),
-        );
-    }
-    // SAFETY: source and parent own live handles and info is correctly sized.
-    let renamed = unsafe {
-        SetFileInformationByHandle(
-            source.as_raw_handle() as _,
-            FileRenameInfo,
-            info.cast(),
-            u32::try_from(buffer_size).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidInput, "audit rename is too long")
-            })?,
-        )
-    };
-    if renamed == 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
 }
 
 #[cfg(windows)]
@@ -1045,18 +943,23 @@ fn windows_mark_delete(file: &File) -> io::Result<()> {
 
 #[cfg(windows)]
 fn sync_directory_handle(directory: &File) -> io::Result<()> {
+    sync_directory_handle_strict(directory).map(|_| ())
+}
+
+#[cfg(windows)]
+fn sync_directory_handle_strict(directory: &File) -> io::Result<bool> {
     use windows_sys::Win32::Storage::FileSystem::FlushFileBuffers;
 
     // SAFETY: directory owns a live handle.
     let flushed = unsafe { FlushFileBuffers(directory.as_raw_handle() as _) };
     if flushed != 0 {
-        return Ok(());
+        return Ok(true);
     }
     let error = io::Error::last_os_error();
     if matches!(error.raw_os_error(), Some(1 | 5)) {
         // Some local filesystems do not support flushing directory handles.
-        // Every file is flushed before its handle-relative rename.
-        Ok(())
+        // The shared publish boundary reports that durability is unconfirmed.
+        Ok(false)
     } else {
         Err(error)
     }

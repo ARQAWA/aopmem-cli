@@ -136,6 +136,12 @@ pub const MAX_MCP_FIELD_BYTES: usize = 16 * 1024;
 pub const MAX_MCP_NOTES_BYTES: usize = 64 * 1024;
 pub const LEGACY_RECALL_ROOT_LIMIT_PER_TYPE: usize = 12;
 pub const LEGACY_RECALL_LINK_LIMIT: usize = 64;
+/// Upper bound for complete candidate payloads held before task packing.
+///
+/// Candidate rows are streamed and charged before entering the result vectors.
+/// One current SQLite row may exist temporarily beyond this logical payload
+/// cap, but every stored node body is independently capped at 1 MiB.
+pub const TASK_RECALL_CANDIDATE_SCAN_MAX_BYTES: usize = 16 * 1024 * 1024;
 
 pub const ALLOWED_NODE_TYPES: &[&str] = &[
     "kernel_contract",
@@ -1484,6 +1490,157 @@ pub fn open_workspace_db_read_only(
     Ok(connection)
 }
 
+/// Opens the live operational database without allowing writes.
+///
+/// URI `mode=ro` sees committed WAL state while query-only and in-memory temp
+/// storage prevent operational database or WAL writes.
+pub fn open_workspace_db_live_read_only(
+    workspace_paths: &WorkspacePaths,
+) -> Result<Connection, OpenWorkspaceReadOnlyError> {
+    match fs::symlink_metadata(workspace_paths.db()) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(OpenWorkspaceReadOnlyError::Missing(
+                workspace_paths.db().clone(),
+            ));
+        }
+        Err(error) => return Err(OpenWorkspaceReadOnlyError::UnsafePath(error)),
+        Ok(_) => {}
+    }
+    validate_workspace_read_paths(workspace_paths)
+        .map_err(OpenWorkspaceReadOnlyError::UnsafePath)?;
+    let canonical =
+        canonical_db_open_path(workspace_paths).map_err(OpenWorkspaceReadOnlyError::UnsafePath)?;
+    let uri = sqlite_uri(&canonical, false)
+        .ok_or_else(|| OpenWorkspaceReadOnlyError::Db(rusqlite::Error::InvalidPath(canonical)))?;
+    let connection = Connection::open_with_flags(
+        uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(OpenWorkspaceReadOnlyError::Db)?;
+    connection
+        .execute_batch(
+            "
+            PRAGMA query_only = ON;
+            PRAGMA temp_store = MEMORY;
+            ",
+        )
+        .map_err(OpenWorkspaceReadOnlyError::Db)?;
+    prepare_task_recall_connection(&connection).map_err(OpenWorkspaceReadOnlyError::Db)?;
+    Ok(connection)
+}
+
+/// Opens the live operational database for official audit repair.
+pub fn open_workspace_db_for_audit_repair(
+    workspace_paths: &WorkspacePaths,
+) -> Result<Connection, OpenWorkspaceReadOnlyError> {
+    open_workspace_db_live_read_only(workspace_paths)
+}
+
+/// Opens an immutable workspace snapshot for commands that must not create
+/// SQLite WAL/SHM sidecars. Callers must not use this while a writer is active.
+pub fn open_workspace_db_immutable(
+    workspace_paths: &WorkspacePaths,
+) -> Result<Connection, OpenWorkspaceReadOnlyError> {
+    match fs::symlink_metadata(workspace_paths.db()) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(OpenWorkspaceReadOnlyError::Missing(
+                workspace_paths.db().clone(),
+            ));
+        }
+        Err(error) => return Err(OpenWorkspaceReadOnlyError::UnsafePath(error)),
+        Ok(_) => {}
+    }
+    validate_workspace_read_paths(workspace_paths)
+        .map_err(OpenWorkspaceReadOnlyError::UnsafePath)?;
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = workspace_paths.db().as_os_str().to_os_string();
+        sidecar.push(suffix);
+        let sidecar = PathBuf::from(sidecar);
+        match fs::symlink_metadata(&sidecar) {
+            Ok(_) => {
+                return Err(OpenWorkspaceReadOnlyError::UnsafePath(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!(
+                        "immutable read requires a clean SQLite checkpoint: {}",
+                        sidecar.display()
+                    ),
+                )));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(OpenWorkspaceReadOnlyError::UnsafePath(error)),
+        }
+    }
+    let canonical =
+        canonical_db_open_path(workspace_paths).map_err(OpenWorkspaceReadOnlyError::UnsafePath)?;
+    let uri = immutable_sqlite_uri(&canonical)
+        .ok_or_else(|| OpenWorkspaceReadOnlyError::Db(rusqlite::Error::InvalidPath(canonical)))?;
+    let connection = Connection::open_with_flags(
+        uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(OpenWorkspaceReadOnlyError::Db)?;
+    connection
+        .execute_batch(
+            "
+            PRAGMA query_only = ON;
+            PRAGMA temp_store = MEMORY;
+            ",
+        )
+        .map_err(OpenWorkspaceReadOnlyError::Db)?;
+    prepare_task_recall_connection(&connection).map_err(OpenWorkspaceReadOnlyError::Db)?;
+    Ok(connection)
+}
+
+fn immutable_sqlite_uri(path: &Path) -> Option<String> {
+    sqlite_uri(path, true)
+}
+
+fn sqlite_uri(path: &Path, immutable: bool) -> Option<String> {
+    #[cfg(unix)]
+    let raw_path = {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str().as_bytes().to_vec()
+    };
+    #[cfg(windows)]
+    let raw_path = {
+        let normalized = path.to_str()?.replace('\\', "/");
+        let normalized = normalized
+            .strip_prefix("//?/UNC/")
+            .map(|path| format!("//{path}"))
+            .or_else(|| normalized.strip_prefix("//?/").map(str::to_string))
+            .unwrap_or(normalized);
+        normalized.into_bytes()
+    };
+    #[cfg(not(any(unix, windows)))]
+    let raw_path = path.to_str()?.as_bytes().to_vec();
+
+    let mut encoded = String::with_capacity(raw_path.len() + 32);
+    for byte in raw_path {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b':' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(char::from(byte))
+            }
+            _ => {
+                use std::fmt::Write as _;
+                let _ = write!(encoded, "%{byte:02X}");
+            }
+        }
+    }
+    #[cfg(windows)]
+    if encoded.as_bytes().get(1) == Some(&b':') {
+        encoded.insert(0, '/');
+    }
+    if immutable {
+        Some(format!("file:{encoded}?mode=ro&immutable=1"))
+    } else {
+        Some(format!("file:{encoded}?mode=ro"))
+    }
+}
+
 fn canonical_db_open_path(workspace_paths: &WorkspacePaths) -> io::Result<PathBuf> {
     let file_name = workspace_paths.db().file_name().ok_or_else(|| {
         persistent_path_error(workspace_paths.db(), "database path has no file name")
@@ -1704,6 +1861,10 @@ pub fn operational_recall_revision(connection: &Connection) -> rusqlite::Result<
             "SELECT tool_id, name, status, owner_workflow, side_effects, approval_requirement, contract_json, created_at, updated_at FROM tool_contracts ORDER BY tool_id ASC",
         ),
         (
+            "tool_aliases",
+            "SELECT alias, canonical_tool_id, created_at, source, status FROM tool_aliases ORDER BY alias ASC",
+        ),
+        (
             "mcp_profiles",
             "SELECT id, name, kind, status, read_operations, write_operations, side_effects, approval_requirement, credentials_source, notes, created_at, updated_at FROM mcp_profiles ORDER BY id ASC",
         ),
@@ -1783,9 +1944,13 @@ pub fn load_task_recall_candidates(
     if limit == 0 {
         return Ok(TaskRecallCandidates::default());
     }
+    prepare_task_recall_connection(connection)?;
 
-    let (typed_roots, typed_more_results) = list_task_typed_roots(connection, query, limit)?;
-    let (fts_results, fts_more_results) = search_task_recall_fts(connection, query, limit)?;
+    let mut scan_budget = TaskRecallCandidateScanBudget::new(TASK_RECALL_CANDIDATE_SCAN_MAX_BYTES);
+    let (typed_roots, typed_more_results) =
+        list_task_typed_roots(connection, query, limit, &mut scan_budget)?;
+    let (fts_results, fts_more_results) =
+        search_task_recall_fts(connection, query, limit, &mut scan_budget)?;
 
     let mut seen_root_ids = BTreeSet::new();
     let mut ordered_roots = Vec::with_capacity(typed_roots.len() + fts_results.len());
@@ -1802,9 +1967,9 @@ pub fn load_task_recall_candidates(
         .map(|(root_id, _)| *root_id)
         .collect::<Vec<_>>();
     let (direct_nodes, direct_more_results) =
-        list_task_direct_nodes(connection, &ordered_root_ids, limit)?;
+        list_task_direct_nodes(connection, &ordered_root_ids, limit, &mut scan_budget)?;
     let (graph_nodes, graph_more_results) =
-        list_task_graph_nodes(connection, &ordered_roots, limit)?;
+        list_task_graph_nodes(connection, &ordered_roots, limit, &mut scan_budget)?;
 
     Ok(TaskRecallCandidates {
         typed_roots,
@@ -1816,6 +1981,50 @@ pub fn load_task_recall_candidates(
             || direct_more_results
             || graph_more_results,
     })
+}
+
+struct TaskRecallCandidateScanBudget {
+    remaining_bytes: usize,
+    exhausted: bool,
+}
+
+impl TaskRecallCandidateScanBudget {
+    fn new(limit_bytes: usize) -> Self {
+        Self {
+            remaining_bytes: limit_bytes,
+            exhausted: false,
+        }
+    }
+
+    fn try_charge(&mut self, node: &Node, extra_strings: &[&str]) -> bool {
+        let bytes = task_recall_candidate_charge(node, extra_strings);
+        if bytes > self.remaining_bytes {
+            self.exhausted = true;
+            return false;
+        }
+        self.remaining_bytes -= bytes;
+        true
+    }
+}
+
+fn task_recall_candidate_charge(node: &Node, extra_strings: &[&str]) -> usize {
+    // This intentionally overcharges fixed structs, vector slots, numeric
+    // fields, and allocator slack. Variable UTF-8 payloads are counted exactly.
+    const FIXED_ROW_OVERHEAD_BYTES: usize = 1_024;
+    [
+        node.node_type.len(),
+        node.status.len(),
+        node.title.len(),
+        node.summary.as_ref().map_or(0, String::len),
+        node.body.as_ref().map_or(0, String::len),
+        node.source_ref.as_ref().map_or(0, String::len),
+        node.trust_level.as_ref().map_or(0, String::len),
+        node.created_at.len(),
+        node.updated_at.len(),
+    ]
+    .into_iter()
+    .chain(extra_strings.iter().map(|value| value.len()))
+    .fold(FIXED_ROW_OVERHEAD_BYTES, usize::saturating_add)
 }
 
 /// Reads one globally ordered typed-root page for continuation recall.
@@ -2167,7 +2376,11 @@ fn list_task_typed_roots(
     connection: &Connection,
     query: &str,
     limit: usize,
+    scan_budget: &mut TaskRecallCandidateScanBudget,
 ) -> rusqlite::Result<(Vec<Node>, bool)> {
+    if scan_budget.exhausted {
+        return Ok((Vec::new(), true));
+    }
     let fetch_limit = page_fetch_limit(limit)?;
     let mut statement = connection.prepare(
         "
@@ -2219,6 +2432,14 @@ fn list_task_typed_roots(
               )
           )
         ORDER BY
+            aopmem_source_priority(nodes.source_ref) ASC,
+            CASE
+                WHEN nodes.trust_level = 'high' THEN 0
+                WHEN nodes.trust_level = 'medium' THEN 1
+                WHEN nodes.trust_level = 'low' THEN 2
+                WHEN nodes.trust_level IS NULL THEN 4 ELSE 3
+            END ASC,
+            nodes.confidence DESC NULLS LAST,
             CASE nodes.node_type
                 WHEN 'workflow' THEN 0
                 WHEN 'tool_contract' THEN 1
@@ -2236,11 +2457,17 @@ fn list_task_typed_roots(
         LIMIT ?2;
         ",
     )?;
-    let mut nodes = statement
-        .query_map(params![query, fetch_limit], row_to_node)?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    let more_results = nodes.len() > limit;
-    nodes.truncate(limit);
+    let mut rows = statement.query(params![query, fetch_limit])?;
+    let mut nodes = Vec::with_capacity(limit);
+    let mut more_results = false;
+    while let Some(row) = rows.next()? {
+        let node = row_to_node(row)?;
+        if nodes.len() == limit || !scan_budget.try_charge(&node, &[]) {
+            more_results = true;
+            break;
+        }
+        nodes.push(node);
+    }
 
     Ok((nodes, more_results))
 }
@@ -2249,7 +2476,11 @@ fn search_task_recall_fts(
     connection: &Connection,
     query: &str,
     limit: usize,
+    scan_budget: &mut TaskRecallCandidateScanBudget,
 ) -> rusqlite::Result<(Vec<FtsNodeSearchResult>, bool)> {
+    if scan_budget.exhausted {
+        return Ok((Vec::new(), true));
+    }
     let Some(match_query) = fts_match_query(query) else {
         return Ok((Vec::new(), false));
     };
@@ -2279,20 +2510,34 @@ fn search_task_recall_fts(
                   'kernel_contract', 'gate', 'project_profile', 'source', 'rule'
               )
           )
-        ORDER BY rank ASC, nodes.id ASC
+        ORDER BY
+            aopmem_source_priority(nodes.source_ref) ASC,
+            CASE
+                WHEN nodes.trust_level = 'high' THEN 0
+                WHEN nodes.trust_level = 'medium' THEN 1
+                WHEN nodes.trust_level = 'low' THEN 2
+                WHEN nodes.trust_level IS NULL THEN 4 ELSE 3
+            END ASC,
+            nodes.confidence DESC NULLS LAST,
+            rank ASC,
+            nodes.id ASC
         LIMIT ?2;
         ",
     )?;
-    let mut results = statement
-        .query_map(params![match_query, fetch_limit], |row| {
-            Ok(FtsNodeSearchResult {
-                rank: row.get(11)?,
-                node: row_to_node(row)?,
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    let more_results = results.len() > limit;
-    results.truncate(limit);
+    let mut rows = statement.query(params![match_query, fetch_limit])?;
+    let mut results = Vec::with_capacity(limit);
+    let mut more_results = false;
+    while let Some(row) = rows.next()? {
+        let result = FtsNodeSearchResult {
+            rank: row.get(11)?,
+            node: row_to_node(row)?,
+        };
+        if results.len() == limit || !scan_budget.try_charge(&result.node, &[]) {
+            more_results = true;
+            break;
+        }
+        results.push(result);
+    }
 
     Ok((results, more_results))
 }
@@ -2301,9 +2546,13 @@ fn list_task_direct_nodes(
     connection: &Connection,
     ordered_root_ids: &[i64],
     limit: usize,
+    scan_budget: &mut TaskRecallCandidateScanBudget,
 ) -> rusqlite::Result<(Vec<DirectRecallNode>, bool)> {
     if ordered_root_ids.is_empty() {
         return Ok((Vec::new(), false));
+    }
+    if scan_budget.exhausted {
+        return Ok((Vec::new(), true));
     }
     let fetch_limit = page_fetch_limit(limit)?;
     let root_rows = ordered_root_ids
@@ -2346,7 +2595,18 @@ fn list_task_direct_nodes(
                   'kernel_contract', 'gate', 'project_profile', 'source', 'rule'
               )
           )
-        ORDER BY root_order.ordinal ASC, links.id ASC, nodes.id ASC
+        ORDER BY
+            aopmem_source_priority(nodes.source_ref) ASC,
+            CASE
+                WHEN nodes.trust_level = 'high' THEN 0
+                WHEN nodes.trust_level = 'medium' THEN 1
+                WHEN nodes.trust_level = 'low' THEN 2
+                WHEN nodes.trust_level IS NULL THEN 4 ELSE 3
+            END ASC,
+            nodes.confidence DESC NULLS LAST,
+            nodes.id ASC,
+            root_order.ordinal ASC,
+            links.id ASC
         LIMIT ?{limit_parameter};
         "
     );
@@ -2355,23 +2615,32 @@ fn list_task_direct_nodes(
         .copied()
         .chain(std::iter::once(fetch_limit));
     let mut statement = connection.prepare(&sql)?;
-    let mut nodes = statement
-        .query_map(rusqlite::params_from_iter(parameters), |row| {
-            Ok(DirectRecallNode {
-                root_node_id: row.get(0)?,
-                link: Link {
-                    id: row.get(1)?,
-                    source_node_id: row.get(2)?,
-                    target_node_id: row.get(3)?,
-                    link_type: row.get(4)?,
-                    created_at: row.get(5)?,
-                },
-                node: row_to_node_at(row, 6)?,
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    let more_results = nodes.len() > limit;
-    nodes.truncate(limit);
+    let mut rows = statement.query(rusqlite::params_from_iter(parameters))?;
+    let mut nodes = Vec::with_capacity(limit);
+    let mut more_results = false;
+    while let Some(row) = rows.next()? {
+        let node = DirectRecallNode {
+            root_node_id: row.get(0)?,
+            link: Link {
+                id: row.get(1)?,
+                source_node_id: row.get(2)?,
+                target_node_id: row.get(3)?,
+                link_type: row.get(4)?,
+                created_at: row.get(5)?,
+            },
+            node: row_to_node_at(row, 6)?,
+        };
+        if nodes.len() == limit
+            || !scan_budget.try_charge(
+                &node.node,
+                &[node.link.link_type.as_str(), node.link.created_at.as_str()],
+            )
+        {
+            more_results = true;
+            break;
+        }
+        nodes.push(node);
+    }
 
     Ok((nodes, more_results))
 }
@@ -2380,9 +2649,13 @@ fn list_task_graph_nodes(
     connection: &Connection,
     ordered_roots: &[(i64, String)],
     limit: usize,
+    scan_budget: &mut TaskRecallCandidateScanBudget,
 ) -> rusqlite::Result<(Vec<GraphRecallNode>, bool)> {
     if ordered_roots.is_empty() || limit == 0 {
         return Ok((Vec::new(), false));
+    }
+    if scan_budget.exhausted {
+        return Ok((Vec::new(), true));
     }
 
     let fetch_limit = page_fetch_limit(limit)?;
@@ -2490,10 +2763,19 @@ fn list_task_graph_nodes(
         FROM graph
         JOIN nodes ON nodes.id = graph.target_node_id
         ORDER BY
+            aopmem_source_priority(nodes.source_ref) ASC,
+            CASE
+                WHEN nodes.trust_level = 'high' THEN 0
+                WHEN nodes.trust_level = 'medium' THEN 1
+                WHEN nodes.trust_level = 'low' THEN 2
+                WHEN nodes.trust_level IS NULL THEN 4 ELSE 3
+            END ASC,
+            nodes.confidence DESC NULLS LAST,
+            nodes.id ASC,
             graph.root_ordinal ASC,
             graph.depth ASC,
             graph.link_id ASC,
-            nodes.id ASC;
+            graph.edge_source_node_id ASC;
         "
     );
     let parameters = ordered_roots
@@ -2508,35 +2790,48 @@ fn list_task_graph_nodes(
             fetch_limit,
         )));
     let mut statement = connection.prepare(&sql)?;
-    let mut nodes = statement
-        .query_map(rusqlite::params_from_iter(parameters), |row| {
-            let depth = row.get::<_, i64>(3)?;
-            let depth = usize::try_from(depth).map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    3,
-                    rusqlite::types::Type::Integer,
-                    Box::new(error),
-                )
-            })?;
-            let node = row_to_node_at(row, 7)?;
-            Ok(GraphRecallNode {
-                root_node_id: row.get(0)?,
-                root_node_type: row.get(1)?,
-                edge_source_node_id: row.get(2)?,
-                link: Link {
-                    id: row.get(4)?,
-                    source_node_id: row.get(2)?,
-                    target_node_id: node.id,
-                    link_type: row.get(5)?,
-                    created_at: row.get(6)?,
-                },
-                depth,
-                node,
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    let more_results = nodes.len() > limit;
-    nodes.truncate(limit);
+    let mut rows = statement.query(rusqlite::params_from_iter(parameters))?;
+    let mut nodes = Vec::with_capacity(limit);
+    let mut more_results = false;
+    while let Some(row) = rows.next()? {
+        let depth = row.get::<_, i64>(3)?;
+        let depth = usize::try_from(depth).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                3,
+                rusqlite::types::Type::Integer,
+                Box::new(error),
+            )
+        })?;
+        let node = row_to_node_at(row, 7)?;
+        let node = GraphRecallNode {
+            root_node_id: row.get(0)?,
+            root_node_type: row.get(1)?,
+            edge_source_node_id: row.get(2)?,
+            link: Link {
+                id: row.get(4)?,
+                source_node_id: row.get(2)?,
+                target_node_id: node.id,
+                link_type: row.get(5)?,
+                created_at: row.get(6)?,
+            },
+            depth,
+            node,
+        };
+        if nodes.len() == limit
+            || !scan_budget.try_charge(
+                &node.node,
+                &[
+                    node.root_node_type.as_str(),
+                    node.link.link_type.as_str(),
+                    node.link.created_at.as_str(),
+                ],
+            )
+        {
+            more_results = true;
+            break;
+        }
+        nodes.push(node);
+    }
 
     Ok((nodes, more_results))
 }
@@ -5479,7 +5774,7 @@ mod tests {
         assert_eq!(foreign_keys, 1);
         assert_eq!(journal_mode, "wal");
         assert_eq!(busy_timeout, 5000);
-        assert_eq!(migration_count, 3);
+        assert_eq!(migration_count, 4);
 
         drop(connection);
         fs::remove_dir_all(override_home).expect("temp AOPMEM_HOME should be removed");
@@ -5505,6 +5800,66 @@ mod tests {
         assert!(!override_home.exists());
         assert!(!workspace_paths.root().exists());
         assert!(!workspace_paths.db().exists());
+    }
+
+    #[test]
+    fn stage_019_repair_reader_sees_wal_and_changes_no_operational_bytes() {
+        let _lock = crate::install::test_env_lock()
+            .lock()
+            .expect("env lock should not be poisoned");
+        let override_home = temp_path("stage-019-repair-reader");
+        let _aopmem_home = EnvGuard::set(AOPMEM_HOME_ENV, &override_home);
+        let paths = resolve_paths().expect("AOPMEM_HOME should resolve");
+        let workspace_paths = ensure_workspace_dirs(&paths, "stage-019-reader")
+            .expect("workspace dirs should create");
+        let writer = open_workspace_db(&workspace_paths).expect("writer should open");
+        writer
+            .execute_batch(
+                "
+                PRAGMA wal_autocheckpoint = 0;
+                INSERT INTO nodes (node_type, status, title)
+                VALUES ('fact', 'active', 'WAL_VISIBLE_STAGE019');
+                ",
+            )
+            .expect("WAL fixture should commit");
+        let wal_path = workspace_db_sidecar_paths(workspace_paths.db())[0].clone();
+        assert!(wal_path.is_file(), "WAL must remain live for the proof");
+        let db_before = fs::read(workspace_paths.db()).expect("DB bytes should read");
+        let wal_before = fs::read(&wal_path).expect("WAL bytes should read");
+
+        let reader = open_workspace_db_for_audit_repair(&workspace_paths)
+            .expect("repair reader should open in URI mode=ro");
+        let query_only: i64 = reader
+            .query_row("PRAGMA query_only;", [], |row| row.get(0))
+            .expect("query_only should read");
+        let visible: i64 = reader
+            .query_row(
+                "SELECT COUNT(*) FROM nodes WHERE title = 'WAL_VISIBLE_STAGE019';",
+                [],
+                |row| row.get(0),
+            )
+            .expect("WAL row should read");
+        assert_eq!(query_only, 1);
+        assert_eq!(visible, 1);
+        assert_eq!(
+            fs::read(workspace_paths.db()).expect("DB bytes should reread"),
+            db_before
+        );
+        assert_eq!(
+            fs::read(&wal_path).expect("WAL bytes should reread"),
+            wal_before
+        );
+        drop(reader);
+        assert_eq!(
+            fs::read(workspace_paths.db()).expect("DB bytes should reread after close"),
+            db_before
+        );
+        assert_eq!(
+            fs::read(&wal_path).expect("WAL bytes should reread after close"),
+            wal_before
+        );
+        drop(writer);
+        fs::remove_dir_all(override_home).expect("temp home should remove");
     }
 
     #[cfg(unix)]
@@ -5598,7 +5953,7 @@ mod tests {
             })
             .expect("schema_migrations should be readable");
 
-        assert_eq!(migration_count, 3);
+        assert_eq!(migration_count, 4);
 
         drop(second);
         fs::remove_dir_all(override_home).expect("temp AOPMEM_HOME should be removed");

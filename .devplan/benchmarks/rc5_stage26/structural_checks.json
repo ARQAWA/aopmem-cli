@@ -1,0 +1,10 @@
+{
+  "status": "PASS",
+  "checks": {
+    "tool_candidate_limit": "MAX_TOOL_CREATION_GUARD_CANDIDATES: usize = 64",
+    "tool_file_limit": "MAX_TOOL_IMPLEMENTATION_FILES: usize = 256",
+    "tool_hash_once": "fn hash_open_file_once",
+    "task_budget": "TASK_RECALL_SOFT_BUDGET_BYTES"
+  },
+  "conclusion": "bounded shortlist/file/budget guards present; normal tool run has no fingerprint path"
+}

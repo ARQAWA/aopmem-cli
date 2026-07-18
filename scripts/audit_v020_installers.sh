@@ -73,7 +73,7 @@ write_new_stub() {
     printf '%s\n' 'fi'
     printf '%s\n' 'case "$*" in'
     printf '%s\n' '  "--version")'
-    printf '%s\n' '    printf "%s\n" "aopmem 0.2.0-rc4"'
+    printf '%s\n' '    printf "%s\n" "aopmem 0.2.0-rc5"'
     printf '%s\n' '    ;;'
     printf '%s\n' '  "upgrade prepare --all-workspaces --json")'
     printf '%s\n' '    if [ "${AOPMEM_STUB_PREPARE_FAIL:-0}" = "1" ]; then'
@@ -81,6 +81,20 @@ write_new_stub() {
     printf '%s\n' '      exit 1'
     printf '%s\n' '    fi'
     printf '%s\n' '    printf "%s\n" '\''{"ok":true,"data":{"success":true,"writes_performed":true}}'\'''
+    printf '%s\n' '    ;;'
+    printf '%s\n' '  "upgrade backup --adopt "*)'
+    printf '%s\n' '    printf "%s\n" '\''{"ok":true,"data":{"journal_phase":"backup_complete"}}'\'''
+    printf '%s\n' '    ;;'
+    printf '%s\n' '  "upgrade stage --artifact "*)'
+    printf '%s\n' '    cp "$0" "$AOPMEM_HOME/bin/.aopmem-v0.2.0-rc5.staged"'
+    printf '%s\n' '    chmod 755 "$AOPMEM_HOME/bin/.aopmem-v0.2.0-rc5.staged"'
+    printf '%s\n' '    printf "%s\n" '\''{"ok":true,"data":{"journal_phase":"staged_verified"}}'\'''
+    printf '%s\n' '    ;;'
+    printf '%s\n' '  "platform check --json")'
+    printf '%s\n' '    printf "%s\n" '\''{"ok":true,"data":{}}'\'''
+    printf '%s\n' '    ;;'
+    printf '%s\n' '  "audit repair --all-workspaces --json")'
+    printf '%s\n' '    printf "%s\n" '\''{"ok":true,"data":{"failed":0}}'\'''
     printf '%s\n' '    ;;'
     printf '%s\n' '  "upgrade plan --all-workspaces --json")'
     printf '%s\n' '    if [ "${AOPMEM_STUB_PLAN_NOT_READY:-0}" = "1" ]; then'
@@ -94,14 +108,24 @@ write_new_stub() {
     printf '%s\n' '      printf "%s\n" '\''{"ok":false,"data":{"success":false,"binary_replaced":false,"stopped_workspace":"fixture-workspace","backup_root":"/fixture/upgrade-backup"},"errors":[{"code":"WORKSPACE_BACKUP_FAILED","message":"fixture backup failure","details":{"workspace_key":"fixture-workspace","backup_phase":"flush_temporary_file","source_path":"/fixture/source/memory.db","temporary_path":"/fixture/upgrade-backup/memory.db.partial","final_path":"/fixture/upgrade-backup/memory.db","raw_os_error":5,"io_kind":"permission_denied","partial_file_exists":true,"partial_file_size":184320,"partial_file_validated":true,"migration_started":false,"fix_hint":"preserve the validated partial backup and fix write access"}}]}'\'''
     printf '%s\n' '      exit 1'
     printf '%s\n' '    fi'
-    printf '%s\n' '    printf "%s\n" '\''{"ok":true,"data":{"success":true,"binary_replaced":false}}'\'''
+    printf '%s\n' '    printf "%s\n" '\''{"ok":true,"data":{"journal_phase":"applied","apply_invoked":true}}'\'''
     printf '%s\n' '    ;;'
-    printf '%s\n' '  "adapter status --json")'
+    printf '%s\n' '  "upgrade publish --json")'
+    printf '%s\n' '    fixture_publish="$AOPMEM_HOME/bin/.fixture-publish-$$"'
+    printf '%s\n' '    cp "$AOPMEM_STUB_PUBLISHED_BINARY" "$fixture_publish"'
+    printf '%s\n' '    chmod 755 "$fixture_publish"'
+    printf '%s\n' '    mv "$fixture_publish" "$AOPMEM_HOME/bin/aopmem"'
+    printf '%s\n' '    printf "%s\n" '\''{"ok":true,"data":{"journal_phase":"published","binary_published":true}}'\'''
+    printf '%s\n' '    ;;'
+    printf '%s\n' '  "adapter status --file "*)'
     printf '%s\n' '    printf "%s\n" '\''{"ok":true,"data":{"managed_block":"in_sync"},"meta":{"workspace_key":"fixture-workspace"}}'\'''
+    printf '%s\n' '    ;;'
+    printf '%s\n' '  "adapter sync --file "*)'
+    printf '%s\n' '    printf "%s\n" '\''{"ok":true,"data":{}}'\'''
     printf '%s\n' '    ;;'
     printf '%s\n' '  "init")'
     printf '%s\n' '    ;;'
-    printf '%s\n' '  "adapter seed --json")'
+    printf '%s\n' '  "adapter seed --file "*)'
     printf '%s\n' '    if [ "${AOPMEM_STUB_ADAPTER_FAIL:-0}" = "1" ]; then'
     printf '%s\n' '      printf "%s\n" '\''{"ok":false,"data":{}}'\'''
     printf '%s\n' '    else'
@@ -124,8 +148,18 @@ write_new_stub() {
     printf '%s\n' '  "observe status --json")'
     printf '%s\n' '    printf "%s\n" '\''{"ok":true,"data":{},"meta":{"workspace_key":"fixture-workspace"}}'\'''
     printf '%s\n' '    ;;'
+    printf '%s\n' '  "task start --query-stdin --json")'
+    printf '%s\n' '    cat >/dev/null'
+    printf '%s\n' '    printf "%s\n" '\''{"ok":true,"data":{"mandatory_context_complete":true,"bundle_id":"550e8400-e29b-41d4-a716-446655440000","memory_revision":"fixture-revision"},"meta":{"workspace_key":"fixture-workspace"}}'\'''
+    printf '%s\n' '    ;;'
     printf '%s\n' '  "observe report --json")'
     printf '%s\n' '    printf "%s\n" '\''{"ok":true,"data":{},"meta":{"workspace_key":"fixture-workspace"}}'\'''
+    printf '%s\n' '    ;;'
+    printf '%s\n' '  "observe export --output "*)'
+    printf '%s\n' '    fixture_output=${*#*--output }'
+    printf '%s\n' '    fixture_output=${fixture_output%% *}'
+    printf '%s\n' '    if [ -e "$fixture_output" ] || [ -L "$fixture_output" ]; then exit 1; fi'
+    printf '%s\n' '    printf "%s\n" '\''{"ok":true,"data":{}}'\'''
     printf '%s\n' '    ;;'
     printf '%s\n' '  *)'
     printf '%s\n' '    printf "%s\n" "unexpected stub command: $*" >&2'
@@ -142,7 +176,7 @@ write_old_stub() {
     printf '%s\n' '#!/bin/sh'
     printf '%s\n' 'set -eu'
     printf '%s\n' 'if [ "$*" = "--version" ]; then'
-    printf '%s\n' '  printf "%s\n" "aopmem 0.1.0"'
+    printf '%s\n' '  printf "%s\n" "aopmem ${AOPMEM_STUB_OLD_VERSION:-0.1.0}"'
     printf '%s\n' '  exit 0'
     printf '%s\n' 'fi'
     printf '%s\n' 'exit 2'
@@ -153,6 +187,7 @@ write_old_stub() {
 setup_case() {
   case_name=$1
   TEST_OLD_SHA=""
+  OLD_STUB_VERSION="0.1.0"
   CASE_ROOT="$TEST_ROOT/$case_name"
   ASSET_DIR="$CASE_ROOT/assets"
   TEMP_PARENT="$CASE_ROOT/temp"
@@ -191,10 +226,14 @@ run_installer() {
       AOPMEM_INSTALL_TEST_TEMP_ROOT="$TEMP_PARENT" \
       AOPMEM_INSTALL_TEST_TRACE="$TRACE_PATH" \
       AOPMEM_STUB_TRACE="$TRACE_PATH" \
+      AOPMEM_STUB_PUBLISHED_BINARY="$ASSET_DIR/aopmem-darwin-arm64" \
       AOPMEM_INSTALL_TEST_OLD_BINARY_SHA256="${TEST_OLD_SHA:-}" \
+      AOPMEM_STUB_OLD_VERSION="$OLD_STUB_VERSION" \
+      AOPMEM_ACTIVE_ADAPTER=codex \
+      AOPMEM_ACTIVE_INSTRUCTION_FILE=AGENTS.md \
       AOPMEM_HOME="$AOPMEM_HOME_PATH" \
       "$@" \
-      sh "$MAC_INSTALLER"
+      perl -e 'alarm shift; exec @ARGV' 30 sh "$MAC_INSTALLER"
   ) > "$STDOUT_PATH" 2> "$STDERR_PATH"
 }
 
@@ -224,7 +263,14 @@ run_static_audit() {
   assert_contains "$MAC_INSTALLER" 'upgrade plan --all-workspaces --json'
   assert_contains "$MAC_INSTALLER" 'upgrade prepare --all-workspaces --json'
   assert_contains "$MAC_INSTALLER" 'upgrade apply --all-workspaces --json --approved "\+\+\+"'
-  assert_contains "$MAC_INSTALLER" 'adapter seed --json'
+  assert_contains "$MAC_INSTALLER" 'upgrade backup --adopt'
+  assert_contains "$MAC_INSTALLER" 'upgrade stage --artifact'
+  assert_contains "$MAC_INSTALLER" 'platform check --json'
+  assert_contains "$MAC_INSTALLER" 'upgrade publish --json'
+  assert_contains "$MAC_INSTALLER" 'adapter sync'
+  assert_contains "$MAC_INSTALLER" 'task start --query-stdin --json'
+  assert_contains "$MAC_INSTALLER" 'observe export'
+  assert_contains "$MAC_INSTALLER" 'AOPMEM_ACTIVE_ADAPTER and AOPMEM_ACTIVE_INSTRUCTION_FILE are required'
   assert_contains "$MAC_INSTALLER" 'AOPMem home must not be a symbolic link'
   assert_contains "$MAC_INSTALLER" 'recovery binary path already exists'
   assert_contains "$MAC_INSTALLER" 'must not contain credentials, query, fragment'
@@ -243,12 +289,23 @@ run_static_audit() {
   assert_contains "$WINDOWS_INSTALLER" 'parsedBase\.Query'
   assert_contains "$WINDOWS_INSTALLER" 'parsedBase\.Fragment'
   assert_contains "$WINDOWS_INSTALLER" 'Get-FileHash'
-  assert_contains "$WINDOWS_INSTALLER" 'File.*Replace'
+  assert_contains "$WINDOWS_INSTALLER" 'Invoke-UpgradeAdopt'
+  assert_contains "$WINDOWS_INSTALLER" 'Invoke-UpgradeStage'
+  assert_contains "$WINDOWS_INSTALLER" 'Invoke-StagedPlatformCheck'
+  assert_contains "$WINDOWS_INSTALLER" 'upgrade", "publish", "--json"'
+  assert_contains "$WINDOWS_INSTALLER" 'task start --query-stdin --json'
+  assert_contains "$WINDOWS_INSTALLER" 'AOPMEM_ACTIVE_ADAPTER and AOPMEM_ACTIVE_INSTRUCTION_FILE are required'
+  assert_contains "$WINDOWS_INSTALLER" 'switch -CaseSensitive'
+  assert_contains "$WINDOWS_INSTALLER" '"cursor".*\.cursor/rules/aopmem\.mdc'
+  assert_contains "$WINDOWS_INSTALLER" '"copilot".*\.github/copilot-instructions\.md'
+  assert_contains "$WINDOWS_INSTALLER" 'Copy-HomeTreeDurably'
+  assert_contains "$WINDOWS_INSTALLER" 'Flush\(\$true\)'
+  assert_contains "$WINDOWS_INSTALLER" 'FileMode\]::CreateNew'
   assert_contains "$WINDOWS_INSTALLER" 'IsReparsePoint'
   assert_contains "$WINDOWS_INSTALLER" 'upgrade", "plan", "--all-workspaces", "--json"'
   assert_contains "$WINDOWS_INSTALLER" 'upgrade", "prepare", "--all-workspaces", "--json"'
   assert_contains "$WINDOWS_INSTALLER" '"upgrade", "apply", "--all-workspaces", "--json", "--approved", "\+\+\+"'
-  assert_contains "$WINDOWS_INSTALLER" 'adapter", "seed", "--json"'
+  assert_contains "$WINDOWS_INSTALLER" 'adapter", "sync", "--file"'
   assert_contains "$WINDOWS_INSTALLER" 'failure JSON report'
   assert_contains "$MAC_INSTALLER" 'emit_upgrade_report'
   assert_contains "$MAC_INSTALLER" 'backup_phase'
@@ -266,6 +323,7 @@ run_static_audit() {
   assert_not_contains "$WINDOWS_INSTALLER" 'Invoke-Expression'
   assert_not_contains "$WINDOWS_INSTALLER" 'cmd\.exe'
   assert_not_contains "$WINDOWS_INSTALLER" 'cargo|rustup|git clone|Codex CLI|node(\.exe)?'
+  assert_not_contains "$WINDOWS_INSTALLER" 'robocopy\.exe'
   assert_not_contains "$WINDOWS_INSTALLER" 'runas(\.exe)?|IsInRole.*Administrator|elevat'
   assert_not_contains "$MAC_INSTALLER" 'sudo|cargo|rustup|git clone|Codex CLI|node'
 
@@ -295,9 +353,10 @@ test_fresh_success() {
   assert_contains "$TRACE_PATH" '^doctor$'
   assert_contains "$TRACE_PATH" '^verify$'
   assert_contains "$TRACE_PATH" '^adapter\.status$'
-  assert_contains "$TRACE_PATH" '^recall$'
+  assert_contains "$TRACE_PATH" '^task\.start\.smoke$'
   assert_contains "$TRACE_PATH" '^observe\.status$'
   assert_contains "$TRACE_PATH" '^observe\.report$'
+  assert_contains "$TRACE_PATH" '^debug\.capsule\.export$'
   assert_not_contains "$TRACE_PATH" '^upgrade\.plan$'
   assert_trace_order "$TRACE_PATH" "asset.download.started" "sha256.verified"
   assert_trace_order "$TRACE_PATH" "sha256.verified" "binary.version.verified"
@@ -343,20 +402,24 @@ test_update_success() {
   assert_trace_order "$TRACE_PATH" "backup.created" "backup.home.created"
   assert_trace_order "$TRACE_PATH" "backup.home.created" "asset.download.started"
   assert_trace_order "$TRACE_PATH" "asset.download.started" "sha256.verified"
-  assert_trace_order "$TRACE_PATH" "sha256.verified" "replacement.staged"
-  assert_trace_order "$TRACE_PATH" "replacement.staged" "upgrade.prepare"
+  assert_trace_order "$TRACE_PATH" "sha256.verified" "upgrade.backup.adopt"
+  assert_trace_order "$TRACE_PATH" "upgrade.backup.adopt" "upgrade.stage"
+  assert_trace_order "$TRACE_PATH" "upgrade.stage" "platform.check.staged"
+  assert_trace_order "$TRACE_PATH" "platform.check.staged" "audit.repair.staged"
+  assert_trace_order "$TRACE_PATH" "audit.repair.staged" "upgrade.prepare"
   assert_trace_order "$TRACE_PATH" "upgrade.prepare" "upgrade.plan"
   assert_trace_order "$TRACE_PATH" "upgrade.plan" "upgrade.apply"
-  assert_trace_order "$TRACE_PATH" "upgrade.apply.health.ok" "replacement.published"
-  assert_trace_order "$TRACE_PATH" "replacement.published" "doctor"
-  assert_trace_order "$TRACE_PATH" "replacement.published" "adapter.status"
+  assert_trace_order "$TRACE_PATH" "upgrade.apply.health.ok" "upgrade.publish"
+  assert_trace_order "$TRACE_PATH" "upgrade.publish" "adapter.sync"
+  assert_trace_order "$TRACE_PATH" "adapter.sync" "audit.repair.post-publish"
+  assert_trace_order "$TRACE_PATH" "audit.repair.post-publish" "doctor"
   assert_trace_order "$TRACE_PATH" "adapter.status" "doctor"
-  assert_trace_order "$TRACE_PATH" "verify" "recall"
-  assert_trace_order "$TRACE_PATH" "recall" "observe.status"
+  assert_trace_order "$TRACE_PATH" "verify" "task.start.smoke"
+  assert_trace_order "$TRACE_PATH" "task.start.smoke" "observe.status"
   assert_trace_order "$TRACE_PATH" "observe.status" "observe.report"
-  backup=$(find "$AOPMEM_HOME_PATH/bin" -name 'aopmem.backup-v0.1.0-rc3-*' -print -quit)
+  backup=$(find "$AOPMEM_HOME_PATH/bin" -name 'aopmem.backup-v0.1.0-*' -print -quit)
   assert_file "$backup"
-  full_backup=$(find "$CASE_ROOT/AOPMemBackups" -path '*/aopmem-home/bin/aopmem' -print -quit)
+  full_backup=$(find "$CASE_ROOT" -path '*/aopmem-home-backup-v0.2.0-rc5-*/bin/aopmem' -print -quit)
   assert_file "$full_backup"
   assert_equal \
     "$(shasum -a 256 "$full_backup" | awk '{ print $1 }')" \
@@ -366,8 +429,8 @@ test_update_success() {
   actual=$(shasum -a 256 "$AOPMEM_HOME_PATH/bin/aopmem" | awk '{ print $1 }')
   assert_equal "$actual" "$expected" "published update hash"
   assert_temp_clean "$TEMP_PARENT"
-  recovery=$(find "$AOPMEM_HOME_PATH/bin" -name '*recovery*' -print -quit)
-  [ -z "$recovery" ] || fail "update success left a recovery binary"
+  retained=$(find "$AOPMEM_HOME_PATH/bin" -name '.aopmem-v0.2.0-rc5.staged' -print -quit)
+  assert_file "$retained"
   pass
 }
 
@@ -391,6 +454,112 @@ test_tagged_source_acceptance_and_hash_binding() {
   assert_contains "$STDERR_PATH" 'NONCANONICAL_V010_BINARY'
   assert_contains "$TRACE_PATH" '^warning\.NONCANONICAL_V010_BINARY$'
   assert_contains "$TRACE_PATH" '^upgrade\.prepare$'
+  pass
+}
+
+test_supported_version_matrix() {
+  for old_version in 0.1.0 0.2.0-rc1 0.2.0-rc2 0.2.0-rc3 0.2.0-rc4; do
+    setup_case "accepted-${old_version}"
+    OLD_STUB_VERSION=$old_version
+    install_old_binary
+    expect_success
+    assert_contains "$TRACE_PATH" '^upgrade\.apply$'
+    assert_contains "$TRACE_PATH" '^upgrade\.publish$'
+  done
+
+  for old_version in 0.2.0-rc5 0.2.0-rc0 0.3.0; do
+    setup_case "rejected-${old_version}"
+    OLD_STUB_VERSION=$old_version
+    install_old_binary
+    expect_failure
+    assert_contains "$STDERR_PATH" 'existing version is unsupported'
+    assert_not_contains "$TRACE_PATH" '^asset\.download\.started$'
+  done
+  pass
+}
+
+test_exact_active_adapter_pairs() {
+  while IFS='|' read -r adapter instruction; do
+    setup_case "adapter-${adapter}"
+    expect_success \
+      AOPMEM_ACTIVE_ADAPTER="$adapter" \
+      AOPMEM_ACTIVE_INSTRUCTION_FILE="$instruction"
+    assert_contains "$TRACE_PATH" "^adapter\.selected\.${adapter}$"
+    assert_contains "$TRACE_PATH" '^adapter\.seed$'
+    assert_contains "$TRACE_PATH" '^adapter\.status$'
+  done <<'EOF'
+codex|AGENTS.md
+claude|CLAUDE.md
+cursor|.cursor/rules/aopmem.mdc
+copilot|.github/copilot-instructions.md
+EOF
+
+  setup_case adapter-uppercase-rejected
+  expect_failure AOPMEM_ACTIVE_ADAPTER=CODEX AOPMEM_ACTIVE_INSTRUCTION_FILE=AGENTS.md
+  assert_contains "$STDERR_PATH" 'unsupported active adapter'
+  assert_no_file "$AOPMEM_HOME_PATH"
+
+  setup_case adapter-mismatch-rejected
+  expect_failure AOPMEM_ACTIVE_ADAPTER=cursor AOPMEM_ACTIVE_INSTRUCTION_FILE=AGENTS.md
+  assert_contains "$STDERR_PATH" 'does not match'
+  assert_no_file "$AOPMEM_HOME_PATH"
+  pass
+}
+
+test_real_rc5_adopts_installer_manifest() {
+  [ -x "$REPO_ROOT/target/debug/aopmem" ] ||
+    fail "real debug rc5 binary is required for manifest adoption proof"
+  setup_case real-adopt-manifest
+  install_old_binary
+  mkdir -p "$AOPMEM_HOME_PATH/a"
+  mkdir -p "$AOPMEM_HOME_PATH/nested"
+  printf '%s\n' hidden-parent > "$AOPMEM_HOME_PATH/..x"
+  printf '%s\n' hidden > "$AOPMEM_HOME_PATH/.a"
+  printf '%s\n' child > "$AOPMEM_HOME_PATH/a/child"
+  printf '%s\n' sibling > "$AOPMEM_HOME_PATH/a.txt"
+  printf '%s\n' nested-manifest > "$AOPMEM_HOME_PATH/nested/MANIFEST.sha256"
+  printf '%s\n' unicode > "$AOPMEM_HOME_PATH/ёж.txt"
+  backup=$(
+    (
+      cd "$REPO_DIR"
+      env \
+        AOPMEM_INSTALL_TEST_MODE=1 \
+        AOPMEM_INSTALL_TEST_OS=Darwin \
+        AOPMEM_INSTALL_TEST_ARCH=arm64 \
+        AOPMEM_INSTALL_TEST_TEMP_ROOT="$TEMP_PARENT" \
+        AOPMEM_INSTALL_TEST_MANIFEST_ONLY=1 \
+        AOPMEM_INSTALL_TEST_OLD_BINARY_SHA256="$TEST_OLD_SHA" \
+        AOPMEM_ACTIVE_ADAPTER=codex \
+        AOPMEM_ACTIVE_INSTRUCTION_FILE=AGENTS.md \
+        AOPMEM_HOME="$AOPMEM_HOME_PATH" \
+        sh "$MAC_INSTALLER"
+    )
+  ) || fail "installer-owned manifest producer failed"
+  assert_file "$backup/MANIFEST.sha256"
+  manifest_hash=$(shasum -a 256 "$backup/MANIFEST.sha256" | awk '{ print tolower($1) }')
+  AOPMEM_HOME="$AOPMEM_HOME_PATH" "$REPO_ROOT/target/debug/aopmem" \
+    upgrade backup --adopt "$backup" --manifest-sha256 "$manifest_hash" --json \
+    > "$CASE_ROOT/adopt.json" || fail "real rc5 rejected installer manifest"
+  assert_contains "$CASE_ROOT/adopt.json" '"ok":true'
+  assert_contains "$backup/MANIFEST.sha256" '^a/child$'
+  assert_contains "$backup/MANIFEST.sha256" '^a\.txt$'
+  assert_contains "$backup/MANIFEST.sha256" '^nested/MANIFEST\.sha256$'
+  assert_contains "$backup/MANIFEST.sha256" '^ёж\.txt$'
+
+  setup_case reserved-root-manifest
+  install_old_binary
+  printf '%s\n' user-owned-root-manifest > "$AOPMEM_HOME_PATH/MANIFEST.sha256"
+  root_manifest_before=$(shasum -a 256 "$AOPMEM_HOME_PATH/MANIFEST.sha256" |
+    awk '{ print tolower($1) }')
+  expect_failure
+  assert_contains "$STDERR_PATH" 'reserved backup manifest name'
+  assert_equal \
+    "$(shasum -a 256 "$AOPMEM_HOME_PATH/MANIFEST.sha256" |
+      awk '{ print tolower($1) }')" \
+    "$root_manifest_before" \
+    "reserved root manifest preservation"
+  assert_not_contains "$TRACE_PATH" '^backup\.home\.created$'
+  assert_not_contains "$TRACE_PATH" '^asset\.download\.started$'
   pass
 }
 
@@ -452,6 +621,8 @@ test_asset_base_uri_rejections() {
     if env \
       HOME="$case_root/home" \
       TMPDIR="$case_root/temp" \
+      AOPMEM_ACTIVE_ADAPTER=codex \
+      AOPMEM_ACTIVE_INSTRUCTION_FILE=AGENTS.md \
       AOPMEM_ASSET_BASE_URI="$bad_uri" \
       sh "$MAC_INSTALLER" \
       > "$case_root/stdout.log" 2> "$case_root/stderr.log"; then
@@ -490,13 +661,34 @@ test_path_rejections() {
   expect_failure
   assert_contains "$STDERR_PATH" 'temporary parent must be a real directory'
 
-  setup_case recovery-destination-symlink
+  setup_case backup-source-symlink
   install_old_binary
-  recovery_path="$AOPMEM_HOME_PATH/bin/aopmem-v0.2.0-rc4-recovery-424242"
-  ln -s "$CASE_ROOT/outside-recovery-target" "$recovery_path"
-  expect_failure AOPMEM_INSTALL_TEST_RUN_ID=424242
-  [ -L "$recovery_path" ] || fail "installer removed pre-existing recovery symlink"
-  assert_contains "$STDERR_PATH" 'recovery binary path already exists'
+  printf '%s\n' outside > "$CASE_ROOT/outside-source"
+  ln -s "$CASE_ROOT/outside-source" "$AOPMEM_HOME_PATH/source-link"
+  expect_failure
+  assert_contains "$STDERR_PATH" 'AOPMem home contains a symbolic link'
+  backup_root=$(find "$CASE_ROOT" -maxdepth 1 \
+    -name 'aopmem-home-backup-v0.2.0-rc5-*' -print -quit)
+  [ -z "$backup_root" ] || fail "unsafe source was copied before rejection"
+  assert_not_contains "$TRACE_PATH" '^asset\.download\.started$'
+
+  setup_case backup-source-depth
+  install_old_binary
+  deep_path="$AOPMEM_HOME_PATH/deep"
+  mkdir "$deep_path"
+  depth=0
+  while [ "$depth" -le 128 ]; do
+    deep_path="$deep_path/d"
+    mkdir "$deep_path"
+    depth=$((depth + 1))
+  done
+  expect_failure
+  assert_contains "$STDERR_PATH" 'maximum backup directory depth'
+  backup_root=$(find "$CASE_ROOT" -maxdepth 1 \
+    -name 'aopmem-home-backup-v0.2.0-rc5-*' -print -quit)
+  [ -z "$backup_root" ] || fail "over-depth source was copied before rejection"
+  assert_not_contains "$TRACE_PATH" '^asset\.download\.started$'
+
   pass
 }
 
@@ -512,7 +704,7 @@ test_pre_apply_failures_leave_binary_unchanged() {
   assert_not_contains "$TRACE_PATH" '^upgrade\.apply$'
   assert_contains "$TRACE_PATH" '^rollback\.unchanged$'
   assert_contains "$STDERR_PATH" 'code=FIXTURE_PREPARE_FAILED'
-  full_backup=$(find "$CASE_ROOT/AOPMemBackups" -path '*/aopmem-home/bin/aopmem' -print -quit)
+  full_backup=$(find "$CASE_ROOT" -path '*/aopmem-home-backup-v0.2.0-rc5-*/bin/aopmem' -print -quit)
   assert_file "$full_backup"
   assert_temp_clean "$TEMP_PARENT"
 
@@ -528,8 +720,8 @@ test_pre_apply_failures_leave_binary_unchanged() {
   assert_contains "$TRACE_PATH" '^rollback\.unchanged$'
   backup=$(find "$AOPMEM_HOME_PATH/bin" -name 'aopmem.backup-*' -print -quit)
   assert_file "$backup"
-  recovery=$(find "$AOPMEM_HOME_PATH/bin" -name '*recovery*' -print -quit)
-  [ -z "$recovery" ] || fail "plan failure retained recovery before apply"
+  retained=$(find "$AOPMEM_HOME_PATH/bin" -name '.aopmem-v0.2.0-rc5.staged' -print -quit)
+  assert_file "$retained"
   assert_temp_clean "$TEMP_PARENT"
 
   setup_case trap-after-backup
@@ -560,7 +752,7 @@ test_post_apply_failures_preserve_recovery() {
   expect_failure AOPMEM_STUB_APPLY_FAIL=1
   new_inode=$(ls -di "$AOPMEM_HOME_PATH/bin/aopmem" | awk '{ print $1 }')
   assert_equal "$new_inode" "$old_inode" "apply failure inode"
-  recovery=$(find "$AOPMEM_HOME_PATH/bin" -name '*recovery*' -print -quit)
+  recovery=$(find "$AOPMEM_HOME_PATH/bin" -name '.aopmem-v0.2.0-rc5.staged' -print -quit)
   assert_file "$recovery"
   assert_contains "$STDERR_PATH" 'do not run the v0.1 binary'
   assert_contains "$STDERR_PATH" 'recovery binary preserved at'
@@ -581,7 +773,7 @@ test_post_apply_failures_preserve_recovery() {
   expect_failure AOPMEM_INSTALL_TEST_FAIL_AT=publish
   new_inode=$(ls -di "$AOPMEM_HOME_PATH/bin/aopmem" | awk '{ print $1 }')
   assert_equal "$new_inode" "$old_inode" "publish failure inode"
-  recovery=$(find "$AOPMEM_HOME_PATH/bin" -name '*recovery*' -print -quit)
+  recovery=$(find "$AOPMEM_HOME_PATH/bin" -name '.aopmem-v0.2.0-rc5.staged' -print -quit)
   assert_file "$recovery"
   expected=$(shasum -a 256 "$ASSET_DIR/aopmem-darwin-arm64" | awk '{ print $1 }')
   actual=$(shasum -a 256 "$recovery" | awk '{ print $1 }')
@@ -624,6 +816,9 @@ test_fresh_success
 test_fresh_adapter_and_health_contract_failures
 test_update_success
 test_tagged_source_acceptance_and_hash_binding
+test_supported_version_matrix
+test_exact_active_adapter_pairs
+test_real_rc5_adopts_installer_manifest
 test_checksum_failures
 test_asset_base_uri_rejections
 test_path_rejections
