@@ -14,6 +14,5 @@ SQLite read-only, writes a redacted snapshot to a temp file, validates the
 digest after close, then publishes. `.pending-snapshot` is persistent evidence
 until the repair completes.
 
-The RC8 updater may run staged audit repair after recovery backup and before
-prepare. It may also run post-publish repair. Failure before apply keeps the
-old binary unchanged.
+RC9 has no runtime transition path. Audit repair remains a normal explicit
+command and a post-install verification tool.

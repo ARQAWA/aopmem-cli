@@ -1,47 +1,71 @@
-# AOPMem v0.2.0-rc8 install prompt
+# AOPMem v0.2.0-rc9 clean install prompt
 
-Use this prompt to install or update AOPMem v0.2.0-rc8.
-Run only the official installer and release assets.
+Use this prompt for AOPMem v0.2.0-rc9.
+RC9 has no in-place updater. Install only into an absent or empty
+`AOPMEM_HOME`.
 
-````text
-You are installing AOPMem v0.2.0-rc8 for the current project.
+You are installing AOPMem v0.2.0-rc9 for the current project.
 
 Do not use WSL, Docker, Cargo, Rustup, source builds, Codex CLI, or another
 terminal. Do not use administrator rights. Do not create a repo-local
 `.aopmem`.
 
-Set exactly one active adapter pair before running the installer:
-
-- `codex` / `AGENTS.md`
-- `claude` / `CLAUDE.md`
-- `cursor` / `.cursor/rules/aopmem.mdc`
-- `copilot` / `.github/copilot-instructions.md`
+If `%USERPROFILE%\.aopmem` already exists and contains data, stop.
+Quarantine it first. Do not rename, delete, or modify it automatically.
 
 Supported hosts:
 
 - macOS Apple Silicon: `Darwin arm64`
 - Windows 11 x64: native Windows PowerShell 5.1
 
-Trusted RC8 release assets:
+Expected binary version:
+
+`aopmem 0.2.0-rc9`
+
+Release assets:
 
 | Asset | Size | SHA-256 |
 | --- | ---: | --- |
-| `aopmem-darwin-arm64` | 9825376 | `84eb321603b0bb2dd8dc961946abebe56ccaa79cb1c170f6bd1fdcf63a8d58ca` |
-| `aopmem-windows-x86_64.exe` | 10740224 | `b27fe37afbb33c91a906a40f6667599ef6d33f40b179fb6e7e5300d578ad6839` |
-| `SHA256SUMS` | 178 | `2d2042c066699da4373dc5a8ca796a144cf4274e2e220d71f8f4ff6a4efd2421` |
-| `install.ps1` | 69643 | `346162c857febaffd8384549f475a9175145e250b0e63f423c0158aef11c5938` |
-| `install.sh` | 40627 | `139d26d278c0c10f5e213deefc8ed5e799f7eb619845e4b8374aea9ec475a4db` |
+| `aopmem-darwin-arm64` | 9329872 | `16ed13b6b5df96a345a93a406cebb5394704a63b665bac2c836d8adca1f15999` |
+| `aopmem-windows-x86_64.exe` | 10093056 | `de3e58ac70d00636532536fc815152c9efa952f0571292abfb496db245e9fd9e` |
+| `SHA256SUMS` | 178 | `5c9a25bbff2b2b015d98de5604e85ca92d03693c12e8247e0c6aa802249f73f2` |
+| `install.ps1` | 11330 | `0e60b6b7322ce157b27b88bc3e5123342a2bea34eb94c994e871a7da173ff63f` |
+| `install.sh` | 6035 | `9cb47d956aff8e37c46a3c22d097e18d9dfdf03d400b56e68f2ebf7bd3342f33` |
+
+Windows direct bootstrap:
+
+```powershell
+$tempRoot = Join-Path ([IO.Path]::GetTempPath()) `
+    ("aopmem-rc9-bootstrap-" + [Guid]::NewGuid().ToString("N"))
+$null = New-Item -ItemType Directory -Path $tempRoot -ErrorAction Stop
+$installer = Join-Path $tempRoot "install.ps1"
+Invoke-WebRequest `
+    -Uri "https://raw.githubusercontent.com/ARQAWA/aopmem-cli/v0.2.0-rc9/install/v0.2/install.ps1" `
+    -OutFile $installer `
+    -UseBasicParsing `
+    -TimeoutSec 900 `
+    -ErrorAction Stop
+$installerHash = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash
+if ($installerHash -ine "0e60b6b7322ce157b27b88bc3e5123342a2bea34eb94c994e871a7da173ff63f") {
+    throw "INSTALLER_SHA256_MISMATCH"
+}
+& "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
+    -NoProfile `
+    -ExecutionPolicy Bypass `
+    -File $installer `
+    -AssetBaseUri "https://github.com/ARQAWA/aopmem-cli/releases/download/v0.2.0-rc9"
+```
 
 Windows bootstrap with proxy:
 
 ```powershell
 $proxyUri = [Uri]"<PROXY_URI>"
 $tempRoot = Join-Path ([IO.Path]::GetTempPath()) `
-    ("aopmem-rc8-bootstrap-" + [Guid]::NewGuid().ToString("N"))
+    ("aopmem-rc9-bootstrap-" + [Guid]::NewGuid().ToString("N"))
 $null = New-Item -ItemType Directory -Path $tempRoot -ErrorAction Stop
 $installer = Join-Path $tempRoot "install.ps1"
 Invoke-WebRequest `
-    -Uri "https://raw.githubusercontent.com/ARQAWA/aopmem-cli/v0.2.0-rc8/install/v0.2/install.ps1" `
+    -Uri "https://raw.githubusercontent.com/ARQAWA/aopmem-cli/v0.2.0-rc9/install/v0.2/install.ps1" `
     -OutFile $installer `
     -UseBasicParsing `
     -Proxy $proxyUri `
@@ -49,83 +73,35 @@ Invoke-WebRequest `
     -TimeoutSec 900 `
     -ErrorAction Stop
 $installerHash = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash
-if ($installerHash -ine "346162c857febaffd8384549f475a9175145e250b0e63f423c0158aef11c5938") {
+if ($installerHash -ine "0e60b6b7322ce157b27b88bc3e5123342a2bea34eb94c994e871a7da173ff63f") {
     throw "INSTALLER_SHA256_MISMATCH"
 }
 & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
     -NoProfile `
     -ExecutionPolicy Bypass `
     -File $installer `
-    -AssetBaseUri "https://github.com/ARQAWA/aopmem-cli/releases/download/v0.2.0-rc8" `
+    -AssetBaseUri "https://github.com/ARQAWA/aopmem-cli/releases/download/v0.2.0-rc9" `
     -ProxyUri $proxyUri `
     -ProxyUseDefaultCredentials
 ```
 
-Direct Windows bootstrap:
+Clean flow:
 
-```powershell
-$tempRoot = Join-Path ([IO.Path]::GetTempPath()) `
-    ("aopmem-rc8-bootstrap-" + [Guid]::NewGuid().ToString("N"))
-$null = New-Item -ItemType Directory -Path $tempRoot -ErrorAction Stop
-$installer = Join-Path $tempRoot "install.ps1"
-Invoke-WebRequest `
-    -Uri "https://raw.githubusercontent.com/ARQAWA/aopmem-cli/v0.2.0-rc8/install/v0.2/install.ps1" `
-    -OutFile $installer `
-    -UseBasicParsing `
-    -TimeoutSec 900 `
-    -ErrorAction Stop
-$installerHash = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash
-if ($installerHash -ine "346162c857febaffd8384549f475a9175145e250b0e63f423c0158aef11c5938") {
-    throw "INSTALLER_SHA256_MISMATCH"
-}
-& "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
-    -NoProfile `
-    -ExecutionPolicy Bypass `
-    -File $installer `
-    -AssetBaseUri "https://github.com/ARQAWA/aopmem-cli/releases/download/v0.2.0-rc8"
-```
+1. Check environment.
+2. Download immutable asset.
+3. Verify `SHA256SUMS` and selected binary.
+4. Run `platform check`.
+5. Create fresh `AOPMEM_HOME`.
+6. Install binary.
+7. Run normal initialization for the current repository.
+8. Sync adapter.
+9. Run `doctor` and `verify`.
+
+Existing-home behavior:
+
+- absent home: continue clean install;
+- existing empty home: continue clean install;
+- existing populated home: fail with `CLEAN_INSTALL_REQUIRES_EMPTY_HOME`;
+- populated home remains untouched.
 
 Never put proxy credentials in the URI, logs, files, or final report.
-
-Fresh flow:
-
-1. Verify `SHA256SUMS` and the selected binary.
-2. Require the binary to report `aopmem 0.2.0-rc8`.
-3. Publish the binary atomically.
-4. Run normal `aopmem init`.
-5. Seed exactly the selected adapter file.
-6. Run `doctor`, `verify`, `task start`, and observability checks.
-
-Update flow:
-
-1. Close active AOPMem processes.
-2. Create installer Safety Backup of the current home.
-3. Download and verify RC8.
-4. Run `platform check --json`.
-5. Run `upgrade recovery inspect --json`.
-6. Run `upgrade backup --all-workspaces --json`.
-7. Run `upgrade stage --artifact <verified-binary> --sha256 <hash> --json`.
-8. Run staged `audit repair --all-workspaces --json` if needed.
-9. Run `upgrade prepare --all-workspaces --json`.
-10. Run `upgrade plan --all-workspaces --json`.
-11. Require `ready=true` and `writes_performed=false`.
-12. Run `upgrade apply --all-workspaces --json --approved "+++"` exactly once.
-13. Run `upgrade publish --json`.
-14. Sync the selected adapter.
-15. Run post-publish audit repair, doctor, verify, task smoke, observability,
-    and debug capsule.
-
-The installer Safety Backup is emergency evidence only. It is never passed to
-normal `upgrade backup --adopt`. Normal RC8 uses a fresh Upgrade Recovery
-Backup made by the verified RC8 binary.
-
-Failure rules:
-
-- Before apply starts, the old binary must remain unchanged.
-- After apply starts, never auto-retry apply.
-- Keep every Safety Backup, Upgrade Recovery Backup, journal, JSON report,
-  retained staged binary, and debug capsule.
-- If `upgrade recovery inspect` reports apply-started evidence, stop and
-  preserve evidence.
-- If long path failure occurs, report `RECOVERY_LONG_PATH_FAILURE`.
-````

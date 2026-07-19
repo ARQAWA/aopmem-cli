@@ -13,12 +13,6 @@ struct Migration {
     sql: &'static str,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct MigrationDescriptor {
-    pub version: &'static str,
-    pub name: &'static str,
-}
-
 const MIGRATIONS: &[Migration] = &[
     Migration {
         version: "001",
@@ -290,16 +284,6 @@ const MIGRATIONS: &[Migration] = &[
         ",
     },
 ];
-
-pub(crate) fn migration_catalog() -> Vec<MigrationDescriptor> {
-    MIGRATIONS
-        .iter()
-        .map(|migration| MigrationDescriptor {
-            version: migration.version,
-            name: migration.name,
-        })
-        .collect()
-}
 
 pub fn apply_migrations(connection: &mut Connection) -> rusqlite::Result<()> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;

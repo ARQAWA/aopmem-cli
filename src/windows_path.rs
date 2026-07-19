@@ -5,9 +5,7 @@ use std::io;
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
 #[cfg(windows)]
-use std::os::windows::ffi::OsStringExt;
-#[cfg(windows)]
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 #[cfg(any(windows, test))]
 const VERBATIM_PREFIX: &[u16] = &[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
@@ -29,15 +27,6 @@ pub(crate) fn verbatim_wide_path(path: &Path) -> io::Result<Vec<u16>> {
         &path.as_os_str().encode_wide().collect::<Vec<_>>(),
         path.is_absolute(),
     )
-}
-
-#[cfg(windows)]
-pub(crate) fn verbatim_path(path: &Path) -> io::Result<PathBuf> {
-    let mut wide = verbatim_wide_path(path)?;
-    if wide.last() == Some(&0) {
-        wide.pop();
-    }
-    Ok(PathBuf::from(std::ffi::OsString::from_wide(&wide)))
 }
 
 #[cfg(any(windows, test))]

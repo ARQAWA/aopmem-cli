@@ -157,15 +157,6 @@ impl AnchoredDir {
         Ok(())
     }
 
-    /// Returns a path-free token for the opened directory identity.
-    ///
-    /// Upgrade recovery persists this token so a same-name directory swap is
-    /// detected before any migration is resumed.
-    pub(crate) fn stable_identity_token(&self) -> io::Result<String> {
-        let identity = filesystem_identity_from_file(&self.handle, &self.logical_path)?;
-        Ok(filesystem_identity_token(identity))
-    }
-
     pub(super) fn child_dir(&self, name: &str, create: bool) -> io::Result<Self> {
         self.child_dir_os(OsStr::new(name), create)
     }
@@ -269,13 +260,6 @@ impl AnchoredDir {
     ) -> io::Result<bool> {
         let current = self.open_regular_os(name)?;
         same_file(opened, &current)
-    }
-
-    /// Returns a path-free identity token for one anchored regular child.
-    pub(crate) fn regular_child_identity_token(&self, name: &OsStr) -> io::Result<String> {
-        let file = self.open_regular_os(name)?;
-        let identity = filesystem_identity_from_file(&file, &self.logical_path.join(name))?;
-        Ok(filesystem_identity_token(identity))
     }
 
     fn open_regular_with(&self, name: &str, mode: FileOpenMode) -> io::Result<File> {
@@ -399,19 +383,6 @@ fn same_file(left: &File, right: &File) -> io::Result<bool> {
     let left = filesystem_identity_from_file(left, Path::new("<open audit source>"))?;
     let right = filesystem_identity_from_file(right, Path::new("<anchored audit source>"))?;
     Ok(left == right)
-}
-
-#[cfg(unix)]
-fn filesystem_identity_token(identity: FilesystemIdentity) -> String {
-    format!("unix:{:016x}:{:016x}", identity.device, identity.inode)
-}
-
-#[cfg(windows)]
-fn filesystem_identity_token(identity: FilesystemIdentity) -> String {
-    format!(
-        "windows:{:08x}:{:016x}",
-        identity.volume_serial, identity.file_index
-    )
 }
 
 #[cfg(unix)]

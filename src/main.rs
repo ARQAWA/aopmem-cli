@@ -17,7 +17,6 @@ pub mod storage;
 pub mod task;
 pub mod tools;
 pub mod ui;
-pub mod upgrade;
 pub mod verify;
 mod windows_path;
 

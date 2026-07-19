@@ -1346,19 +1346,6 @@ pub(crate) fn ensure_owned_direct_directory(parent: &Path, directory: &Path) -> 
     validate_canonical_direct_child(parent, directory)
 }
 
-pub(crate) fn create_new_owned_direct_directory(parent: &Path, directory: &Path) -> io::Result<()> {
-    validate_real_directory(parent)?;
-    if directory.parent() != Some(parent) {
-        return Err(persistent_path_error(
-            directory,
-            "managed directory is not a direct child",
-        ));
-    }
-    fs::create_dir(directory)?;
-    validate_real_directory(directory)?;
-    validate_canonical_direct_child(parent, directory)
-}
-
 pub(crate) fn validate_real_directory(path: &Path) -> io::Result<()> {
     let metadata = fs::symlink_metadata(path)?;
     if metadata.is_dir() && !persistent_path_is_link_or_reparse_point(&metadata) {

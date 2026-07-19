@@ -5,33 +5,11 @@ umask 077
 LC_ALL=C
 export LC_ALL
 
-PRODUCT_VERSION="0.2.0-rc8"
-OLD_RELEASE_LABEL="0.1.0-rc3"
+PRODUCT_VERSION="0.2.0-rc9"
 ASSET_NAME="aopmem-darwin-arm64"
 CHECKSUM_NAME="SHA256SUMS"
 TEST_MODE="${AOPMEM_INSTALL_TEST_MODE:-0}"
-TEST_FAIL_AT="${AOPMEM_INSTALL_TEST_FAIL_AT:-}"
 TEMP_ROOT=""
-INSTALL_STAGE=""
-INSTALL_STAGE_OWNED="0"
-RECOVERY_BINARY=""
-RECOVERY_BINARY_OWNED="0"
-BACKUP_PATH=""
-FULL_BACKUP_ROOT=""
-FULL_BACKUP_HOME=""
-UPGRADE_BACKUP_ROOT=""
-BACKUP_READY="0"
-APPLY_ATTEMPTED="0"
-BINARY_PUBLISHED="0"
-PRESERVE_RECOVERY="0"
-MODE="unknown"
-FAILURE_MESSAGE=""
-INSTALL_RUN_ID=$$
-
-# The installer owns only orchestration.  Recovery state and replacement are
-# deliberately owned by the verified RC8 binary (D037/D038).
-ACTIVE_ADAPTER=${AOPMEM_ACTIVE_ADAPTER:-}
-ACTIVE_INSTRUCTION_FILE=${AOPMEM_ACTIVE_INSTRUCTION_FILE:-}
 
 trace_install_event() {
   if [ "$TEST_MODE" = "1" ] && [ -n "${AOPMEM_INSTALL_TEST_TRACE:-}" ]; then
@@ -39,203 +17,67 @@ trace_install_event() {
   fi
 }
 
-cleanup_temporary_files() {
-  if [ -n "$INSTALL_STAGE" ] && [ "$INSTALL_STAGE_OWNED" = "1" ]; then
-    rm -f "$INSTALL_STAGE"
-  fi
-  if [ -n "$RECOVERY_BINARY" ] && [ "$RECOVERY_BINARY_OWNED" = "1" ] \
-    && [ "$PRESERVE_RECOVERY" != "1" ]; then
-    rm -f "$RECOVERY_BINARY"
-  fi
+fail_install() {
+  printf '%s\n' "AOPMem clean install failed: $1" >&2
+  exit 1
+}
+
+fail_populated_home() {
+  printf '%s\n' \
+    "CLEAN_INSTALL_REQUIRES_EMPTY_HOME: existing AOPMem installation detected; quarantine it before clean installation" >&2
+  exit 1
+}
+
+cleanup() {
   if [ -n "$TEMP_ROOT" ]; then
     rm -rf "$TEMP_ROOT"
   fi
 }
+trap cleanup EXIT HUP INT TERM
 
-finish_install_process() {
-  exit_status=$1
-  trap - EXIT HUP INT TERM
-  if [ "$exit_status" -ne 0 ] && [ "$MODE" = "update" ] \
-    && [ "$APPLY_ATTEMPTED" = "1" ]; then
-    PRESERVE_RECOVERY="1"
-    if [ -z "$FAILURE_MESSAGE" ]; then
-      FAILURE_MESSAGE="unexpected failure after upgrade apply started"
-    fi
-    printf '%s\n' \
-      "AOPMem install failed: $FAILURE_MESSAGE; upgrade apply may have committed v0.2 data; do not run the v0.1 binary; verified v0.2 recovery binary preserved at $RECOVERY_BINARY; binary backup preserved at $BACKUP_PATH; upgrade backup preserved at ${UPGRADE_BACKUP_ROOT:-reported by upgrade apply}" >&2
-  elif [ "$exit_status" -ne 0 ] && [ "$MODE" = "update" ] \
-    && [ "$BACKUP_READY" = "1" ] && [ "$BINARY_PUBLISHED" = "0" ]; then
-    if [ -z "$FAILURE_MESSAGE" ]; then
-      FAILURE_MESSAGE="unexpected failure before upgrade apply completed"
-    fi
-    if verify_old_binary_unchanged; then
-      printf '%s\n' \
-        "AOPMem install failed: $FAILURE_MESSAGE; old binary was left unchanged; full backup preserved at ${FULL_BACKUP_ROOT:-not-created}; binary backup preserved at $BACKUP_PATH" >&2
-    else
-      printf '%s\n' \
-        "AOPMem install failed: $FAILURE_MESSAGE; old binary changed unexpectedly; full backup preserved at ${FULL_BACKUP_ROOT:-not-created}; binary backup preserved at $BACKUP_PATH" >&2
-    fi
-  elif [ "$exit_status" -ne 0 ]; then
-    if [ -z "$FAILURE_MESSAGE" ]; then
-      FAILURE_MESSAGE="unexpected installer failure"
-    fi
-    printf '%s\n' \
-      "AOPMem install failed: $FAILURE_MESSAGE; workspace data was preserved" >&2
-  fi
-  cleanup_temporary_files
-  exit "$exit_status"
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || fail_install "required command missing: $1"
 }
 
-trap 'finish_install_process $?' EXIT
-trap 'exit 130' HUP INT TERM
-
-copy_file_durable() {
-  source_path=$1
-  destination_path=$2
-  cp -p -n "$source_path" "$destination_path" || return 1
-  sync || return 1
-}
-
-validate_regular_file() {
-  file_path=$1
-  file_label=$2
-  if [ ! -f "$file_path" ] || [ -L "$file_path" ]; then
-    fail_install "$file_label is not a real regular file: $file_path"
-  fi
-}
-
-sha256_file() {
-  shasum -a 256 "$1" | awk '{ print tolower($1) }'
-}
-
-known_source_hash() {
+absolute_path() {
   case "$1" in
-    "aopmem 0.1.0")
-      printf '%s\n' "d238071299d557cfdeabfce75a52b2bcd2f62635802ef34da5ba11767155c607"
-      ;;
-    "aopmem 0.2.0-rc1")
-      printf '%s\n' "b32e918d2a44f0767444e09c84c1ed44fe9177709b2d56b2aa89c300081d4308"
-      ;;
-    "aopmem 0.2.0-rc2")
-      printf '%s\n' "d4a3f52aeddd3fd656f46358305a5a4a688868b3f25d4675eb37f6cf223a81d4"
-      ;;
-    "aopmem 0.2.0-rc3")
-      printf '%s\n' "8bc4d3a7ae38253c1a6e4c653292cf954fb2c8eee916c69a03c6dc5e2484261c"
-      ;;
-    "aopmem 0.2.0-rc4")
-      printf '%s\n' "4812ca6c798cd2460b4b9da468e5f99f433a68907dc40eba257b88d197886e4e"
-      ;;
-    "aopmem 0.2.0-rc5")
-      printf '%s\n' "594bb9606bd7f971a0fb97b16916fe2a5da84096e8340a5885c36d7037dd1b5e"
-      ;;
-    "aopmem 0.2.0-rc6")
-      printf '%s\n' "b933d921ae6ec68ce7e0f118de27fd7eabe9d1c42d715a0a6df8f2ec731cb949"
-      ;;
-    *) return 1 ;;
+    /*) printf '%s\n' "$1" ;;
+    *) printf '%s\n' "$(pwd -P)/$1" ;;
   esac
 }
 
-verify_old_binary_unchanged() {
-  if [ "$MODE" != "update" ] || [ -z "$BACKUP_PATH" ] \
-    || [ ! -f "$BACKUP_PATH" ] || [ ! -f "$INSTALLED_BINARY" ] \
-    || [ -L "$INSTALLED_BINARY" ]; then
-    return 1
-  fi
-  current_hash=$(sha256_file "$INSTALLED_BINARY") || return 1
-  if [ "$current_hash" != "$ORIGINAL_BINARY_HASH" ]; then
-    return 1
-  fi
-  trace_install_event "rollback.unchanged"
-}
-
-fail_install() {
-  FAILURE_MESSAGE=$1
-  exit 1
-}
-
-json_field_or_empty() {
-  json_path=$1
-  key_path=$2
-  if [ ! -x /usr/bin/plutil ]; then
-    return 0
-  fi
-  /usr/bin/plutil -extract "$key_path" raw -o - "$json_path" 2>/dev/null \
-    | tr '\r\n' '  ' || true
-}
-
-emit_upgrade_report() {
-  report_context=$1
-  report_path=$2
-  printf '%s\n' "AOPMem $report_context JSON report:" >&2
-  while IFS= read -r report_line || [ -n "$report_line" ]; do
-    printf '%s\n' "$report_line" >&2
-  done < "$report_path"
-}
-
-set_upgrade_report_failure() {
-  report_context=$1
-  report_path=$2
-  report_code=$(json_field_or_empty "$report_path" "errors.0.code")
-  report_message=$(json_field_or_empty "$report_path" "errors.0.message")
-  report_workspace=$(json_field_or_empty "$report_path" "data.stopped_workspace")
-  report_backup=$(json_field_or_empty "$report_path" "data.backup_root")
-  report_phase=$(json_field_or_empty "$report_path" "errors.0.details.backup_phase")
-  report_os_error=$(json_field_or_empty "$report_path" "errors.0.details.raw_os_error")
-  report_partial=$(json_field_or_empty "$report_path" "errors.0.details.temporary_path")
-  report_partial_validated=$(
-    json_field_or_empty "$report_path" "errors.0.details.partial_file_validated"
-  )
-  report_migration_started=$(
-    json_field_or_empty "$report_path" "errors.0.details.migration_started"
-  )
-  if [ -n "$report_backup" ] && [ "$report_backup" != "null" ]; then
-    UPGRADE_BACKUP_ROOT=$report_backup
-  fi
-  FAILURE_MESSAGE="$report_context failed"
-  if [ -n "$report_workspace" ] && [ "$report_workspace" != "null" ]; then
-    FAILURE_MESSAGE="$FAILURE_MESSAGE: workspace=$report_workspace"
-  fi
-  if [ -n "$report_code" ] && [ "$report_code" != "null" ]; then
-    FAILURE_MESSAGE="$FAILURE_MESSAGE code=$report_code"
-  fi
-  if [ -n "$report_message" ] && [ "$report_message" != "null" ]; then
-    FAILURE_MESSAGE="$FAILURE_MESSAGE message=$report_message"
-  fi
-  if [ -n "$report_phase" ] && [ "$report_phase" != "null" ]; then
-    FAILURE_MESSAGE="$FAILURE_MESSAGE backup_phase=$report_phase"
-  fi
-  if [ -n "$report_os_error" ] && [ "$report_os_error" != "null" ]; then
-    FAILURE_MESSAGE="$FAILURE_MESSAGE raw_os_error=$report_os_error"
-  fi
-  if [ -n "$report_partial" ] && [ "$report_partial" != "null" ]; then
-    FAILURE_MESSAGE="$FAILURE_MESSAGE partial_backup=$report_partial"
-  fi
-  if [ -n "$report_partial_validated" ] &&
-    [ "$report_partial_validated" != "null" ]; then
-    FAILURE_MESSAGE="$FAILURE_MESSAGE partial_validated=$report_partial_validated"
-  fi
-  if [ -n "$report_migration_started" ] &&
-    [ "$report_migration_started" != "null" ]; then
-    FAILURE_MESSAGE="$FAILURE_MESSAGE migration_started=$report_migration_started"
+assert_platform() {
+  os_name=$(uname -s)
+  arch_name=$(uname -m)
+  if [ "$os_name" != "Darwin" ] || [ "$arch_name" != "arm64" ]; then
+    fail_install "unsupported platform: $os_name $arch_name"
   fi
 }
 
-validate_asset_base_uri() {
-  asset_base_uri=$1
-  case "$asset_base_uri" in
-    https://*) ;;
-    "") fail_install "trusted HTTPS asset base URI is missing from release context" ;;
-    *) fail_install "asset base URI must use HTTPS" ;;
-  esac
-  case "$asset_base_uri" in
-    *"@"*|*"?"*|*"#"*|*[[:space:]]*)
-      fail_install "asset base URI must not contain credentials, query, fragment, or whitespace"
-      ;;
-  esac
-  asset_authority=${asset_base_uri#https://}
-  case "$asset_authority" in
-    ""|/*|:*) fail_install "asset base URI has an empty host" ;;
-  esac
+resolve_home() {
+  if [ -n "${AOPMEM_HOME:-}" ]; then
+    absolute_path "$AOPMEM_HOME"
+  else
+    [ -n "${HOME:-}" ] || fail_install "HOME is not set"
+    printf '%s\n' "$HOME/.aopmem"
+  fi
+}
+
+assert_clean_home() {
+  home_path=$1
+  repo_root=$2
+  repo_local_home="$repo_root/.aopmem"
+  if [ "$home_path" = "$repo_local_home" ]; then
+    fail_install "repo-local .aopmem is not allowed"
+  fi
+  if [ -e "$home_path" ] || [ -L "$home_path" ]; then
+    if [ ! -d "$home_path" ] || [ -L "$home_path" ]; then
+      fail_populated_home
+    fi
+    if find "$home_path" -mindepth 1 -maxdepth 1 -print -quit | grep . >/dev/null; then
+      fail_populated_home
+    fi
+  fi
 }
 
 download_asset() {
@@ -243,776 +85,130 @@ download_asset() {
   destination=$2
   if [ "$TEST_MODE" = "1" ]; then
     test_asset_dir=${AOPMEM_INSTALL_TEST_ASSET_DIR:-}
-    if [ -z "$test_asset_dir" ] || [ ! -f "$test_asset_dir/$asset_name" ] \
-      || [ -L "$test_asset_dir/$asset_name" ]; then
-      fail_install "local test asset missing: $asset_name"
-    fi
-    cp "$test_asset_dir/$asset_name" "$destination" \
-      || fail_install "local test asset copy failed: $asset_name"
+    [ -n "$test_asset_dir" ] || fail_install "AOPMEM_INSTALL_TEST_ASSET_DIR is not set"
+    [ -f "$test_asset_dir/$asset_name" ] || fail_install "local test asset missing: $asset_name"
+    cp "$test_asset_dir/$asset_name" "$destination" ||
+      fail_install "local test asset copy failed: $asset_name"
     return 0
   fi
 
   asset_base_uri=${AOPMEM_ASSET_BASE_URI:-}
-  validate_asset_base_uri "$asset_base_uri"
+  case "$asset_base_uri" in
+    https://*) ;;
+    "") fail_install "trusted HTTPS asset base URI is missing" ;;
+    *) fail_install "asset base URI must use HTTPS" ;;
+  esac
+  case "$asset_base_uri" in
+    *"@"*|*"?"*|*"#"*|*[[:space:]]*)
+      fail_install "asset base URI must not contain credentials, query, fragment, or whitespace"
+      ;;
+  esac
   asset_base_uri=${asset_base_uri%/}
   curl --fail --show-error --silent --location \
     --proto '=https' --proto-redir '=https' --tlsv1.2 \
     --connect-timeout 30 --max-time 900 \
-    "$asset_base_uri/$asset_name" \
-    --output "$destination" || fail_install "download failed for $asset_name"
+    --output "$destination" "$asset_base_uri/$asset_name" ||
+    fail_install "download failed: $asset_name"
 }
 
-detect_supported_platform() {
-  if [ "$TEST_MODE" = "1" ]; then
-    detected_os=${AOPMEM_INSTALL_TEST_OS:-$(uname -s)}
-    detected_arch=${AOPMEM_INSTALL_TEST_ARCH:-$(uname -m)}
-  else
-    detected_os=$(uname -s)
-    detected_arch=$(uname -m)
-  fi
-  if [ "$detected_os" != "Darwin" ] || [ "$detected_arch" != "arm64" ]; then
-    fail_install "unsupported platform: $detected_os/$detected_arch"
-  fi
+sha256_file() {
+  shasum -a 256 "$1" | awk '{ print tolower($1) }'
 }
 
-verify_checksum_entry() {
-  sums_path=$1
-  binary_path=$2
+expected_sha256() {
+  checksum_path=$1
+  exact_name=$2
+  awk -v name="$exact_name" '
+    $2 == name && $1 ~ /^[0-9A-Fa-f]{64}$/ { count += 1; hash = tolower($1) }
+    END { if (count == 1) print hash; else exit 1 }
+  ' "$checksum_path" || fail_install "SHA256SUMS has no unique exact entry for $exact_name"
+}
+
+verify_asset_hash() {
+  file_path=$1
+  checksum_path=$2
   exact_name=$3
-  expected_hash=$(awk -v exact_name="$exact_name" '
-    {
-      referenced = 0
-      for (field = 1; field <= NF; field += 1) {
-        if ($field == exact_name) {
-          referenced = 1
-        }
-      }
-      if (referenced) {
-        count += 1
-        if (NF == 2 && $2 == exact_name && length($1) == 64 &&
-            $1 !~ /[^0-9A-Fa-f]/) {
-          hash = tolower($1)
-        } else {
-          malformed = 1
-        }
-      }
-    }
-    END {
-      if (count == 1 && malformed == 0 && hash != "") {
-        print hash
-      } else {
-        exit 1
-      }
-    }
-  ' "$sums_path") || fail_install "SHA256SUMS has no unique exact entry for $exact_name"
-  actual_hash=$(sha256_file "$binary_path")
-  if [ "$expected_hash" != "$actual_hash" ]; then
-    fail_install "SHA-256 mismatch for $exact_name"
-  fi
-  VERIFIED_BINARY_HASH=$actual_hash
-  trace_install_event "sha256.verified"
+  expected=$(expected_sha256 "$checksum_path" "$exact_name")
+  actual=$(sha256_file "$file_path")
+  [ "$actual" = "$expected" ] || fail_install "SHA256 mismatch for $exact_name"
+  printf '%s\n' "$actual"
 }
 
-verify_new_binary_version() {
-  if ! version_output=$("$DOWNLOADED_BINARY" --version 2>/dev/null); then
-    fail_install "verified binary version check failed"
-  fi
-  if [ "$version_output" != "aopmem $PRODUCT_VERSION" ]; then
-    fail_install "verified binary has unexpected version: $version_output"
-  fi
-  trace_install_event "binary.version.verified"
+run_aopmem() {
+  AOPMEM_HOME="$AOPMEM_HOME_PATH" "$INSTALLED_BINARY" "$@"
 }
 
-backup_old_binary() {
-  if [ "$TEST_MODE" = "1" ] && [ "$TEST_FAIL_AT" = "backup" ]; then
-    fail_install "injected old binary backup failure"
-  fi
-  backup_stamp=$(date -u '+%Y%m%dT%H%M%SZ')
-  BACKUP_PATH="$INSTALL_DIR/aopmem.backup-v${OLD_RELEASE_LABEL}-${backup_stamp}-$$"
-  if [ -e "$BACKUP_PATH" ] || [ -L "$BACKUP_PATH" ]; then
-    fail_install "binary backup path already exists: $BACKUP_PATH"
-  fi
-  ORIGINAL_BINARY_HASH=$(sha256_file "$INSTALLED_BINARY")
-  copy_file_durable "$INSTALLED_BINARY" "$BACKUP_PATH"
-  validate_regular_file "$BACKUP_PATH" "old binary backup"
-  backup_hash=$(sha256_file "$BACKUP_PATH")
-  if [ "$ORIGINAL_BINARY_HASH" != "$backup_hash" ]; then
-    fail_install "old binary backup verification failed: $BACKUP_PATH"
-  fi
-  BACKUP_READY="1"
-  trace_install_event "backup.created"
+run_init_defaults() {
+  {
+    printf '%s\n' "n"
+    printf '%s\n' "n"
+    printf '%s\n' "Clean AOPMem $PRODUCT_VERSION install for this repository."
+    printf '%s\n' "User owns decisions. Agent keeps project memory current."
+    printf '%s\n' "Only this repository is initialized by the clean installer."
+  } | run_aopmem --json init >/dev/null
 }
 
-assert_no_active_aopmem_processes() {
-  if [ "$TEST_MODE" = "1" ]; then
-    trace_install_event "process.gate.clear"
-    return 0
-  fi
-  AOPMEM_PROCESS_GATE_EXECUTABLE=$INSTALLED_BINARY
-  export AOPMEM_PROCESS_GATE_EXECUTABLE
-  active_processes=$(ps -axo pid=,command= | awk '
-    index($0, ENVIRON["AOPMEM_PROCESS_GATE_EXECUTABLE"]) > 0 { print }
-  ')
-  unset AOPMEM_PROCESS_GATE_EXECUTABLE
-  if [ -n "$active_processes" ]; then
-    printf '%s\n' "$active_processes" >&2
-    fail_install "AOPMEM_PROCESS_RUNNING: close all AOPMem processes before update"
-  fi
-  trace_install_event "process.gate.clear"
-}
+main() {
+  require_command uname
+  require_command curl
+  require_command shasum
+  require_command awk
+  require_command find
+  assert_platform
 
-backup_aopmem_home() {
-  backup_stamp=$(date -u '+%Y%m%dT%H%M%SZ')
-  backup_parent=$(dirname "$AOPMEM_HOME_PATH")
-  if [ -L "$backup_parent" ]; then
-    fail_install "durable backup parent must not be a symbolic link: $backup_parent"
-  fi
-  mkdir -p "$backup_parent" || fail_install "cannot create durable backup parent"
-  if [ ! -d "$backup_parent" ] || [ -L "$backup_parent" ]; then
-    fail_install "durable backup parent is not a safe directory: $backup_parent"
-  fi
-  reserved_home_manifest="$AOPMEM_HOME_PATH/MANIFEST.sha256"
-  if [ -e "$reserved_home_manifest" ] || [ -L "$reserved_home_manifest" ]; then
-    fail_install "AOPMem home root uses reserved backup manifest name: MANIFEST.sha256"
-  fi
-  SOURCE_PREFLIGHT_ENTRIES=0
-  preflight_backup_source_tree "$AOPMEM_HOME_PATH" 0
-  # Safety Backup is durable evidence only. Normal RC8 recovery never adopts
-  # this shell-created full-home backup.
-  FULL_BACKUP_ROOT="$backup_parent/aopmem-home-backup-v${PRODUCT_VERSION}-${backup_stamp}-$$"
-  FULL_BACKUP_HOME="$FULL_BACKUP_ROOT"
-  if [ -e "$FULL_BACKUP_ROOT" ] || [ -L "$FULL_BACKUP_ROOT" ]; then
-    fail_install "durable backup path already exists: $FULL_BACKUP_ROOT"
-  fi
-  mkdir "$FULL_BACKUP_ROOT" || fail_install "cannot create durable backup root"
-  cp -Rp "$AOPMEM_HOME_PATH"/. "$FULL_BACKUP_HOME" \
-    || fail_install "durable AOPMem home backup failed"
-  sync || fail_install "durable AOPMem home backup sync failed"
-  backup_binary="$FULL_BACKUP_HOME/bin/aopmem"
-  validate_regular_file "$backup_binary" "durable backup binary"
-  if [ "$(sha256_file "$backup_binary")" != "$ORIGINAL_BINARY_HASH" ]; then
-    fail_install "durable AOPMem home backup verification failed"
-  fi
-  if [ -d "$AOPMEM_HOME_PATH/workspaces" ]; then
-    for workspace_path in "$AOPMEM_HOME_PATH"/workspaces/*; do
-      [ -d "$workspace_path" ] || continue
-      workspace_name=$(basename "$workspace_path")
-      if [ ! -d "$FULL_BACKUP_HOME/workspaces/$workspace_name" ]; then
-        fail_install "durable backup workspace missing: $workspace_name"
-      fi
-      if [ -f "$workspace_path/aopmem.sqlite" ] \
-        && [ ! -f "$FULL_BACKUP_HOME/workspaces/$workspace_name/aopmem.sqlite" ]; then
-        fail_install "durable backup database missing: $workspace_name"
-      fi
-    done
-  fi
-  # The adopted-backup contract is byte-for-byte Rust's per-directory sorted
-  # depth-first manifest: two LF-only lines per regular file.  Do not replace
-  # this with a global `find | sort`: that changes `a/child` vs `a.txt` order.
-  manifest="$FULL_BACKUP_ROOT/MANIFEST.sha256"
-  if [ -e "$manifest" ] || [ -L "$manifest" ]; then
-    fail_install "copied AOPMem home conflicts with reserved backup manifest name"
-  fi
-  (set -C; : > "$manifest") \
-    || fail_install "cannot create durable backup manifest without replacement"
-  MANIFEST_ENTRIES=0
-  MANIFEST_BYTES=0
-  write_backup_manifest_tree "$FULL_BACKUP_ROOT" "" 0
-  sync || fail_install "durable AOPMem home backup manifest sync failed"
-  FULL_BACKUP_MANIFEST_SHA256=$(sha256_file "$manifest")
-  trace_install_event "backup.home.created"
-}
+  REPO_ROOT=$(pwd -P)
+  AOPMEM_HOME_PATH=$(resolve_home)
+  export AOPMEM_HOME_PATH
+  assert_clean_home "$AOPMEM_HOME_PATH" "$REPO_ROOT"
+  trace_install_event "home.clean"
 
-preflight_backup_source_tree() {
-  if [ "$2" -gt 128 ]; then
-    fail_install "AOPMem home exceeds maximum backup directory depth"
-  fi
-  source_directory_entries=0
-  for source_path in "$1"/..?* "$1"/.[!.]* "$1"/*; do
-    [ -e "$source_path" ] || [ -L "$source_path" ] || continue
-    source_directory_entries=$((source_directory_entries + 1))
-  done
-  if [ "$source_directory_entries" -gt 10000 ]; then
-    fail_install "AOPMem home exceeds maximum backup directory entry count"
-  fi
-  for source_path in "$1"/..?* "$1"/.[!.]* "$1"/*; do
-    [ -e "$source_path" ] || [ -L "$source_path" ] || continue
-    source_name=${source_path##*/}
-    SOURCE_PREFLIGHT_ENTRIES=$((SOURCE_PREFLIGHT_ENTRIES + 1))
-    if [ "$SOURCE_PREFLIGHT_ENTRIES" -gt 100000 ]; then
-      fail_install "AOPMem home exceeds maximum backup entry count"
-    fi
-    case "$source_name" in *'
-'*|*''*) fail_install "AOPMem home contains an unsafe path" ;; esac
-    if [ -L "$source_path" ]; then
-      fail_install "AOPMem home contains a symbolic link"
-    fi
-    if [ -d "$source_path" ]; then
-      preflight_backup_source_tree "$source_path" $(( $2 + 1 ))
-    elif [ ! -f "$source_path" ]; then
-      fail_install "AOPMem home contains a non-regular file"
-    fi
-  done
-}
+  TEMP_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/aopmem-rc9-install.XXXXXX")
+  binary_stage="$TEMP_ROOT/$ASSET_NAME"
+  checksums_stage="$TEMP_ROOT/$CHECKSUM_NAME"
+  download_asset "$CHECKSUM_NAME" "$checksums_stage"
+  download_asset "$ASSET_NAME" "$binary_stage"
+  binary_sha=$(verify_asset_hash "$binary_stage" "$checksums_stage" "$ASSET_NAME")
+  trace_install_event "asset.verified"
 
-write_backup_manifest_tree() {
-  if [ "$3" -gt 128 ]; then
-    fail_install "durable backup exceeds maximum directory depth"
-  fi
-  # POSIX pathname expansion is ordered by LC_ALL=C, matching the Rust
-  # `OsString` sort for the supported UTF-8 macOS path contract.
-  manifest_directory_entries=0
-  for manifest_path in "$1"/..?* "$1"/.[!.]* "$1"/*; do
-    [ -e "$manifest_path" ] || [ -L "$manifest_path" ] || continue
-    manifest_directory_entries=$((manifest_directory_entries + 1))
-  done
-  if [ "$manifest_directory_entries" -gt 10000 ]; then
-    fail_install "durable backup exceeds maximum directory entry count"
-  fi
-  for manifest_path in "$1"/..?* "$1"/.[!.]* "$1"/*; do
-    [ -e "$manifest_path" ] || [ -L "$manifest_path" ] || continue
-    manifest_name=${manifest_path##*/}
-    if [ -z "$2" ] && [ "$manifest_name" = "MANIFEST.sha256" ]; then
-      continue
-    fi
-    MANIFEST_ENTRIES=$((MANIFEST_ENTRIES + 1))
-    if [ "$MANIFEST_ENTRIES" -gt 100000 ]; then
-      fail_install "durable backup exceeds maximum entry count"
-    fi
-    case "$manifest_name" in *'
-'*|*''*) fail_install "backup path is unsafe" ;; esac
-    if [ -L "$manifest_path" ]; then
-      fail_install "durable backup must not contain symbolic links"
-    fi
-    if [ -d "$manifest_path" ]; then
-      if [ -n "$2" ]; then
-        child_relative="$2/$manifest_name"
-      else
-        child_relative=$manifest_name
-      fi
-      write_backup_manifest_tree "$manifest_path" "$child_relative" $(( $3 + 1 ))
-    elif [ -f "$manifest_path" ]; then
-      if [ -n "$2" ]; then
-        file_relative="$2/$manifest_name"
-      else
-        file_relative=$manifest_name
-      fi
-      bytes=$(wc -c < "$manifest_path" | tr -d ' ')
-      mode=$(stat -f '%p' "$manifest_path")
-      mode=$(printf '%d' "0$mode")
-      hash=$(sha256_file "$manifest_path")
-      MANIFEST_BYTES=$((MANIFEST_BYTES + ${#bytes} + 1 + ${#mode} + 1 + 64 + 1 + ${#file_relative} + 1))
-      if [ "$MANIFEST_BYTES" -gt 33554432 ]; then
-        fail_install "durable backup manifest exceeds maximum size"
-      fi
-      printf '%s %s %s\n%s\n' "$bytes" "$mode" "$hash" "$file_relative" >> "$manifest"
-    else
-      fail_install "durable backup contains a non-regular file"
-    fi
-  done
-}
+  chmod 755 "$binary_stage"
+  version_output=$("$binary_stage" --version)
+  [ "$version_output" = "aopmem $PRODUCT_VERSION" ] ||
+    fail_install "binary version mismatch: $version_output"
 
-select_active_adapter() {
-  if [ -z "$ACTIVE_ADAPTER" ] || [ -z "$ACTIVE_INSTRUCTION_FILE" ]; then
-    fail_install "AOPMEM_ACTIVE_ADAPTER and AOPMEM_ACTIVE_INSTRUCTION_FILE are required"
+  mkdir -p "$AOPMEM_HOME_PATH/bin"
+  INSTALLED_BINARY="$AOPMEM_HOME_PATH/bin/aopmem"
+  export INSTALLED_BINARY
+  if [ -e "$INSTALLED_BINARY" ] || [ -L "$INSTALLED_BINARY" ]; then
+    fail_populated_home
   fi
-  case "$ACTIVE_ADAPTER" in
-    codex) expected_instruction_file="AGENTS.md" ;;
-    claude) expected_instruction_file="CLAUDE.md" ;;
-    cursor) expected_instruction_file=".cursor/rules/aopmem.mdc" ;;
-    copilot) expected_instruction_file=".github/copilot-instructions.md" ;;
-    *) fail_install "unsupported active adapter: $ACTIVE_ADAPTER" ;;
-  esac
-  if [ "$ACTIVE_INSTRUCTION_FILE" != "$expected_instruction_file" ]; then
-    fail_install "active adapter instruction file does not match the selected adapter"
-  fi
-  trace_install_event "adapter.selected.$ACTIVE_ADAPTER"
-}
+  cp "$binary_stage" "$INSTALLED_BINARY"
+  chmod 755 "$INSTALLED_BINARY"
+  sync || true
+  trace_install_event "binary.installed"
 
-run_staged_json() {
-  staged_context=$1
-  shift
-  staged_output="$TEMP_ROOT/$staged_context.json"
-  if [ "$TEST_MODE" = "1" ] && [ "$TEST_FAIL_AT" = "publish" ] \
-    && [ "$staged_context" = "upgrade-publish" ]; then
-    fail_install "injected native upgrade publish failure"
-  fi
-  if ! AOPMEM_HOME="$AOPMEM_HOME_PATH" "$DOWNLOADED_BINARY" "$@" > "$staged_output"; then
-    emit_upgrade_report "$staged_context failure" "$staged_output"
-    set_upgrade_report_failure "$staged_context" "$staged_output"
-    fail_install "$FAILURE_MESSAGE"
-  fi
-  if ! grep -Eq '"ok"[[:space:]]*:[[:space:]]*true' "$staged_output"; then
-    emit_upgrade_report "$staged_context unsuccessful" "$staged_output"
-    fail_install "$staged_context did not report success"
-  fi
-}
-
-run_upgrade_stage() {
-  trace_install_event "upgrade.stage"
-  run_staged_json "upgrade-stage" upgrade stage --artifact "$DOWNLOADED_BINARY" \
-    --sha256 "$VERIFIED_BINARY_HASH" --json
-  RECOVERY_BINARY="$INSTALL_DIR/.aopmem-v${PRODUCT_VERSION}.staged"
-  RECOVERY_BINARY_OWNED="0"
-}
-
-run_staged_platform_check() {
-  trace_install_event "platform.check.staged"
-  run_staged_json "platform-check" platform check --json
-}
-
-run_upgrade_recovery_inspect() {
-  trace_install_event "upgrade.recovery.inspect"
-  run_staged_json "upgrade-recovery-inspect" upgrade recovery inspect --json
-  if grep -Eq '"apply_started"[[:space:]]*:[[:space:]]*true' \
-      "$TEMP_ROOT/upgrade-recovery-inspect.json" \
-    && ! grep -Eq '"can_resume_publish"[[:space:]]*:[[:space:]]*true' \
-      "$TEMP_ROOT/upgrade-recovery-inspect.json"; then
-    fail_install "upgrade recovery has apply-started evidence; automatic fresh run is blocked"
-  fi
-}
-
-run_upgrade_recovery_backup() {
-  trace_install_event "upgrade.backup.fresh"
-  run_staged_json "upgrade-backup-fresh" upgrade backup --all-workspaces --json
-  UPGRADE_BACKUP_ROOT=$(json_field_or_empty \
-    "$TEMP_ROOT/upgrade-backup-fresh.json" "data.recovery_backup_root")
-  if [ -z "$UPGRADE_BACKUP_ROOT" ] || [ "$UPGRADE_BACKUP_ROOT" = "null" ]; then
-    fail_install "upgrade backup did not report recovery backup root"
-  fi
-}
-
-run_audit_repair() {
-  repair_phase=$1
-  repair_binary=$2
-  trace_install_event "audit.repair.$repair_phase"
-  repair_output="$TEMP_ROOT/audit-repair-$repair_phase.json"
-  if ! AOPMEM_HOME="$AOPMEM_HOME_PATH" "$repair_binary" audit repair --all-workspaces --json > "$repair_output"; then
-    emit_upgrade_report "audit repair $repair_phase failure" "$repair_output"
-    set_upgrade_report_failure "audit repair $repair_phase" "$repair_output"
-    fail_install "$FAILURE_MESSAGE"
-  fi
-  if ! grep -Eq '"ok"[[:space:]]*:[[:space:]]*true' "$repair_output"; then
-    fail_install "audit repair $repair_phase did not report success"
-  fi
-}
-
-run_adapter_sync() {
-  trace_install_event "adapter.sync"
-  adapter_output="$TEMP_ROOT/adapter-sync.json"
-  if ! AOPMEM_HOME="$AOPMEM_HOME_PATH" "$INSTALLED_BINARY" adapter sync \
-    --file "$ACTIVE_INSTRUCTION_FILE" --json > "$adapter_output"; then
-    fail_install "adapter sync failed for active instruction file"
-  fi
-  if ! grep -Eq '"ok"[[:space:]]*:[[:space:]]*true' "$adapter_output"; then
-    fail_install "adapter sync did not report success"
-  fi
-}
-
-run_debug_capsule_export() {
-  capsule_dir="$AOPMEM_HOME_PATH/debug-capsules"
-  capsule_path="$capsule_dir/upgrade-${INSTALL_RUN_ID}.zip"
-  if [ -L "$capsule_dir" ]; then
-    fail_install "debug capsule directory must not be a symbolic link"
-  fi
-  if [ -e "$capsule_dir" ] && [ ! -d "$capsule_dir" ]; then
-    fail_install "debug capsule path is not a directory"
-  fi
-  if [ ! -e "$capsule_dir" ]; then
-    mkdir "$capsule_dir" || fail_install "cannot create debug capsule directory"
-  fi
-  if [ -L "$capsule_dir" ] || [ ! -d "$capsule_dir" ]; then
-    fail_install "debug capsule directory changed during validation"
-  fi
-  trace_install_event "debug.capsule.export"
-  AOPMEM_HOME="$AOPMEM_HOME_PATH" "$INSTALLED_BINARY" observe export \
-    --output "$capsule_path" --json > "$TEMP_ROOT/debug-capsule.json" \
-    || fail_install "debug capsule export failed"
-  grep -Eq '"ok"[[:space:]]*:[[:space:]]*true' "$TEMP_ROOT/debug-capsule.json" \
-    || fail_install "debug capsule export did not report success"
-}
-
-run_upgrade_prepare() {
-  prepare_output="$TEMP_ROOT/upgrade-prepare.json"
-  trace_install_event "upgrade.prepare"
-  if ! AOPMEM_HOME="$AOPMEM_HOME_PATH" "$DOWNLOADED_BINARY" \
-    upgrade prepare --all-workspaces --json > "$prepare_output"; then
-    emit_upgrade_report "upgrade prepare failure" "$prepare_output"
-    set_upgrade_report_failure "upgrade prepare" "$prepare_output"
-    fail_install "$FAILURE_MESSAGE"
-  fi
-  if ! grep -Eq '"ok"[[:space:]]*:[[:space:]]*true' "$prepare_output" \
-    || ! grep -Eq '"success"[[:space:]]*:[[:space:]]*true' "$prepare_output" \
-    || grep -Eq '"ok"[[:space:]]*:[[:space:]]*false' "$prepare_output" \
-    || grep -Eq '"success"[[:space:]]*:[[:space:]]*false' "$prepare_output"; then
-    emit_upgrade_report "upgrade prepare unsuccessful" "$prepare_output"
-    fail_install "upgrade prepare did not report success"
-  fi
-}
-
-run_upgrade_plan() {
-  plan_output="$TEMP_ROOT/upgrade-plan.json"
-  trace_install_event "upgrade.plan"
-  if ! AOPMEM_HOME="$AOPMEM_HOME_PATH" "$DOWNLOADED_BINARY" \
-    upgrade plan --all-workspaces --json > "$plan_output"; then
-    emit_upgrade_report "upgrade plan failure" "$plan_output"
-    set_upgrade_report_failure "upgrade plan" "$plan_output"
-    fail_install "$FAILURE_MESSAGE"
-  fi
-  if ! grep -Eq '"ok"[[:space:]]*:[[:space:]]*true' "$plan_output" \
-    || ! grep -Eq '"ready"[[:space:]]*:[[:space:]]*true' "$plan_output" \
-    || ! grep -Eq '"writes_performed"[[:space:]]*:[[:space:]]*false' "$plan_output" \
-    || grep -Eq '"ok"[[:space:]]*:[[:space:]]*false' "$plan_output" \
-    || grep -Eq '"ready"[[:space:]]*:[[:space:]]*false' "$plan_output" \
-    || grep -Eq '"writes_performed"[[:space:]]*:[[:space:]]*true' "$plan_output"; then
-    emit_upgrade_report "upgrade plan not-ready" "$plan_output"
-    fail_install "upgrade plan did not report ready read-only state"
-  fi
-}
-
-run_upgrade_apply() {
-  apply_output="$TEMP_ROOT/upgrade-apply.json"
-  trace_install_event "upgrade.apply"
-  APPLY_ATTEMPTED="1"
-  if ! AOPMEM_HOME="$AOPMEM_HOME_PATH" "$DOWNLOADED_BINARY" \
-    upgrade apply --all-workspaces --json --approved "+++" > "$apply_output"; then
-    emit_upgrade_report "upgrade apply failure" "$apply_output"
-    set_upgrade_report_failure "upgrade apply" "$apply_output"
-    fail_install "$FAILURE_MESSAGE"
-  fi
-  if ! grep -Eq '"ok"[[:space:]]*:[[:space:]]*true' "$apply_output" \
-    || ! grep -Eq '"journal_phase"[[:space:]]*:[[:space:]]*"applied"' "$apply_output" \
-    || grep -Eq '"apply_invoked"[[:space:]]*:[[:space:]]*false' "$apply_output"; then
-    emit_upgrade_report "upgrade apply unsuccessful" "$apply_output"
-    fail_install "upgrade apply did not report success"
-  fi
-  UPGRADE_BACKUP_ROOT=$(json_field_or_empty "$apply_output" "data.apply.backup_root")
-  trace_install_event "upgrade.apply.health.ok"
-}
-
-prepare_publish_files() {
-  INSTALL_STAGE="$INSTALL_DIR/.aopmem-v020-stage-$INSTALL_RUN_ID"
-  RECOVERY_BINARY="$INSTALL_DIR/aopmem-v${PRODUCT_VERSION}-recovery-$INSTALL_RUN_ID"
-  if [ -e "$INSTALL_STAGE" ] || [ -L "$INSTALL_STAGE" ]; then
-    fail_install "binary stage path already exists: $INSTALL_STAGE"
-  fi
-  if [ -e "$RECOVERY_BINARY" ] || [ -L "$RECOVERY_BINARY" ]; then
-    fail_install "recovery binary path already exists: $RECOVERY_BINARY"
-  fi
-  INSTALL_STAGE_OWNED="1"
-  copy_file_durable "$DOWNLOADED_BINARY" "$INSTALL_STAGE" \
-    || fail_install "same-directory binary staging failed"
-  validate_regular_file "$INSTALL_STAGE" "same-directory binary stage"
-  chmod 755 "$INSTALL_STAGE" \
-    || fail_install "same-directory binary staging chmod failed"
-  stage_hash=$(sha256_file "$INSTALL_STAGE")
-  if [ "$stage_hash" != "$VERIFIED_BINARY_HASH" ]; then
-    fail_install "same-directory binary staging verification failed"
-  fi
-  RECOVERY_BINARY_OWNED="1"
-  copy_file_durable "$INSTALL_STAGE" "$RECOVERY_BINARY" \
-    || fail_install "same-directory recovery binary staging failed"
-  validate_regular_file "$RECOVERY_BINARY" "same-directory recovery binary"
-  chmod 755 "$RECOVERY_BINARY" \
-    || fail_install "same-directory recovery binary chmod failed"
-  recovery_hash=$(sha256_file "$RECOVERY_BINARY")
-  if [ "$recovery_hash" != "$VERIFIED_BINARY_HASH" ]; then
-    fail_install "same-directory recovery binary verification failed"
-  fi
-  trace_install_event "replacement.staged"
-}
-
-publish_verified_binary() {
-  if [ "$MODE" != "fresh" ]; then
-    fail_install "installer binary publish is allowed only for a fresh install"
-  fi
-  if [ "$TEST_MODE" = "1" ] && [ "$TEST_FAIL_AT" = "publish" ]; then
-    fail_install "injected atomic replacement failure"
-  fi
-  validate_regular_file "$INSTALL_STAGE" "same-directory binary stage"
-  validate_regular_file "$RECOVERY_BINARY" "same-directory recovery binary"
-  prepublish_stage_hash=$(sha256_file "$INSTALL_STAGE")
-  prepublish_recovery_hash=$(sha256_file "$RECOVERY_BINARY")
-  if [ "$prepublish_stage_hash" != "$VERIFIED_BINARY_HASH" ] \
-    || [ "$prepublish_recovery_hash" != "$VERIFIED_BINARY_HASH" ]; then
-    fail_install "same-directory publish files changed before atomic replacement"
-  fi
-  # Fresh install has no destination.  A hard-link creation is atomic and
-  # no-replace; unlike `mv -f` it cannot overwrite a concurrent target.
-  ln "$INSTALL_STAGE" "$INSTALLED_BINARY" \
-    || fail_install "fresh binary no-replace publish failed"
-  rm "$INSTALL_STAGE" || fail_install "fresh binary stage cleanup failed"
-  INSTALL_STAGE=""
-  INSTALL_STAGE_OWNED="0"
-  BINARY_PUBLISHED="1"
-  sync || fail_install "installed binary sync failed"
-  validate_regular_file "$INSTALLED_BINARY" "installed binary"
-  installed_hash=$(sha256_file "$INSTALLED_BINARY")
-  if [ "$installed_hash" != "$VERIFIED_BINARY_HASH" ]; then
-    fail_install "installed binary verification failed after atomic replacement"
-  fi
-  if ! installed_version=$("$INSTALLED_BINARY" --version 2>/dev/null); then
-    fail_install "installed binary version check failed after atomic replacement"
-  fi
-  if [ "$installed_version" != "aopmem $PRODUCT_VERSION" ]; then
-    fail_install "installed binary has unexpected version after atomic replacement: $installed_version"
-  fi
-  trace_install_event "replacement.published"
-}
-
-run_current_workspace_health() {
-  adapter_status_output="$TEMP_ROOT/adapter-status.json"
-  trace_install_event "adapter.status"
-  if ! AOPMEM_HOME="$AOPMEM_HOME_PATH" "$INSTALLED_BINARY" \
-    adapter status --file "$ACTIVE_INSTRUCTION_FILE" --json > "$adapter_status_output"; then
-    fail_install "adapter status failed for current workspace"
-  fi
-  if ! grep -Eq '"ok"[[:space:]]*:[[:space:]]*true' "$adapter_status_output" \
-    || grep -Eq '"ok"[[:space:]]*:[[:space:]]*false' "$adapter_status_output"; then
-    fail_install "adapter status did not report success"
-  fi
-  doctor_output="$TEMP_ROOT/doctor.json"
-  trace_install_event "doctor"
-  if [ "$TEST_MODE" = "1" ] && [ "$TEST_FAIL_AT" = "doctor" ]; then
-    fail_install "injected doctor failure"
-  fi
-  if ! AOPMEM_HOME="$AOPMEM_HOME_PATH" "$INSTALLED_BINARY" doctor --json > "$doctor_output"; then
-    fail_install "doctor failed for current workspace"
-  fi
-  if ! grep -Eq '"ok"[[:space:]]*:[[:space:]]*true' "$doctor_output" \
-    || ! grep -Eq '"healthy"[[:space:]]*:[[:space:]]*true' "$doctor_output" \
-    || grep -Eq '"ok"[[:space:]]*:[[:space:]]*false' "$doctor_output" \
-    || grep -Eq '"healthy"[[:space:]]*:[[:space:]]*false' "$doctor_output"; then
-    fail_install "doctor did not report healthy state"
-  fi
-  verify_output="$TEMP_ROOT/verify.json"
-  trace_install_event "verify"
-  if ! AOPMEM_HOME="$AOPMEM_HOME_PATH" "$INSTALLED_BINARY" verify --json > "$verify_output"; then
-    fail_install "verify failed for current workspace"
-  fi
-  if ! grep -Eq '"ok"[[:space:]]*:[[:space:]]*true' "$verify_output" \
-    || ! grep -Eq '"clean"[[:space:]]*:[[:space:]]*true' "$verify_output" \
-    || grep -Eq '"ok"[[:space:]]*:[[:space:]]*false' "$verify_output" \
-    || grep -Eq '"clean"[[:space:]]*:[[:space:]]*false' "$verify_output"; then
-    fail_install "verify did not report clean state"
-  fi
-
-  task_start_output="$TEMP_ROOT/task-start-smoke.json"
-  trace_install_event "task.start.smoke"
-  if ! printf '%s' 'RC8 installer task-start smoke' | AOPMEM_HOME="$AOPMEM_HOME_PATH" \
-    "$INSTALLED_BINARY" task start --query-stdin --json > "$task_start_output"; then
-    fail_install "task-start smoke failed for current workspace"
-  fi
-  if ! grep -Eq '"ok"[[:space:]]*:[[:space:]]*true' "$task_start_output" \
-    || ! grep -Eq '"mandatory_context_complete"[[:space:]]*:[[:space:]]*true' "$task_start_output" \
-    || ! grep -Eq '"bundle_id"[[:space:]]*:[[:space:]]*"[^"]+"' "$task_start_output" \
-    || ! grep -Eq '"memory_revision"[[:space:]]*:[[:space:]]*"[^"]+"' "$task_start_output"; then
-    fail_install "task-start smoke did not return a complete bound receipt"
-  fi
-  observe_status_output="$TEMP_ROOT/observe-status.json"
-  trace_install_event "observe.status"
-  if ! AOPMEM_HOME="$AOPMEM_HOME_PATH" "$INSTALLED_BINARY" \
-    observe status --json > "$observe_status_output"; then
-    fail_install "observe status failed for current workspace"
-  fi
-  observe_report_output="$TEMP_ROOT/observe-report.json"
-  trace_install_event "observe.report"
-  if ! AOPMEM_HOME="$AOPMEM_HOME_PATH" "$INSTALLED_BINARY" \
-    observe report --json > "$observe_report_output"; then
-    fail_install "observe report failed for current workspace"
-  fi
-  for health_output in \
-    "$task_start_output" "$observe_status_output" "$observe_report_output"; do
-    if ! grep -Eq '"ok"[[:space:]]*:[[:space:]]*true' "$health_output" \
-      || grep -Eq '"ok"[[:space:]]*:[[:space:]]*false' "$health_output"; then
-      fail_install "post-update workspace check did not report success: $health_output"
-    fi
-  done
-  current_workspace_key=$(json_field_or_empty "$doctor_output" "meta.workspace_key")
-  if [ -z "$current_workspace_key" ] || [ "$current_workspace_key" = "null" ]; then
-    fail_install "doctor did not report current workspace key"
-  fi
-  for health_output in \
-    "$adapter_status_output" "$verify_output" "$task_start_output" \
-    "$observe_status_output" "$observe_report_output"; do
-    health_workspace_key=$(json_field_or_empty "$health_output" "meta.workspace_key")
-    if [ "$health_workspace_key" != "$current_workspace_key" ]; then
-      fail_install "post-update workspace key changed during checks"
-    fi
-  done
-}
-
-run_fresh_init() {
+  run_aopmem platform check --json >/dev/null
+  trace_install_event "platform.check"
+  run_init_defaults
   trace_install_event "init"
-  if ! AOPMEM_HOME="$AOPMEM_HOME_PATH" "$INSTALLED_BINARY" init; then
-    fail_install "fresh workspace semantic initialization failed"
+
+  if [ -n "${AOPMEM_ACTIVE_INSTRUCTION_FILE:-}" ]; then
+    run_aopmem --json adapter sync --file "$AOPMEM_ACTIVE_INSTRUCTION_FILE" >/dev/null
+  else
+    run_aopmem --json adapter sync >/dev/null
   fi
+  trace_install_event "adapter.sync"
+
+  run_aopmem --json doctor >/dev/null
+  run_aopmem --json verify >/dev/null
+  trace_install_event "doctor.verify"
+
+  if [ -d "$REPO_ROOT/.aopmem" ]; then
+    fail_install "repo-local .aopmem was created"
+  fi
+
+  printf '%s\n' "AOPMem $PRODUCT_VERSION clean install complete"
+  printf '%s\n' "AOPMEM_HOME=$AOPMEM_HOME_PATH"
+  printf '%s\n' "$ASSET_NAME sha256=$binary_sha"
 }
 
-run_fresh_adapter_seed() {
-  adapter_output="$TEMP_ROOT/adapter-seed.json"
-  trace_install_event "adapter.seed"
-  if ! AOPMEM_HOME="$AOPMEM_HOME_PATH" "$INSTALLED_BINARY" \
-    adapter seed --file "$ACTIVE_INSTRUCTION_FILE" --json > "$adapter_output"; then
-    fail_install "fresh managed adapter seed failed"
-  fi
-  if ! grep -Eq '"ok"[[:space:]]*:[[:space:]]*true' "$adapter_output" \
-    || grep -Eq '"ok"[[:space:]]*:[[:space:]]*false' "$adapter_output"; then
-    fail_install "fresh managed adapter seed did not report success"
-  fi
-}
-
-ensure_install_directories() {
-  if [ -L "$AOPMEM_HOME_PATH" ]; then
-    fail_install "AOPMem home must not be a symbolic link: $AOPMEM_HOME_PATH"
-  fi
-  if [ -e "$AOPMEM_HOME_PATH" ] && [ ! -d "$AOPMEM_HOME_PATH" ]; then
-    fail_install "AOPMem home is not a directory: $AOPMEM_HOME_PATH"
-  fi
-  if [ ! -e "$AOPMEM_HOME_PATH" ]; then
-    mkdir "$AOPMEM_HOME_PATH" \
-      || fail_install "cannot create AOPMem home: $AOPMEM_HOME_PATH"
-  fi
-  if [ -L "$AOPMEM_HOME_PATH" ] || [ ! -d "$AOPMEM_HOME_PATH" ]; then
-    fail_install "AOPMem home path changed during validation: $AOPMEM_HOME_PATH"
-  fi
-
-  if [ -L "$INSTALL_DIR" ]; then
-    fail_install "AOPMem bin directory must not be a symbolic link: $INSTALL_DIR"
-  fi
-  if [ -e "$INSTALL_DIR" ] && [ ! -d "$INSTALL_DIR" ]; then
-    fail_install "AOPMem bin path is not a directory: $INSTALL_DIR"
-  fi
-  if [ ! -e "$INSTALL_DIR" ]; then
-    mkdir "$INSTALL_DIR" \
-      || fail_install "cannot create AOPMem bin directory: $INSTALL_DIR"
-  fi
-  if [ -L "$INSTALL_DIR" ] || [ ! -d "$INSTALL_DIR" ]; then
-    fail_install "AOPMem bin path changed during validation: $INSTALL_DIR"
-  fi
-}
-
-if [ "$TEST_MODE" = "1" ] && [ -n "${AOPMEM_INSTALL_TEST_RUN_ID:-}" ]; then
-  case "$AOPMEM_INSTALL_TEST_RUN_ID" in
-    *[!0-9]*) fail_install "test run id must contain decimal digits only" ;;
-    *) INSTALL_RUN_ID=$AOPMEM_INSTALL_TEST_RUN_ID ;;
-  esac
-fi
-
-detect_supported_platform
-
-if [ "$TEST_MODE" = "1" ]; then
-  AOPMEM_HOME_PATH=${AOPMEM_HOME:-}
-  TEMP_PARENT=${AOPMEM_INSTALL_TEST_TEMP_ROOT:-}
-  if [ -z "$AOPMEM_HOME_PATH" ] || [ -z "$TEMP_PARENT" ]; then
-    fail_install "test mode requires isolated AOPMEM_HOME and temp root"
-  fi
-  if [ -L "$TEMP_PARENT" ] || [ ! -d "$TEMP_PARENT" ]; then
-    fail_install "test temporary parent must be a real directory: $TEMP_PARENT"
-  fi
-else
-  AOPMEM_HOME_PATH=${HOME:?}/.aopmem
-  TEMP_PARENT=${TMPDIR:-/tmp}
-fi
-INSTALL_DIR="$AOPMEM_HOME_PATH/bin"
-INSTALLED_BINARY="$INSTALL_DIR/aopmem"
-select_active_adapter
-ensure_install_directories
-
-if [ -e "$INSTALLED_BINARY" ] || [ -L "$INSTALLED_BINARY" ]; then
-  if [ ! -f "$INSTALLED_BINARY" ] || [ -L "$INSTALLED_BINARY" ]; then
-    fail_install "installed binary path is not a regular file: $INSTALLED_BINARY"
-  fi
-  if ! installed_version=$("$INSTALLED_BINARY" --version 2>/dev/null); then
-    fail_install "existing binary version check failed: $INSTALLED_BINARY"
-  fi
-  case "$installed_version" in
-    "aopmem 0.1.0"|"aopmem 0.2.0-rc1"|"aopmem 0.2.0-rc2"|\
-    "aopmem 0.2.0-rc3"|"aopmem 0.2.0-rc4"|"aopmem 0.2.0-rc5"|\
-    "aopmem 0.2.0-rc6") ;;
-    *)
-    fail_install "existing version is unsupported for this installer: $installed_version"
-      ;;
-  esac
-  OLD_RELEASE_LABEL=${installed_version#aopmem }
-  installed_old_hash=$(sha256_file "$INSTALLED_BINARY")
-  expected_old_hash=$(known_source_hash "$installed_version") \
-    || expected_old_hash=""
-  if [ "$TEST_MODE" = "1" ] \
-    && [ -n "${AOPMEM_INSTALL_TEST_OLD_BINARY_SHA256:-}" ]; then
-    expected_old_hash=${AOPMEM_INSTALL_TEST_OLD_BINARY_SHA256:-}
-  fi
-  if [ -z "$expected_old_hash" ] || [ "$installed_old_hash" != "$expected_old_hash" ]; then
-    warning_code="NONCANONICAL_SOURCE_BINARY"
-    if [ "$installed_version" = "aopmem 0.1.0" ]; then
-      warning_code="NONCANONICAL_V010_BINARY"
-    fi
-    printf '%s\n' \
-      "WARNING $warning_code: version=$installed_version sha256=$installed_old_hash; version is compatible; workspace compatibility will be decided by upgrade prepare and plan" >&2
-    trace_install_event "warning.$warning_code"
-  fi
-  MODE="update"
-  assert_no_active_aopmem_processes
-  backup_old_binary
-  backup_aopmem_home
-  if [ "$TEST_MODE" = "1" ] && [ "${AOPMEM_INSTALL_TEST_MANIFEST_ONLY:-0}" = "1" ]; then
-    printf '%s\n' "$FULL_BACKUP_ROOT"
-    exit 0
-  fi
-  if [ "$TEST_MODE" = "1" ] && [ "$TEST_FAIL_AT" = "after_backup" ]; then
-    false
-  fi
-else
-  MODE="fresh"
-fi
-
-TEMP_ROOT=$(mktemp -d "$TEMP_PARENT/aopmem-v020.XXXXXX") \
-  || fail_install "temporary directory creation failed"
-if [ -L "$TEMP_ROOT" ] || [ ! -d "$TEMP_ROOT" ]; then
-  fail_install "temporary root is not a private directory: $TEMP_ROOT"
-fi
-chmod 700 "$TEMP_ROOT" || fail_install "temporary directory permission update failed"
-DOWNLOADED_BINARY="$TEMP_ROOT/$ASSET_NAME"
-DOWNLOADED_SUMS="$TEMP_ROOT/$CHECKSUM_NAME"
-
-trace_install_event "asset.download.started"
-download_asset "$ASSET_NAME" "$DOWNLOADED_BINARY"
-download_asset "$CHECKSUM_NAME" "$DOWNLOADED_SUMS"
-verify_checksum_entry "$DOWNLOADED_SUMS" "$DOWNLOADED_BINARY" "$ASSET_NAME"
-chmod 755 "$DOWNLOADED_BINARY"
-verify_new_binary_version
-
-if [ "$MODE" = "update" ]; then
-  run_staged_platform_check
-  run_upgrade_recovery_inspect
-  run_upgrade_recovery_backup
-  run_upgrade_stage
-  run_audit_repair staged "$DOWNLOADED_BINARY"
-  run_upgrade_prepare
-  run_upgrade_plan
-  run_upgrade_apply
-  trace_install_event "upgrade.publish"
-  run_staged_json "upgrade-publish" upgrade publish --json
-  if ! grep -Eq '"journal_phase"[[:space:]]*:[[:space:]]*"published"' \
-    "$TEMP_ROOT/upgrade-publish.json" \
-    || ! grep -Eq '"binary_published"[[:space:]]*:[[:space:]]*true' \
-      "$TEMP_ROOT/upgrade-publish.json"; then
-    fail_install "upgrade publish did not confirm the published binary"
-  fi
-  BINARY_PUBLISHED="1"
-  run_adapter_sync
-  run_audit_repair post-publish "$INSTALLED_BINARY"
-  run_current_workspace_health
-  run_debug_capsule_export
-  printf '%s\n' \
-    "AOPMem $PRODUCT_VERSION updated. doctor=ok verify=ok task_start=ok observability=ok full_backup=$FULL_BACKUP_ROOT binary_backup=$BACKUP_PATH upgrade_backup=${UPGRADE_BACKUP_ROOT:-none}"
-else
-  prepare_publish_files
-  publish_verified_binary
-  run_fresh_init
-  run_fresh_adapter_seed
-  run_current_workspace_health
-  run_debug_capsule_export
-  printf '%s\n' \
-    "AOPMem $PRODUCT_VERSION installed. doctor=ok verify=ok task_start=ok observability=ok"
-fi
+main "$@"
