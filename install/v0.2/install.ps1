@@ -14,7 +14,7 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = "Stop"
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
-$script:ProductVersion = "0.2.0-rc7"
+$script:ProductVersion = "0.2.0-rc8"
 $script:OldReleaseLabel = "0.1.0-rc3"
 $script:KnownSourceHashes = @{
     "aopmem 0.1.0" =
@@ -865,8 +865,8 @@ function Assert-NoActiveAopmemProcesses {
 
 function Backup-AopmemHome {
     $stamp = [DateTime]::UtcNow.ToString("yyyyMMddTHHmmssZ")
-    # Adoption accepts an RC7-named direct sibling only.  This producer is
-    # intentionally before download so an old binary need not know RC7 CLI.
+    # Safety Backup is durable evidence only. Normal RC8 recovery never adopts
+    # this PowerShell-created full-home backup.
     $backupParent = Split-Path -Parent $script:AopmemHome
     Assert-SafeDirectory -LiteralPath $backupParent -Label "durable backup parent"
     if ($null -eq (Get-ExistingPathItem -LiteralPath $backupParent)) {
@@ -888,8 +888,7 @@ function Backup-AopmemHome {
         -Label "durable backup root"
     [IO.Directory]::CreateDirectory($script:FullBackupRoot) | Out-Null
     $script:FullBackupHome = $script:FullBackupRoot
-    # Reject every reparse/non-regular source before copying. The bounds match
-    # the RC7 recovery adopter.
+    # Reject every reparse/non-regular source before copying.
     $script:SourcePreflightEntries = 0
     function Assert-SourceTreeNoFollow {
         param([string]$Directory, [int]$Depth)
@@ -1095,13 +1094,6 @@ function Invoke-StagedJson {
     return $result
 }
 
-function Invoke-UpgradeAdopt {
-    Write-TestTrace -EventName "upgrade.backup.adopt"
-    $null = Invoke-StagedJson -Context "upgrade backup adopt" -Arguments @(
-        "upgrade", "backup", "--adopt", $script:FullBackupRoot,
-        "--manifest-sha256", $script:FullBackupManifestSha256, "--json")
-}
-
 function Invoke-UpgradeStage {
     Write-TestTrace -EventName "upgrade.stage"
     $null = Invoke-StagedJson -Context "upgrade stage" -Arguments @(
@@ -1116,6 +1108,31 @@ function Invoke-StagedPlatformCheck {
     Write-TestTrace -EventName "platform.check.staged"
     $null = Invoke-StagedJson -Context "staged platform check" -Arguments @(
         "platform", "check", "--json")
+}
+
+function Invoke-UpgradeRecoveryInspect {
+    Write-TestTrace -EventName "upgrade.recovery.inspect"
+    $inspect = Invoke-StagedJson -Context "upgrade recovery inspect" -Arguments @(
+        "upgrade", "recovery", "inspect", "--json")
+    if ([bool]$inspect.data.apply_started -and
+        -not [bool]$inspect.data.can_resume_publish) {
+        [Console]::Error.WriteLine("AOPMem recovery inspect blocking JSON report:")
+        [Console]::Error.WriteLine($script:LastAopmemJsonText)
+        Throw-InstallError (
+            "upgrade recovery has apply-started evidence; automatic fresh run is blocked")
+    }
+}
+
+function Invoke-UpgradeRecoveryBackup {
+    Write-TestTrace -EventName "upgrade.backup.fresh"
+    $backup = Invoke-StagedJson -Context "upgrade backup fresh" -Arguments @(
+        "upgrade", "backup", "--all-workspaces", "--json")
+    $backupRoot = Get-OptionalJsonProperty `
+        -Object $backup.data -Name "recovery_backup_root"
+    if ([string]::IsNullOrWhiteSpace([string]$backupRoot)) {
+        Throw-InstallError "upgrade backup did not report recovery backup root"
+    }
+    $script:UpgradeBackupRoot = [string]$backupRoot
 }
 
 function Invoke-AuditRepair {
@@ -1334,7 +1351,7 @@ function Invoke-CurrentWorkspaceHealth {
         Throw-InstallError "verify did not report clean state"
     }
     Write-TestTrace -EventName "task.start.smoke"
-    $taskStart = "RC7 installer task-start smoke" | & $script:InstalledBinary `
+    $taskStart = "RC8 installer task-start smoke" | & $script:InstalledBinary `
         task start --query-stdin --json
     $taskExit = $LASTEXITCODE
     try {
@@ -1529,9 +1546,10 @@ try {
     Write-TestTrace -EventName "binary.version.verified"
 
     if ($script:Mode -eq "update") {
-        Invoke-UpgradeAdopt
-        Invoke-UpgradeStage
         Invoke-StagedPlatformCheck
+        Invoke-UpgradeRecoveryInspect
+        Invoke-UpgradeRecoveryBackup
+        Invoke-UpgradeStage
         Invoke-AuditRepair -Phase "staged" -Executable $script:DownloadedBinary
         Invoke-UpgradePrepare
         Invoke-UpgradePlan

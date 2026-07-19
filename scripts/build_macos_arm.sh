@@ -26,6 +26,7 @@ fi
 mkdir -p "$repo_root/dist"
 cp "$built_bin" "$dist_bin"
 chmod 755 "$dist_bin"
+codesign --force --sign - "$dist_bin"
 
 file "$dist_bin"
 vtool -show-build "$dist_bin" | awk '

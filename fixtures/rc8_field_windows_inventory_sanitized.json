@@ -1,0 +1,82 @@
+{
+  "fixture": "rc8_field_windows_inventory_sanitized",
+  "source": "sanitized from AOPMEM_WINDOWS_FORENSIC_EVIDENCE_20260719-135119",
+  "host": {
+    "os": "Windows 11 Enterprise x64 build 22631",
+    "powershell": "5.1.22621.7376",
+    "admin": false,
+    "long_paths_enabled": 0
+  },
+  "live_home": "C:\\Users\\USER\\.aopmem",
+  "workspaces": [
+    "project-alpha-00000000",
+    "project-beta-11111111"
+  ],
+  "orphan_safety_backup": {
+    "name_pattern": "aopmem-home-backup-v0.2.0-rc7-*",
+    "manifest_entries": 1219,
+    "manifest_sha256": "BD9F2764939FC6A546FC0036A6F405EC6F96CC8A0E65EE737D4F7C4E5B70630E",
+    "recovery_journal_present": false
+  },
+  "extra_live_limited": {
+    "count": 250,
+    "classes": {
+      "mutation_lock": 1,
+      "sqlite_wal": 1,
+      "sqlite_shm": 1,
+      "tools": 37,
+      "runtimes": 2,
+      "venv": 207,
+      "other": 1
+    }
+  },
+  "paths": [
+    {
+      "relative_path": "workspaces\\project-beta-11111111\\.mutation.lock",
+      "class": "product_ephemeral",
+      "rc8_policy": "exclude_copy_and_manifest"
+    },
+    {
+      "relative_path": "workspaces\\project-beta-11111111\\aopmem.sqlite",
+      "class": "sqlite_database",
+      "rc8_policy": "copy_with_sqlite_online_backup"
+    },
+    {
+      "relative_path": "workspaces\\project-beta-11111111\\aopmem.sqlite-wal",
+      "class": "sqlite_ephemeral_sidecar",
+      "rc8_policy": "exclude_copy_and_manifest"
+    },
+    {
+      "relative_path": "workspaces\\project-beta-11111111\\aopmem.sqlite-shm",
+      "class": "sqlite_ephemeral_sidecar",
+      "rc8_policy": "exclude_copy_and_manifest"
+    },
+    {
+      "relative_path": "workspaces\\project-beta-11111111\\.pending-snapshot",
+      "class": "persistent_audit_evidence",
+      "rc8_policy": "include"
+    },
+    {
+      "relative_path": "workspaces\\project-beta-11111111\\tools\\tool-a\\tool.json",
+      "class": "persistent_tool_contract",
+      "rc8_policy": "include"
+    },
+    {
+      "relative_path": "workspaces\\project-beta-11111111\\runtimes\\reader\\.venv\\Lib\\site-packages\\pip\\_vendor\\urllib3\\contrib\\_securetransport\\__pycache__",
+      "class": "persistent_runtime_long_path",
+      "rc8_policy": "include_with_long_path_safe_io"
+    },
+    {
+      "relative_path": "workspaces\\project-beta-11111111\\secrets\\local-config.redacted",
+      "class": "persistent_secret_container",
+      "rc8_policy": "include_bytes_without_logging_contents"
+    }
+  ],
+  "forbidden_values": [
+    "real_user_name",
+    "real_repo_name",
+    "proxy_uri",
+    "credential",
+    "secret_content"
+  ]
+}

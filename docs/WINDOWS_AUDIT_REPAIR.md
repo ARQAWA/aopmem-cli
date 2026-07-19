@@ -1,11 +1,15 @@
 # Windows audit repair
 
-Canonical contract and usage: [AUDIT_REPAIR.md](AUDIT_REPAIR.md).
+Canonical contract: [AUDIT_REPAIR.md](AUDIT_REPAIR.md).
 
-RC7 audit repair uses the shared Atomic Publish V2 boundary. The temporary
-writer is flushed and closed before a short source-validation reopen; every
-validation reader closes before Windows publication. A failed staged platform
-check stops the updater before audit repair or any data change.
+In RC8, audit repair runs only after:
 
-Native Windows RC7 runtime remains `PENDING_DOGFOOD`. macOS local behavioral
-proof and a PE cross-build do not claim native Windows PASS.
+```text
+platform check
+→ recovery inspect
+→ fresh Upgrade Recovery Backup
+→ upgrade stage
+```
+
+A failed platform check, recovery inspection, or backup stops before audit
+repair and before data mutation.

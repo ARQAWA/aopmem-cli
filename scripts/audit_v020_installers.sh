@@ -74,7 +74,7 @@ write_new_stub() {
     printf '%s\n' 'fi'
     printf '%s\n' 'case "$*" in'
     printf '%s\n' '  "--version")'
-    printf '%s\n' '    printf "%s\n" "aopmem 0.2.0-rc7"'
+    printf '%s\n' '    printf "%s\n" "aopmem 0.2.0-rc8"'
     printf '%s\n' '    ;;'
     printf '%s\n' '  "upgrade prepare --all-workspaces --json")'
     printf '%s\n' '    if [ "${AOPMEM_STUB_PREPARE_FAIL:-0}" = "1" ]; then'
@@ -83,12 +83,15 @@ write_new_stub() {
     printf '%s\n' '    fi'
     printf '%s\n' '    printf "%s\n" '\''{"ok":true,"data":{"success":true,"writes_performed":true}}'\'''
     printf '%s\n' '    ;;'
-    printf '%s\n' '  "upgrade backup --adopt "*)'
-    printf '%s\n' '    printf "%s\n" '\''{"ok":true,"data":{"journal_phase":"backup_complete"}}'\'''
+    printf '%s\n' '  "upgrade recovery inspect --json")'
+    printf '%s\n' '    printf "%s\n" '\''{"ok":true,"data":{"classification":"CLEAN_NO_EVIDENCE","apply_started":false,"can_start_fresh":true,"can_resume_publish":false}}'\'''
+    printf '%s\n' '    ;;'
+    printf '%s\n' '  "upgrade backup --all-workspaces --json")'
+    printf '%s\n' '    printf "%s\n" '\''{"ok":true,"data":{"journal_phase":"backup_complete","recovery_backup_root":"/fixture/upgrade-recovery-backup"}}'\'''
     printf '%s\n' '    ;;'
     printf '%s\n' '  "upgrade stage --artifact "*)'
-    printf '%s\n' '    cp "$0" "$AOPMEM_HOME/bin/.aopmem-v0.2.0-rc7.staged"'
-    printf '%s\n' '    chmod 755 "$AOPMEM_HOME/bin/.aopmem-v0.2.0-rc7.staged"'
+    printf '%s\n' '    cp "$0" "$AOPMEM_HOME/bin/.aopmem-v0.2.0-rc8.staged"'
+    printf '%s\n' '    chmod 755 "$AOPMEM_HOME/bin/.aopmem-v0.2.0-rc8.staged"'
     printf '%s\n' '    printf "%s\n" '\''{"ok":true,"data":{"journal_phase":"staged_verified"}}'\'''
     printf '%s\n' '    ;;'
     printf '%s\n' '  "platform check --json")'
@@ -269,7 +272,9 @@ run_static_audit() {
   assert_contains "$MAC_INSTALLER" 'upgrade plan --all-workspaces --json'
   assert_contains "$MAC_INSTALLER" 'upgrade prepare --all-workspaces --json'
   assert_contains "$MAC_INSTALLER" 'upgrade apply --all-workspaces --json --approved "\+\+\+"'
-  assert_contains "$MAC_INSTALLER" 'upgrade backup --adopt'
+  assert_contains "$MAC_INSTALLER" 'upgrade recovery inspect --json'
+  assert_contains "$MAC_INSTALLER" 'upgrade backup --all-workspaces --json'
+  assert_not_contains "$MAC_INSTALLER" 'upgrade backup --adopt'
   assert_contains "$MAC_INSTALLER" 'upgrade stage --artifact'
   assert_contains "$MAC_INSTALLER" 'platform check --json'
   assert_contains "$MAC_INSTALLER" 'upgrade publish --json'
@@ -301,7 +306,9 @@ run_static_audit() {
   assert_contains "$WINDOWS_INSTALLER" 'parsedBase\.Query'
   assert_contains "$WINDOWS_INSTALLER" 'parsedBase\.Fragment'
   assert_contains "$WINDOWS_INSTALLER" 'Get-FileHash'
-  assert_contains "$WINDOWS_INSTALLER" 'Invoke-UpgradeAdopt'
+  assert_contains "$WINDOWS_INSTALLER" 'Invoke-UpgradeRecoveryInspect'
+  assert_contains "$WINDOWS_INSTALLER" 'Invoke-UpgradeRecoveryBackup'
+  assert_not_contains "$WINDOWS_INSTALLER" 'Invoke-UpgradeAdopt'
   assert_contains "$WINDOWS_INSTALLER" 'Invoke-UpgradeStage'
   assert_contains "$WINDOWS_INSTALLER" 'Invoke-StagedPlatformCheck'
   assert_contains "$WINDOWS_INSTALLER" 'upgrade", "publish", "--json"'
@@ -316,6 +323,8 @@ run_static_audit() {
   assert_contains "$WINDOWS_INSTALLER" 'IsReparsePoint'
   assert_contains "$WINDOWS_INSTALLER" 'upgrade", "plan", "--all-workspaces", "--json"'
   assert_contains "$WINDOWS_INSTALLER" 'upgrade", "prepare", "--all-workspaces", "--json"'
+  assert_contains "$WINDOWS_INSTALLER" '"upgrade", "recovery", "inspect", "--json"'
+  assert_contains "$WINDOWS_INSTALLER" '"upgrade", "backup", "--all-workspaces", "--json"'
   assert_contains "$WINDOWS_INSTALLER" '"upgrade", "apply", "--all-workspaces", "--json", "--approved", "\+\+\+"'
   assert_contains "$WINDOWS_INSTALLER" 'adapter", "sync", "--file"'
   assert_contains "$WINDOWS_INSTALLER" 'failure JSON report'
@@ -444,10 +453,13 @@ test_update_success() {
   assert_trace_order "$TRACE_PATH" "backup.created" "backup.home.created"
   assert_trace_order "$TRACE_PATH" "backup.home.created" "asset.download.started"
   assert_trace_order "$TRACE_PATH" "asset.download.started" "sha256.verified"
-  assert_trace_order "$TRACE_PATH" "sha256.verified" "upgrade.backup.adopt"
-  assert_trace_order "$TRACE_PATH" "upgrade.backup.adopt" "upgrade.stage"
-  assert_trace_order "$TRACE_PATH" "upgrade.stage" "platform.check.staged"
-  assert_trace_order "$TRACE_PATH" "platform.check.staged" "audit.repair.staged"
+  assert_trace_order "$TRACE_PATH" "sha256.verified" "binary.version.verified"
+  assert_trace_order "$TRACE_PATH" "binary.version.verified" "platform.check.staged"
+  assert_trace_order "$TRACE_PATH" "platform.check.staged" "upgrade.recovery.inspect"
+  assert_trace_order "$TRACE_PATH" "upgrade.recovery.inspect" "upgrade.backup.fresh"
+  assert_trace_order "$TRACE_PATH" "upgrade.backup.fresh" "upgrade.stage"
+  assert_trace_order "$TRACE_PATH" "upgrade.stage" "audit.repair.staged"
+  assert_not_contains "$TRACE_PATH" '^upgrade\.backup\.adopt$'
   assert_trace_order "$TRACE_PATH" "audit.repair.staged" "upgrade.prepare"
   assert_trace_order "$TRACE_PATH" "upgrade.prepare" "upgrade.plan"
   assert_trace_order "$TRACE_PATH" "upgrade.plan" "upgrade.apply"
@@ -461,7 +473,7 @@ test_update_success() {
   assert_trace_order "$TRACE_PATH" "observe.status" "observe.report"
   backup=$(find "$AOPMEM_HOME_PATH/bin" -name 'aopmem.backup-v0.1.0-*' -print -quit)
   assert_file "$backup"
-  full_backup=$(find "$CASE_ROOT" -path '*/aopmem-home-backup-v0.2.0-rc7-*/bin/aopmem' -print -quit)
+  full_backup=$(find "$CASE_ROOT" -path '*/aopmem-home-backup-v0.2.0-rc8-*/bin/aopmem' -print -quit)
   assert_file "$full_backup"
   assert_equal \
     "$(shasum -a 256 "$full_backup" | awk '{ print $1 }')" \
@@ -471,7 +483,7 @@ test_update_success() {
   actual=$(shasum -a 256 "$AOPMEM_HOME_PATH/bin/aopmem" | awk '{ print $1 }')
   assert_equal "$actual" "$expected" "published update hash"
   assert_temp_clean "$TEMP_PARENT"
-  retained=$(find "$AOPMEM_HOME_PATH/bin" -name '.aopmem-v0.2.0-rc7.staged' -print -quit)
+  retained=$(find "$AOPMEM_HOME_PATH/bin" -name '.aopmem-v0.2.0-rc8.staged' -print -quit)
   assert_file "$retained"
   pass
 }
@@ -589,10 +601,10 @@ EOF
   pass
 }
 
-test_real_rc7_adopts_installer_manifest() {
+test_safety_backup_is_not_normal_adopt_source() {
   [ -x "$REPO_ROOT/target/debug/aopmem" ] ||
-    fail "real debug rc7 binary is required for manifest adoption proof"
-  setup_case real-adopt-manifest
+    fail "real debug rc8 binary is required for safety backup rejection proof"
+  setup_case safety-backup-adopt-rejected
   install_old_binary
   mkdir -p "$AOPMEM_HOME_PATH/a"
   mkdir -p "$AOPMEM_HOME_PATH/nested"
@@ -620,10 +632,13 @@ test_real_rc7_adopts_installer_manifest() {
   ) || fail "installer-owned manifest producer failed"
   assert_file "$backup/MANIFEST.sha256"
   manifest_hash=$(shasum -a 256 "$backup/MANIFEST.sha256" | awk '{ print tolower($1) }')
-  AOPMEM_HOME="$AOPMEM_HOME_PATH" "$REPO_ROOT/target/debug/aopmem" \
-    upgrade backup --adopt "$backup" --manifest-sha256 "$manifest_hash" --json \
-    > "$CASE_ROOT/adopt.json" || fail "real rc7 rejected installer manifest"
-  assert_contains "$CASE_ROOT/adopt.json" '"ok":true'
+  if AOPMEM_HOME="$AOPMEM_HOME_PATH" "$REPO_ROOT/target/debug/aopmem" \
+      upgrade backup --adopt "$backup" --manifest-sha256 "$manifest_hash" --json \
+      > "$CASE_ROOT/adopt.json"; then
+    fail "RC8 accepted installer Safety Backup as a normal adopt source"
+  fi
+  assert_contains "$CASE_ROOT/adopt.json" '"ok":false'
+  assert_contains "$CASE_ROOT/adopt.json" 'RECOVERY_LEGACY_EVIDENCE_UNSUPPORTED'
   assert_contains "$backup/MANIFEST.sha256" '^a/child$'
   assert_contains "$backup/MANIFEST.sha256" '^a\.txt$'
   assert_contains "$backup/MANIFEST.sha256" '^nested/MANIFEST\.sha256$'
@@ -751,7 +766,7 @@ test_path_rejections() {
   expect_failure
   assert_contains "$STDERR_PATH" 'AOPMem home contains a symbolic link'
   backup_root=$(find "$CASE_ROOT" -maxdepth 1 \
-    -name 'aopmem-home-backup-v0.2.0-rc7-*' -print -quit)
+    -name 'aopmem-home-backup-v0.2.0-rc8-*' -print -quit)
   [ -z "$backup_root" ] || fail "unsafe source was copied before rejection"
   assert_not_contains "$TRACE_PATH" '^asset\.download\.started$'
 
@@ -768,7 +783,7 @@ test_path_rejections() {
   expect_failure
   assert_contains "$STDERR_PATH" 'maximum backup directory depth'
   backup_root=$(find "$CASE_ROOT" -maxdepth 1 \
-    -name 'aopmem-home-backup-v0.2.0-rc7-*' -print -quit)
+    -name 'aopmem-home-backup-v0.2.0-rc8-*' -print -quit)
   [ -z "$backup_root" ] || fail "over-depth source was copied before rejection"
   assert_not_contains "$TRACE_PATH" '^asset\.download\.started$'
 
@@ -787,7 +802,7 @@ test_pre_apply_failures_leave_binary_unchanged() {
   assert_not_contains "$TRACE_PATH" '^upgrade\.apply$'
   assert_contains "$TRACE_PATH" '^rollback\.unchanged$'
   assert_contains "$STDERR_PATH" 'code=FIXTURE_PREPARE_FAILED'
-  full_backup=$(find "$CASE_ROOT" -path '*/aopmem-home-backup-v0.2.0-rc7-*/bin/aopmem' -print -quit)
+  full_backup=$(find "$CASE_ROOT" -path '*/aopmem-home-backup-v0.2.0-rc8-*/bin/aopmem' -print -quit)
   assert_file "$full_backup"
   assert_temp_clean "$TEMP_PARENT"
 
@@ -803,7 +818,7 @@ test_pre_apply_failures_leave_binary_unchanged() {
   assert_contains "$TRACE_PATH" '^rollback\.unchanged$'
   backup=$(find "$AOPMEM_HOME_PATH/bin" -name 'aopmem.backup-*' -print -quit)
   assert_file "$backup"
-  retained=$(find "$AOPMEM_HOME_PATH/bin" -name '.aopmem-v0.2.0-rc7.staged' -print -quit)
+  retained=$(find "$AOPMEM_HOME_PATH/bin" -name '.aopmem-v0.2.0-rc8.staged' -print -quit)
   assert_file "$retained"
   assert_temp_clean "$TEMP_PARENT"
 
@@ -835,7 +850,7 @@ test_post_apply_failures_preserve_recovery() {
   expect_failure AOPMEM_STUB_APPLY_FAIL=1
   new_inode=$(ls -di "$AOPMEM_HOME_PATH/bin/aopmem" | awk '{ print $1 }')
   assert_equal "$new_inode" "$old_inode" "apply failure inode"
-  recovery=$(find "$AOPMEM_HOME_PATH/bin" -name '.aopmem-v0.2.0-rc7.staged' -print -quit)
+  recovery=$(find "$AOPMEM_HOME_PATH/bin" -name '.aopmem-v0.2.0-rc8.staged' -print -quit)
   assert_file "$recovery"
   assert_contains "$STDERR_PATH" 'do not run the v0.1 binary'
   assert_contains "$STDERR_PATH" 'recovery binary preserved at'
@@ -856,7 +871,7 @@ test_post_apply_failures_preserve_recovery() {
   expect_failure AOPMEM_INSTALL_TEST_FAIL_AT=publish
   new_inode=$(ls -di "$AOPMEM_HOME_PATH/bin/aopmem" | awk '{ print $1 }')
   assert_equal "$new_inode" "$old_inode" "publish failure inode"
-  recovery=$(find "$AOPMEM_HOME_PATH/bin" -name '.aopmem-v0.2.0-rc7.staged' -print -quit)
+  recovery=$(find "$AOPMEM_HOME_PATH/bin" -name '.aopmem-v0.2.0-rc8.staged' -print -quit)
   assert_file "$recovery"
   expected=$(shasum -a 256 "$ASSET_DIR/aopmem-darwin-arm64" | awk '{ print $1 }')
   actual=$(shasum -a 256 "$recovery" | awk '{ print $1 }')
@@ -901,7 +916,7 @@ test_update_success
 test_tagged_source_acceptance_and_hash_binding
 test_supported_version_matrix
 test_exact_active_adapter_pairs
-test_real_rc7_adopts_installer_manifest
+test_safety_backup_is_not_normal_adopt_source
 test_checksum_failures
 test_asset_base_uri_rejections
 test_path_rejections

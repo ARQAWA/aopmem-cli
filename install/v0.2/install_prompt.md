@@ -1,294 +1,131 @@
-# AOPMem v0.2.0-rc7 install prompt
+# AOPMem v0.2.0-rc8 install prompt
 
-Use this prompt to install AOPMem v0.2.0-rc7 for the current project.
-It supports a fresh install and an update from compatible AOPMem v0.1.0
-SQLite workspaces.
+Use this prompt to install or update AOPMem v0.2.0-rc8.
+Run only the official installer and release assets.
 
 ````text
-You are installing AOPMem v0.2.0-rc7 for the user's current project.
+You are installing AOPMem v0.2.0-rc8 for the current project.
 
-Complete the whole safe flow without pausing between normal steps.
-Do not run Codex CLI during installation.
-Do not open another terminal.
-Do not ask technical questions which can be detected.
-Do not ask for a final confirmation.
+Do not use WSL, Docker, Cargo, Rustup, source builds, Codex CLI, or another
+terminal. Do not use administrator rights. Do not create a repo-local
+`.aopmem`.
 
-The caller must explicitly provide both `AOPMEM_ACTIVE_ADAPTER` and
-`AOPMEM_ACTIVE_INSTRUCTION_FILE`. Accept only these exact pairs:
+Set exactly one active adapter pair before running the installer:
 
 - `codex` / `AGENTS.md`
 - `claude` / `CLAUDE.md`
 - `cursor` / `.cursor/rules/aopmem.mdc`
 - `copilot` / `.github/copilot-instructions.md`
 
-Do not guess a default adapter. Stop before any change if the pair is absent
-or mismatched. This is an install gate, not an onboarding question.
-
 Supported hosts:
 
-- macOS Apple Silicon: Darwin arm64.
-- Windows 11 x64: native Windows PowerShell 5.1.
+- macOS Apple Silicon: `Darwin arm64`
+- Windows 11 x64: native Windows PowerShell 5.1
 
-Fail with an exact unsupported-platform error on every other host.
-Do not use Linux, WSL, Windows ARM, Intel Mac, or Windows PowerShell 7.
+Trusted RC8 release assets:
 
-Forbidden install methods:
+| Asset | Size | SHA-256 |
+| --- | ---: | --- |
+| `aopmem-darwin-arm64` | 9825376 | `84eb321603b0bb2dd8dc961946abebe56ccaa79cb1c170f6bd1fdcf63a8d58ca` |
+| `aopmem-windows-x86_64.exe` | 10740224 | `b27fe37afbb33c91a906a40f6667599ef6d33f40b179fb6e7e5300d578ad6839` |
+| `SHA256SUMS` | 178 | `2d2042c066699da4373dc5a8ca796a144cf4274e2e220d71f8f4ff6a4efd2421` |
+| `install.ps1` | 69643 | `346162c857febaffd8384549f475a9175145e250b0e63f423c0158aef11c5938` |
+| `install.sh` | 40627 | `139d26d278c0c10f5e213deefc8ed5e799f7eb619845e4b8374aea9ec475a4db` |
 
-- administrator rights;
-- WSL;
-- cargo or rustup;
-- git clone;
-- source builds;
-- Node.js;
-- Codex CLI;
-- external terminals.
+Windows bootstrap with proxy:
 
-Windows bootstrap:
+```powershell
+$proxyUri = [Uri]"<PROXY_URI>"
+$tempRoot = Join-Path ([IO.Path]::GetTempPath()) `
+    ("aopmem-rc8-bootstrap-" + [Guid]::NewGuid().ToString("N"))
+$null = New-Item -ItemType Directory -Path $tempRoot -ErrorAction Stop
+$installer = Join-Path $tempRoot "install.ps1"
+Invoke-WebRequest `
+    -Uri "https://raw.githubusercontent.com/ARQAWA/aopmem-cli/v0.2.0-rc8/install/v0.2/install.ps1" `
+    -OutFile $installer `
+    -UseBasicParsing `
+    -Proxy $proxyUri `
+    -ProxyUseDefaultCredentials `
+    -TimeoutSec 900 `
+    -ErrorAction Stop
+$installerHash = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash
+if ($installerHash -ine "346162c857febaffd8384549f475a9175145e250b0e63f423c0158aef11c5938") {
+    throw "INSTALLER_SHA256_MISMATCH"
+}
+& "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
+    -NoProfile `
+    -ExecutionPolicy Bypass `
+    -File $installer `
+    -AssetBaseUri "https://github.com/ARQAWA/aopmem-cli/releases/download/v0.2.0-rc8" `
+    -ProxyUri $proxyUri `
+    -ProxyUseDefaultCredentials
+```
 
-- Use native Windows PowerShell 5.1 in the current console.
-- Download the immutable RC7 installer from:
-  `https://raw.githubusercontent.com/ARQAWA/aopmem-cli/v0.2.0-rc7/install/v0.2/install.ps1`
-- Create a new unique private directory below `%TEMP%`; never download the
-  installer into the repository.
-- Behind a proxy, use normal `Invoke-WebRequest` redirect behavior with
-  `-Proxy <PROXY_URI>` and optional `-ProxyUseDefaultCredentials`. Do not use
-  `-MaximumRedirection 0`:
+Direct Windows bootstrap:
 
-  ```powershell
-  $proxyUri = [Uri]"<PROXY_URI>"
-  $tempRoot = Join-Path ([IO.Path]::GetTempPath()) `
-      ("aopmem-rc7-bootstrap-" + [Guid]::NewGuid().ToString("N"))
-  $null = New-Item -ItemType Directory -Path $tempRoot -ErrorAction Stop
-  $installer = Join-Path $tempRoot "install.ps1"
-  Invoke-WebRequest `
-      -Uri "https://raw.githubusercontent.com/ARQAWA/aopmem-cli/v0.2.0-rc7/install/v0.2/install.ps1" `
-      -OutFile $installer `
-      -UseBasicParsing `
-      -Proxy $proxyUri `
-      -ProxyUseDefaultCredentials `
-      -TimeoutSec 900 `
-      -ErrorAction Stop
-  $installerHash = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash
-  if ($installerHash -ine "c306d664664852b4f60bf834fa2f5d798312e8646ef9921eae9d14007bd5c949") {
-      throw "INSTALLER_SHA256_MISMATCH"
-  }
-  & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
-      -NoProfile `
-      -ExecutionPolicy Bypass `
-      -File $installer `
-      -AssetBaseUri "https://github.com/ARQAWA/aopmem-cli/releases/download/v0.2.0-rc7" `
-      -ProxyUri $proxyUri `
-      -ProxyUseDefaultCredentials
-  ```
+```powershell
+$tempRoot = Join-Path ([IO.Path]::GetTempPath()) `
+    ("aopmem-rc8-bootstrap-" + [Guid]::NewGuid().ToString("N"))
+$null = New-Item -ItemType Directory -Path $tempRoot -ErrorAction Stop
+$installer = Join-Path $tempRoot "install.ps1"
+Invoke-WebRequest `
+    -Uri "https://raw.githubusercontent.com/ARQAWA/aopmem-cli/v0.2.0-rc8/install/v0.2/install.ps1" `
+    -OutFile $installer `
+    -UseBasicParsing `
+    -TimeoutSec 900 `
+    -ErrorAction Stop
+$installerHash = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash
+if ($installerHash -ine "346162c857febaffd8384549f475a9175145e250b0e63f423c0158aef11c5938") {
+    throw "INSTALLER_SHA256_MISMATCH"
+}
+& "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
+    -NoProfile `
+    -ExecutionPolicy Bypass `
+    -File $installer `
+    -AssetBaseUri "https://github.com/ARQAWA/aopmem-cli/releases/download/v0.2.0-rc8"
+```
 
-- Omit both `-Proxy`/`-ProxyUseDefaultCredentials` from the bootstrap and
-  `-ProxyUri`/`-ProxyUseDefaultCredentials` from the installer invocation
-  when no proxy is configured:
-
-  ```powershell
-  $tempRoot = Join-Path ([IO.Path]::GetTempPath()) `
-      ("aopmem-rc7-bootstrap-" + [Guid]::NewGuid().ToString("N"))
-  $null = New-Item -ItemType Directory -Path $tempRoot -ErrorAction Stop
-  $installer = Join-Path $tempRoot "install.ps1"
-  Invoke-WebRequest `
-      -Uri "https://raw.githubusercontent.com/ARQAWA/aopmem-cli/v0.2.0-rc7/install/v0.2/install.ps1" `
-      -OutFile $installer `
-      -UseBasicParsing `
-      -TimeoutSec 900 `
-      -ErrorAction Stop
-  $installerHash = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash
-  if ($installerHash -ine "c306d664664852b4f60bf834fa2f5d798312e8646ef9921eae9d14007bd5c949") {
-      throw "INSTALLER_SHA256_MISMATCH"
-  }
-  & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
-      -NoProfile `
-      -ExecutionPolicy Bypass `
-      -File $installer `
-      -AssetBaseUri "https://github.com/ARQAWA/aopmem-cli/releases/download/v0.2.0-rc7"
-  ```
-
-Proxy setup is technical environment setup. It is not an onboarding question.
-Never put proxy credentials in a URI, command, log, report, or file.
-
-Release inputs:
-
-- The trusted release context supplies an HTTPS asset base URI.
-- Do not invent, guess, search for, or hard-code a release URL.
-- The base URI must contain no credentials, query, or fragment.
-- Only test mode may inject assets from a local fixture directory.
-- Use exactly these flat release assets:
-  - aopmem-darwin-arm64
-  - aopmem-windows-x86_64.exe
-  - SHA256SUMS
-
-The audited RC7 artifact digests are:
-
-- aopmem-darwin-arm64:
-  8998c88efaa59a9abc4d4ddce01adf67f4b1a47361b01b483053ebe0e3841786
-- aopmem-windows-x86_64.exe:
-  9e957a2b47c7442ab6aff57a8f8d3469b41e158831a55be18218fc239db29ae1
-- SHA256SUMS:
-  89e59fd7eceed6048d1ef0367bd4cccc32cc40ab692713e4224e60c78b36e0bc
-- immutable install.ps1:
-  c306d664664852b4f60bf834fa2f5d798312e8646ef9921eae9d14007bd5c949
-
-Integrity rules:
-
-- Download into a new private temporary directory.
-- Find exactly one SHA256SUMS line whose filename exactly matches the
-  selected flat asset name.
-- Reject a missing, duplicate, malformed, or differently named line.
-- Verify SHA-256 before chmod or any binary execution.
-- Verify the downloaded binary reports exactly:
-  aopmem 0.2.0-rc7
-- Never execute an unverified file.
-
-Path rules:
-
-- macOS home: $HOME/.aopmem
-- Windows home: %USERPROFILE%\.aopmem
-- macOS binary: $HOME/.aopmem/bin/aopmem
-- Windows binary: %USERPROFILE%\.aopmem\bin\aopmem.exe
-- Reject a symlink, junction, reparse point, directory, or other unsafe
-  object where AOPMem home, bin, binary, stage, or recovery file must be.
-- Never create a project-local .aopmem directory.
-
-Select the flow silently:
-
-1. No installed binary means fresh install.
-2. A compatible installed binary reports exactly one of `aopmem 0.1.0`,
-   `aopmem 0.2.0-rc1`, `aopmem 0.2.0-rc2`, `aopmem 0.2.0-rc3`,
-   `aopmem 0.2.0-rc4`, `aopmem 0.2.0-rc5`, or `aopmem 0.2.0-rc6`.
-   Recognize exact published platform hashes for v0.1.0-rc3 and RC1 through
-   RC6. For another compatible RC1-RC6 SHA-256, emit
-   `NONCANONICAL_SOURCE_BINARY`; for another compatible v0.1 SHA-256, emit
-   `NONCANONICAL_V010_BINARY`. Keep the actual version and hash visible,
-   require the durable full backup, and let staged `upgrade prepare` plus
-   `upgrade plan` decide workspace compatibility.
-3. Any other installed version, including RC7 itself, is unsupported. Stop
-   without changing it.
-
-For macOS, use the supplied install/v0.2/install.sh.
-Pass the trusted base through AOPMEM_ASSET_BASE_URI.
-The script must use curl with fail, TLS 1.2, HTTPS-only initial and redirect
-protocols, shasum -a 256, chmod, and private temp files. It must never replace
-the update binary with shell `mv`; only `aopmem upgrade publish --json` may do it.
-
-For Windows, use the supplied install/v0.2/install.ps1.
-Pass the trusted base through -AssetBaseUri or AOPMEM_ASSET_BASE_URI.
-Use native Windows PowerShell 5.1 only.
-Invoke the system Windows PowerShell executable in the same console with
--NoProfile and process-only -ExecutionPolicy Bypass. This does not change
-the user or machine execution policy and must not open a new window.
-The script must configure TLS 1.2 and UTF-8 and use a PowerShell 5.1-compatible
-`System.Net.Http.HttpClient` transport with
-`HttpClientHandler.AllowAutoRedirect=false`. It must process 301, 302, 303,
-307, and 308 as normal responses, validate every redirect as HTTPS-only,
-reject userinfo, loops, and more than 10 hops, stream into a create-new partial
-file, preserve the original network exception, and use `Get-FileHash`.
-It must not use production `Invoke-WebRequest -MaximumRedirection 0` or access
-an absent `Exception.Response` property. It must never call `File.Replace` or
-`File.Move` for the update binary; only `aopmem upgrade publish --json` may do
-it.
+Never put proxy credentials in the URI, logs, files, or final report.
 
 Fresh flow:
 
-1. Verify and stage the new binary.
-2. Publish it atomically in the user-level bin directory.
-3. Run the normal aopmem init flow in the current project.
-4. Let that CLI ask its existing five semantic questions.
-5. Run `aopmem adapter seed --file <selected-active-file> --json` and require
-   `ok=true`. It may write only the explicit selected adapter file.
-6. Run `aopmem doctor --json` and require `ok=true`, `healthy=true`.
-7. Run `aopmem verify --json` and require `ok=true`, `clean=true`.
-8. Run secure-stdin `aopmem task start --query-stdin --json` and require a
-   complete receipt with bundle id and memory revision.
-9. Run `observe status`, `observe report`, and `observe export`.
-10. Print one short final status.
-
-The existing five questions are:
-
-1. Включаем Understand Anything для локального понимания проекта и
-   .understand.docs?
-2. Включаем Codebase Memory MCP для навигации по коду?
-3. Объясни, что это за проект, зачем он нужен и чем мы тут занимаемся.
-4. Какая твоя роль в этом проекте и какая роль у агента?
-5. Какие части проекта рабочие, какие вспомогательные, какие нельзя трогать?
-
-Do not add, remove, reorder, or paraphrase these questions.
+1. Verify `SHA256SUMS` and the selected binary.
+2. Require the binary to report `aopmem 0.2.0-rc8`.
+3. Publish the binary atomically.
+4. Run normal `aopmem init`.
+5. Seed exactly the selected adapter file.
+6. Run `doctor`, `verify`, `task start`, and observability checks.
 
 Update flow:
 
-1. Ask zero onboarding questions.
-2. Require all AOPMem UI and CLI processes to be closed. Do not terminate an
-   unknown process automatically.
-3. Create and verify a durable full backup of AOPMem home plus the old binary.
-   The installer-owned backup is a direct sibling named
-   `aopmem-home-backup-v0.2.0-rc7-*` with deterministic `MANIFEST.sha256`.
-4. Download and verify RC7. Then adopt exactly that unchanged backup:
-   `aopmem upgrade backup --adopt <backup> --manifest-sha256 <digest> --json`.
-5. Retain the verified artifact with `upgrade stage --artifact ... --sha256 ...`.
-6. Run staged `platform check --json`. If it fails, stop before prepare.
-7. Run staged `audit repair --all-workspaces --json`; an already-clean result
-   is an allowed no-op.
-8. Run the staged binary:
-   aopmem upgrade prepare --all-workspaces --json
-9. Require exit code 0, ok=true, and success=true. On failure, do not run
-   plan, apply, or publish.
-10. Immediately run the same staged binary:
-   aopmem upgrade plan --all-workspaces --json
-11. Run no AOPMem DB-read command between prepare and plan. Require ok=true,
-   ready=true, and writes_performed=false.
-12. Then run the same staged binary exactly once:
-   aopmem upgrade apply --all-workspaces --json --approved "+++"
-13. Require exit code 0 and ok=true. Never auto-retry apply.
-14. Only after successful apply run native `aopmem upgrade publish --json`.
-   The installer must not copy, move, or replace the installed binary itself.
-15. Sync exactly one explicit active adapter: `codex`/`claude`/`cursor`/
-   `copilot`, mapped to `AGENTS.md`, `CLAUDE.md`, `.cursor/rules/aopmem.mdc`,
-   or `.github/copilot-instructions.md` respectively. Preserve all other files.
-16. Run post-publish `audit repair --all-workspaces --json`, then
-   `doctor --json`, `verify --json`, secure-stdin `task start --query-stdin --json`,
-   `observe status --json`,
-   `observe report --json`, and `observe export --output <new capsule> --json`.
-   Require ok=true, doctor healthy=true, verify clean=true, and one stable
-   non-empty current workspace key across reports.
-17. Print one short final status and all durable backup paths.
+1. Close active AOPMem processes.
+2. Create installer Safety Backup of the current home.
+3. Download and verify RC8.
+4. Run `platform check --json`.
+5. Run `upgrade recovery inspect --json`.
+6. Run `upgrade backup --all-workspaces --json`.
+7. Run `upgrade stage --artifact <verified-binary> --sha256 <hash> --json`.
+8. Run staged `audit repair --all-workspaces --json` if needed.
+9. Run `upgrade prepare --all-workspaces --json`.
+10. Run `upgrade plan --all-workspaces --json`.
+11. Require `ready=true` and `writes_performed=false`.
+12. Run `upgrade apply --all-workspaces --json --approved "+++"` exactly once.
+13. Run `upgrade publish --json`.
+14. Sync the selected adapter.
+15. Run post-publish audit repair, doctor, verify, task smoke, observability,
+    and debug capsule.
+
+The installer Safety Backup is emergency evidence only. It is never passed to
+normal `upgrade backup --adopt`. Normal RC8 uses a fresh Upgrade Recovery
+Backup made by the verified RC8 binary.
 
 Failure rules:
 
-- Before upgrade apply starts, the installed v0.1 binary must stay
-  byte-for-byte unchanged. Keep its backup.
-- Before upgrade prepare starts, create the durable full backup. Preparation
-  failure must block plan, apply, and publish.
-- After upgrade apply starts, some v0.2 data may already be committed.
-- Never restore or republish v0.1 after that point.
-- On any apply or later failure, keep the recovery journal, retained staged
-  binary, home backup, and all evidence. Follow only the native recovery phase.
-- Tell the user not to run v0.1 after such a failure.
-- Keep every upgrade backup and every workspace.
-- Remove only installer temporary files.
-- Print the exact workspace and error returned by upgrade.
-- Do not continue other workspaces silently after a failure.
-
-Success report:
-
-- version;
-- fresh or updated;
-- doctor=ok;
-- verify=ok;
-- task_start=ok;
-- observability=ok;
-- binary backup path for update.
-- durable full-backup path for update.
-- upgrade-run backup path for update.
-
-Do not push, tag, create a release, or install into any workspace other than
-the user's selected current installation.
+- Before apply starts, the old binary must remain unchanged.
+- After apply starts, never auto-retry apply.
+- Keep every Safety Backup, Upgrade Recovery Backup, journal, JSON report,
+  retained staged binary, and debug capsule.
+- If `upgrade recovery inspect` reports apply-started evidence, stop and
+  preserve evidence.
+- If long path failure occurs, report `RECOVERY_LONG_PATH_FAILURE`.
 ````
-
-Implementation files:
-
-- `install/v0.2/install.sh`
-- `install/v0.2/install.ps1`
-- `scripts/audit_v020_installers.sh`

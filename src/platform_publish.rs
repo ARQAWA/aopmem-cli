@@ -34,7 +34,9 @@ pub(crate) enum PublishStrategy {
     Undetermined,
     WindowsReplaceFileW,
     WindowsMoveFileExW,
+    #[allow(dead_code)]
     UnixRenameAt,
+    #[allow(dead_code)]
     UnixLinkAtUnlinkAt,
 }
 

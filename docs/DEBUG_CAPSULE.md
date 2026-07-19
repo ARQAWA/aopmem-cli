@@ -98,6 +98,12 @@ The capsule does not include:
 - MCP credential sources or notes;
 - environment variables, secrets, tokens, cookies, or authorization headers.
 
+RC8 recovery and installer reports may be referenced only as bounded facts:
+classification, stable error code, phase, retry/apply counters, and sanitized
+evidence roles. Capsules must not embed raw recovery inventories, proxy URI
+values, secret file contents, Safety Backup payloads, or Upgrade Recovery
+Backup payloads.
+
 Review the capsule before sharing it. The export is designed for manual upload
 to ChatGPT or another external analysis tool, but sharing remains a user
 action.

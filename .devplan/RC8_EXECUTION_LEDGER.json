@@ -1,0 +1,14 @@
+{
+  "release": "v0.2.0-rc8",
+  "baseline_tag": "v0.2.0-rc7",
+  "baseline_commit": "d26b20f1c7b714a6199c0cbf34d6084b80b0193d",
+  "external_evidence_root": "/Users/arkadijcukavin/Downloads/AOPMEM_WINDOWS_FORENSIC_EVIDENCE_20260719-135119",
+  "evidence_files_read": 53,
+  "manifest_files_verified": 49,
+  "manifest_verification": "PASS",
+  "normal_installer_adopt_removed": true,
+  "safety_backup_is_adopt_source": false,
+  "recovery_journal_schema_version": 1,
+  "target_version": "0.2.0-rc8",
+  "external_gate": "WAITING_FOR_STANDALONE_PLUS_PLUS_PLUS"
+}

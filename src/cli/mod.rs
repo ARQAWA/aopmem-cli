@@ -1555,11 +1555,21 @@ enum ObserveCommand {
 #[command(rename_all = "kebab-case")]
 enum UpgradeCommand {
     Backup(UpgradeBackupArgs),
+    Recovery {
+        #[command(subcommand)]
+        command: UpgradeRecoveryCommand,
+    },
     Stage(UpgradeStageArgs),
     Prepare(UpgradePlanArgs),
     Plan(UpgradePlanArgs),
     Apply(UpgradePlanArgs),
     Publish,
+}
+
+#[derive(Debug, Subcommand)]
+#[command(rename_all = "kebab-case")]
+enum UpgradeRecoveryCommand {
+    Inspect,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1592,6 +1602,13 @@ struct UpgradePlanArgs {
 
 #[derive(Debug, Args)]
 struct UpgradeBackupArgs {
+    #[arg(
+        long,
+        conflicts_with = "adopt",
+        required_unless_present = "adopt",
+        action = clap::ArgAction::SetTrue
+    )]
+    all_workspaces: bool,
     #[arg(long, requires = "manifest_sha256")]
     adopt: Option<PathBuf>,
     #[arg(long, requires = "adopt")]
@@ -1694,6 +1711,9 @@ fn run_command_with_context(
     if let Command::Upgrade { command } = command {
         return match command {
             UpgradeCommand::Backup(args) => run_upgrade_backup(command_id, args, json),
+            UpgradeCommand::Recovery { command } => match command {
+                UpgradeRecoveryCommand::Inspect => run_upgrade_recovery_inspect(command_id, json),
+            },
             UpgradeCommand::Stage(args) => run_upgrade_stage(command_id, args, json),
             UpgradeCommand::Prepare(args) => run_upgrade_prepare(command_id, args, json),
             UpgradeCommand::Plan(args) => run_upgrade_plan(command_id, args, json),
@@ -2176,11 +2196,31 @@ fn run_upgrade_backup(
         (Some(backup), Some(manifest_sha256)) => {
             upgrade::adopt_home_backup(backup, manifest_sha256)
         }
-        (None, None) => upgrade::backup_home(),
+        (None, None) if args.all_workspaces => upgrade::backup_home(),
+        (None, None) => return print_error(command_id, &CliError::invalid_args(), json_output),
         _ => unreachable!("clap requires both backup adoption arguments"),
     };
     match result {
         Ok(execution) => print_upgrade_recovery_success(command_id, execution, json_output),
+        Err(error) => print_upgrade_recovery_error(command_id, &error, json_output),
+    }
+}
+
+fn run_upgrade_recovery_inspect(command_id: &'static str, json_output: bool) -> ExitCode {
+    match upgrade::inspect_recovery() {
+        Ok(report) => {
+            let data = serde_json::to_value(report)
+                .expect("upgrade recovery inspect serialization should not fail");
+            if json_output {
+                println!(
+                    "{}",
+                    success_envelope_with_meta(command_id, data, OutputMeta::default())
+                );
+            } else {
+                println!("upgrade recovery inspect: ok");
+            }
+            ExitCode::from(EXIT_SUCCESS)
+        }
         Err(error) => print_upgrade_recovery_error(command_id, &error, json_output),
     }
 }
@@ -2310,7 +2350,25 @@ fn upgrade_recovery_error_details(
                 temporary_cleanup_confirmed: details.temporary_cleanup_confirmed,
             }),
         ),
-        _ => None,
+        _ => Some(OutputErrorDetails::UpgradeRecoveryState(
+            UpgradeRecoveryStateDetails::from_error(recovery_error),
+        )),
+    }
+}
+
+fn recovery_error_exact_code(error: &upgrade::RecoveryError) -> &'static str {
+    match error {
+        upgrade::RecoveryError::StalePreApplyEvidence => "RECOVERY_STALE_PRE_APPLY_EVIDENCE",
+        upgrade::RecoveryError::JournalMalformedPreApply => "RECOVERY_JOURNAL_MALFORMED_PRE_APPLY",
+        upgrade::RecoveryError::PhaseGapPreApply => "RECOVERY_PHASE_GAP_PRE_APPLY",
+        upgrade::RecoveryError::ApplyStarted => "RECOVERY_APPLY_STARTED",
+        upgrade::RecoveryError::BackupManifestMismatch => "RECOVERY_BACKUP_MANIFEST_MISMATCH",
+        upgrade::RecoveryError::BackupIncomplete => "RECOVERY_BACKUP_INCOMPLETE",
+        upgrade::RecoveryError::HomeChangedDuringBackup => "RECOVERY_HOME_CHANGED_DURING_BACKUP",
+        upgrade::RecoveryError::ApplyOutcomeUnknown => "RECOVERY_APPLY_OUTCOME_UNKNOWN",
+        upgrade::RecoveryError::LongPathFailure => "RECOVERY_LONG_PATH_FAILURE",
+        upgrade::RecoveryError::InvalidJournal => "RECOVERY_LEGACY_EVIDENCE_UNSUPPORTED",
+        _ => "UPGRADE_RECOVERY_FAILED",
     }
 }
 
@@ -8691,6 +8749,9 @@ fn command_id(command: &Command) -> &'static str {
         },
         Command::Upgrade { command } => match command {
             UpgradeCommand::Backup(_) => "upgrade_backup",
+            UpgradeCommand::Recovery { command } => match command {
+                UpgradeRecoveryCommand::Inspect => "upgrade_recovery_inspect",
+            },
             UpgradeCommand::Stage(_) => "upgrade_stage",
             UpgradeCommand::Prepare(_) => "upgrade_prepare",
             UpgradeCommand::Plan(_) => "upgrade_plan",
@@ -9692,6 +9753,86 @@ enum OutputErrorDetails {
     PlatformCheck(platform_check::PlatformCheckFailure),
     DebugCapsulePublish(observability_export::DebugCapsulePublishFailure),
     UpgradeRecoveryPublish(UpgradeRecoveryPublishDetails),
+    UpgradeRecoveryState(UpgradeRecoveryStateDetails),
+}
+
+#[derive(Debug, Serialize)]
+struct UpgradeRecoveryStateDetails {
+    exact_code: &'static str,
+    classification: &'static str,
+    run_id: Option<String>,
+    phase: Option<String>,
+    apply_started: bool,
+    apply_attempts: u32,
+    binary_replaced: bool,
+    safe_to_start_fresh: bool,
+    safe_to_resume_publish: bool,
+    blocking_evidence: Vec<String>,
+    preserved_paths: Vec<String>,
+    recommended_action: &'static str,
+}
+
+impl UpgradeRecoveryStateDetails {
+    fn from_error(error: &upgrade::RecoveryError) -> Self {
+        let exact_code = recovery_error_exact_code(error);
+        let (
+            classification,
+            apply_started,
+            safe_to_start_fresh,
+            safe_to_resume_publish,
+            recommended_action,
+        ) = match error {
+            upgrade::RecoveryError::StalePreApplyEvidence => (
+                "STALE_PRE_APPLY_BACKUP",
+                false,
+                true,
+                false,
+                "preserve stale evidence and start fresh recovery backup",
+            ),
+            upgrade::RecoveryError::JournalMalformedPreApply => (
+                "MALFORMED_PRE_APPLY_JOURNAL",
+                false,
+                true,
+                false,
+                "preserve malformed pre-apply journal and start fresh recovery backup",
+            ),
+            upgrade::RecoveryError::PhaseGapPreApply => (
+                "PRE_APPLY_PHASE_GAP",
+                false,
+                true,
+                false,
+                "preserve pre-apply phase gap and start fresh recovery backup",
+            ),
+            upgrade::RecoveryError::ApplyStarted | upgrade::RecoveryError::ApplyOutcomeUnknown => (
+                "APPLY_STARTED",
+                true,
+                false,
+                false,
+                "stop; preserve evidence; do not retry apply automatically",
+            ),
+            _ => (
+                "UNKNOWN_APPLY_OUTCOME",
+                false,
+                false,
+                false,
+                "preserve every backup and checkpoint; inspect recovery evidence",
+            ),
+        };
+        Self {
+            exact_code,
+            classification,
+            run_id: None,
+            phase: None,
+            apply_started,
+            apply_attempts: 0,
+            binary_replaced: false,
+            safe_to_start_fresh,
+            safe_to_resume_publish,
+            blocking_evidence: Vec::new(),
+            preserved_paths: Vec::new(),
+            recommended_action,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -11580,7 +11721,7 @@ mod tests {
         assert_eq!(envelope["data"], serde_json::json!({}));
         assert_eq!(envelope["warnings"], serde_json::json!([]));
         assert_eq!(envelope["errors"], serde_json::json!([]));
-        assert_eq!(envelope["meta"]["version"], "0.2.0-rc7");
+        assert_eq!(envelope["meta"]["version"], "0.2.0-rc8");
     }
 
     #[test]
@@ -11602,7 +11743,7 @@ mod tests {
             envelope["errors"][0]["message"],
             "command is not implemented yet: node_create"
         );
-        assert_eq!(envelope["meta"]["version"], "0.2.0-rc7");
+        assert_eq!(envelope["meta"]["version"], "0.2.0-rc8");
     }
 
     #[test]
@@ -11782,7 +11923,7 @@ mod tests {
             envelope["errors"][0]["fix_hint"],
             "run `aopmem --help` to see supported commands"
         );
-        assert_eq!(envelope["meta"]["version"], "0.2.0-rc7");
+        assert_eq!(envelope["meta"]["version"], "0.2.0-rc8");
     }
 
     #[test]
@@ -21242,9 +21383,14 @@ mod tests {
             &"0".repeat(64),
         ])
         .is_err());
-        let backup = Cli::try_parse_from(["aopmem", "upgrade", "backup", "--json"])
-            .expect("upgrade backup should parse");
+        assert!(Cli::try_parse_from(["aopmem", "upgrade", "backup", "--json"]).is_err());
+        let backup =
+            Cli::try_parse_from(["aopmem", "upgrade", "backup", "--all-workspaces", "--json"])
+                .expect("upgrade backup should parse");
         assert_eq!(command_id(&backup.command), "upgrade_backup");
+        let inspect = Cli::try_parse_from(["aopmem", "upgrade", "recovery", "inspect", "--json"])
+            .expect("upgrade recovery inspect should parse");
+        assert_eq!(command_id(&inspect.command), "upgrade_recovery_inspect");
         let adopted = Cli::try_parse_from([
             "aopmem",
             "upgrade",
@@ -21360,6 +21506,8 @@ mod tests {
     fn upgrade_publish_durability_warning_is_top_level_json() {
         let execution = upgrade::RecoveryExecution {
             journal_phase: upgrade::RecoveryPhase::Published,
+            run_id: "test-run".to_string(),
+            recovery_backup_root: "/tmp/aopmem-recovery".to_string(),
             resumed: true,
             apply_invoked: false,
             binary_published: true,

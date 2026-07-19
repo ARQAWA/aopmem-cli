@@ -28,8 +28,9 @@ pub use prepare::{
     UpgradePrepareReport,
 };
 pub use recovery::{
-    adopt_home_backup, apply_or_resume, backup_home, publish_applied, stage_binary, RecoveryError,
-    RecoveryExecution, RecoveryPhase, RecoveryPublishFailure,
+    adopt_home_backup, apply_or_resume, backup_home, inspect_recovery, publish_applied,
+    stage_binary, RecoveryError, RecoveryExecution, RecoveryInspectReport, RecoveryPhase,
+    RecoveryPublishFailure,
 };
 
 const PLAN_SCOPE: &str = "all_workspaces";

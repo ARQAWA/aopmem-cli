@@ -1,16 +1,19 @@
-//! Durable, resumable boundary around the RC7 database upgrade.
+//! Durable, resumable boundary around the RC8 database upgrade.
 //!
 //! The journal deliberately records state outside `AOPMEM_HOME`: a failed
 //! home must never take its only recovery evidence with it.  It is a small
 //! state machine, not a second migration engine.  The existing transactional
 //! migration remains the only code that changes workspace databases.
 
-use std::collections::BTreeSet;
-use std::ffi::OsStr;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use rusqlite::backup::{Backup, StepResult};
+use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -26,9 +29,15 @@ use super::{
     apply_core_all_workspaces, plan_all_workspaces, UpgradeApplyExecution, UpgradePlanReport,
 };
 
-const JOURNAL_PREFIX: &str = "aopmem-upgrade-recovery-v0.2.0-rc7-";
-const STAGED_BINARY_NAME: &str = ".aopmem-v0.2.0-rc7.staged";
-const BACKUP_PREFIX: &str = "aopmem-home-backup-v0.2.0-rc7-";
+const JOURNAL_SCHEMA_VERSION: u32 = 1;
+const TARGET_VERSION: &str = env!("CARGO_PKG_VERSION");
+const JOURNAL_PREFIX: &str = "aopmem-upgrade-recovery-v1-";
+const LEGACY_RC7_JOURNAL_PREFIX: &str = "aopmem-upgrade-recovery-v0.2.0-rc7-";
+const STAGED_BINARY_NAME: &str = concat!(".aopmem-v", env!("CARGO_PKG_VERSION"), ".staged");
+const RETAIN_TEMP_NAME: &str = concat!(".aopmem-v", env!("CARGO_PKG_VERSION"), ".retain.tmp");
+const PUBLISH_TEMP_NAME: &str = concat!(".aopmem-v", env!("CARGO_PKG_VERSION"), ".publish.tmp");
+const BACKUP_PREFIX: &str = "aopmem-upgrade-recovery-v1-r8-";
+const LEGACY_RC7_BACKUP_PREFIX: &str = "aopmem-home-backup-v0.2.0-rc7-";
 const MAX_BACKUP_ENTRIES: usize = 100_000;
 const MAX_BACKUP_DIRECTORY_ENTRIES: usize = 10_000;
 const MAX_BACKUP_DEPTH: usize = 128;
@@ -37,6 +46,9 @@ const MAX_JOURNAL_BYTES: usize = 1024 * 1024;
 const HOME_MANIFEST_TEMP_PREFIX: &str = ".aopmem-home-manifest-";
 const MAX_RECOVERY_PARENT_SCAN_ENTRIES: usize = 100_000;
 const MAX_RECOVERY_TEMP_REMOVALS: usize = 128;
+const RECOVERY_SQLITE_BACKUP_PAGE_BATCH: i32 = 256;
+const RECOVERY_SQLITE_BUSY_PAUSE: std::time::Duration = std::time::Duration::from_millis(10);
+const RECOVERY_SQLITE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RecoveryFaultPoint {
@@ -88,7 +100,7 @@ impl RecoveryHooks for LiveRecoveryHooks {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecoveryPhase {
     BackupComplete,
@@ -101,14 +113,23 @@ pub enum RecoveryPhase {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecoveryJournal {
-    pub version: String,
+    pub journal_schema_version: u32,
+    pub target_version: String,
+    pub source_version: String,
+    pub run_id: String,
     pub phase: RecoveryPhase,
     pub home_identity: String,
-    pub home_backup_dir: String,
+    pub safety_backup_root: Option<String>,
+    pub recovery_backup_root: String,
+    pub source_manifest_sha256: String,
     pub backup_manifest_sha256: String,
     pub staged_binary_name: String,
     pub staged_sha256: String,
     pub planned_workspaces: Vec<PlannedWorkspaceIdentity>,
+    pub apply_attempts: u32,
+    pub binary_replaced: bool,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,9 +141,94 @@ pub struct PlannedWorkspaceIdentity {
     pub schema_before: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum RecoveryClassification {
+    CleanNoEvidence,
+    StalePreApplyBackup,
+    MalformedPreApplyJournal,
+    PreApplyPhaseGap,
+    ActivePreApplyRun,
+    ApplyStarted,
+    AppliedNotPublished,
+    PublishedComplete,
+    UnknownApplyOutcome,
+    LegacyHistoricalEvidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RecoveryEvidenceRun {
+    pub run_id: String,
+    pub journal_schema_version: Option<u32>,
+    pub target_version: Option<String>,
+    pub phase: Option<RecoveryPhase>,
+    pub backup_root: Option<String>,
+    pub apply_started: bool,
+    pub apply_attempts: u32,
+    pub binary_replaced: bool,
+    pub evidence_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RecoveryInspectReport {
+    pub classification: RecoveryClassification,
+    pub active_run: Option<RecoveryEvidenceRun>,
+    pub historical_runs: Vec<RecoveryEvidenceRun>,
+    pub blocking_evidence: Vec<String>,
+    pub ignored_pre_apply_evidence: Vec<String>,
+    pub apply_started: bool,
+    pub can_start_fresh: bool,
+    pub can_resume_publish: bool,
+    pub recommended_action: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InventoryManifest {
+    pub inventory_policy_version: u32,
+    pub run_id: String,
+    pub source_home_identity: String,
+    pub created_at: String,
+    pub entries: Vec<InventoryEntry>,
+    pub excluded_counts_by_reason: BTreeMap<String, usize>,
+    pub workspace_identities: Vec<WorkspaceManifestIdentity>,
+    pub source_binary_version: String,
+    pub source_binary_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InventoryEntry {
+    pub relative_path: String,
+    pub entry_kind: InventoryEntryKind,
+    pub size: u64,
+    pub sha256: String,
+    pub persistence: PersistenceClass,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InventoryEntryKind {
+    RegularFile,
+    SqliteDatabase,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersistenceClass {
+    Persistent,
+    Ephemeral,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceManifestIdentity {
+    pub workspace_key: String,
+    pub root_identity: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RecoveryExecution {
     pub journal_phase: RecoveryPhase,
+    pub run_id: String,
+    pub recovery_backup_root: String,
     pub resumed: bool,
     pub apply_invoked: bool,
     pub binary_published: bool,
@@ -130,6 +236,13 @@ pub struct RecoveryExecution {
     pub home_backup_retained: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub apply: Option<super::UpgradeApplyReport>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CreatedRecoveryBackup {
+    path: PathBuf,
+    source_manifest_sha256: String,
+    backup_manifest_sha256: String,
 }
 
 #[derive(Debug, Error)]
@@ -142,6 +255,26 @@ pub enum RecoveryError {
     InvalidStagedBinary,
     #[error("recovery journal is invalid")]
     InvalidJournal,
+    #[error("RECOVERY_STALE_PRE_APPLY_EVIDENCE: stale pre-apply recovery evidence was preserved; start a fresh verified recovery backup")]
+    StalePreApplyEvidence,
+    #[error("RECOVERY_JOURNAL_MALFORMED_PRE_APPLY: malformed pre-apply recovery journal was preserved; start a fresh verified recovery backup")]
+    JournalMalformedPreApply,
+    #[error("RECOVERY_PHASE_GAP_PRE_APPLY: pre-apply recovery phase gap was preserved; start a fresh verified recovery backup")]
+    PhaseGapPreApply,
+    #[error(
+        "RECOVERY_APPLY_STARTED: apply-started recovery evidence exists; do not start a fresh run"
+    )]
+    ApplyStarted,
+    #[error("RECOVERY_BACKUP_MANIFEST_MISMATCH: backup manifest does not match expected recovery evidence")]
+    BackupManifestMismatch,
+    #[error("RECOVERY_BACKUP_INCOMPLETE: recovery backup is incomplete")]
+    BackupIncomplete,
+    #[error(
+        "RECOVERY_HOME_CHANGED_DURING_BACKUP: persistent home inventory changed during backup"
+    )]
+    HomeChangedDuringBackup,
+    #[error("RECOVERY_LONG_PATH_FAILURE: long-path-safe recovery filesystem operation failed")]
+    LongPathFailure,
     #[error("recovery journal cannot resume an unfinished apply; preserve evidence and start a new verified run")]
     ApplyOutcomeUnknown,
     #[error("workspace set or identity changed after the frozen upgrade plan")]
@@ -183,7 +316,13 @@ pub fn backup_home() -> Result<RecoveryExecution, RecoveryError> {
     backup_home_with_hooks(&mut LiveRecoveryHooks)
 }
 
-/// Adopts an installer-created sibling full-home backup after the RC7 binary
+pub fn inspect_recovery() -> Result<RecoveryInspectReport, RecoveryError> {
+    let paths = storage::resolve_paths()?;
+    let parent = paths.home().parent().ok_or(RecoveryError::InvalidJournal)?;
+    inspect_recovery_parent(parent)
+}
+
+/// Adopts an installer-created sibling full-home backup after the RC8 binary
 /// has been downloaded. The backup must exactly match the still-unchanged
 /// current home and the caller-provided manifest digest.
 pub fn adopt_home_backup(
@@ -195,7 +334,7 @@ pub fn adopt_home_backup(
     cleanup_recovery_temporaries(parent)?;
     if let Some(journal) = read_journal(parent)? {
         validate_journal(&journal, paths.home(), parent)?;
-        if journal.home_backup_dir
+        if journal.recovery_backup_root
             != backup
                 .file_name()
                 .ok_or(RecoveryError::InvalidJournal)?
@@ -208,15 +347,28 @@ pub fn adopt_home_backup(
     }
     let (backup_name, manifest_sha256) =
         validate_adoptable_backup(paths.home(), parent, backup, expected_manifest_sha256)?;
+    let now = timestamp_utc()?;
     let journal = RecoveryJournal {
-        version: "v0.2.0-rc7".to_string(),
+        journal_schema_version: JOURNAL_SCHEMA_VERSION,
+        target_version: TARGET_VERSION.to_string(),
+        source_version: current_binary_version(paths.bin()),
+        run_id: backup_name
+            .strip_prefix(BACKUP_PREFIX)
+            .unwrap_or(&backup_name)
+            .to_string(),
         phase: RecoveryPhase::BackupComplete,
         home_identity: home_identity(paths.home())?,
-        home_backup_dir: backup_name,
+        safety_backup_root: None,
+        recovery_backup_root: backup_name,
+        source_manifest_sha256: manifest_sha256.clone(),
         backup_manifest_sha256: manifest_sha256,
         staged_binary_name: String::new(),
         staged_sha256: String::new(),
         planned_workspaces: Vec::new(),
+        apply_attempts: 0,
+        binary_replaced: false,
+        created_at: now.clone(),
+        updated_at: now,
     };
     write_journal(parent, paths.home(), &journal)?;
     Ok(execution(
@@ -230,36 +382,65 @@ fn backup_home_with_hooks(
     let paths = storage::resolve_paths()?;
     let parent = paths.home().parent().ok_or(RecoveryError::InvalidJournal)?;
     cleanup_recovery_temporaries(parent)?;
-    let (journal, resumed) = match read_journal(parent)? {
-        Some(journal) => {
+    let journal_read = read_journal(parent);
+    let (journal, resumed) = match journal_read {
+        Ok(Some(journal)) => {
             validate_journal(&journal, paths.home(), parent)?;
             (journal, true)
         }
-        None => {
-            let backup = create_full_home_backup(paths.home(), parent)?;
-            hooks.checkpoint(RecoveryFaultPoint::BackupEffect)?;
-            let manifest_sha256 = sha256_regular_nofollow(&backup.join("MANIFEST.sha256"))?;
-            let journal = RecoveryJournal {
-                version: "v0.2.0-rc7".to_string(),
-                phase: RecoveryPhase::BackupComplete,
-                home_identity: home_identity(paths.home())?,
-                home_backup_dir: backup
-                    .file_name()
-                    .ok_or(RecoveryError::InvalidJournal)?
-                    .to_string_lossy()
-                    .into_owned(),
-                backup_manifest_sha256: manifest_sha256,
-                staged_binary_name: String::new(),
-                staged_sha256: String::new(),
-                planned_workspaces: Vec::new(),
-            };
-            write_journal(parent, paths.home(), &journal)?;
-            (journal, false)
+        Err(error) => {
+            let inspect = inspect_recovery_parent(parent)?;
+            if !inspect.can_start_fresh {
+                return Err(error);
+            }
+            create_new_backup_journal(paths.home(), paths.bin(), parent, hooks)?
         }
+        Ok(None) => create_new_backup_journal(paths.home(), paths.bin(), parent, hooks)?,
     };
     Ok(execution(
         &journal, parent, resumed, false, false, false, None,
     ))
+}
+
+fn create_new_backup_journal(
+    home: &Path,
+    bin: &Path,
+    parent: &Path,
+    hooks: &mut impl RecoveryHooks,
+) -> Result<(RecoveryJournal, bool), RecoveryError> {
+    let backup = create_full_home_backup_record(home, parent)?;
+    hooks.checkpoint(RecoveryFaultPoint::BackupEffect)?;
+    let backup_name = backup
+        .path
+        .file_name()
+        .ok_or(RecoveryError::InvalidJournal)?
+        .to_string_lossy()
+        .into_owned();
+    let now = timestamp_utc()?;
+    let journal = RecoveryJournal {
+        journal_schema_version: JOURNAL_SCHEMA_VERSION,
+        target_version: TARGET_VERSION.to_string(),
+        source_version: current_binary_version(bin),
+        run_id: backup_name
+            .strip_prefix(BACKUP_PREFIX)
+            .unwrap_or(&backup_name)
+            .to_string(),
+        phase: RecoveryPhase::BackupComplete,
+        home_identity: home_identity(home)?,
+        safety_backup_root: None,
+        recovery_backup_root: backup_name,
+        source_manifest_sha256: backup.source_manifest_sha256,
+        backup_manifest_sha256: backup.backup_manifest_sha256,
+        staged_binary_name: String::new(),
+        staged_sha256: String::new(),
+        planned_workspaces: Vec::new(),
+        apply_attempts: 0,
+        binary_replaced: false,
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    write_journal(parent, home, &journal)?;
+    Ok((journal, false))
 }
 
 /// Retains a verified artifact after the pre-download backup boundary.
@@ -286,6 +467,7 @@ fn stage_binary_with_hooks(
             .into_owned();
         journal.staged_sha256 = expected.to_string();
         journal.phase = RecoveryPhase::StagedVerified;
+        touch_journal(&mut journal)?;
         write_journal(&parent, paths.home(), &journal)?;
     } else {
         if journal.staged_sha256 != expected {
@@ -320,6 +502,7 @@ fn apply_or_resume_with_hooks(
         journal.planned_workspaces = capture_planned_workspaces(&paths, &plan)?;
         hooks.checkpoint(RecoveryFaultPoint::PrepareEffect)?;
         journal.phase = RecoveryPhase::Prepared;
+        touch_journal(&mut journal)?;
         write_journal(&parent, paths.home(), &journal)?;
     }
 
@@ -334,6 +517,7 @@ fn apply_or_resume_with_hooks(
     if journal.phase == RecoveryPhase::ApplyStarted {
         if all_planned_workspaces_applied(&paths, &journal.planned_workspaces)? {
             journal.phase = RecoveryPhase::Applied;
+            touch_journal(&mut journal)?;
             write_journal(&parent, paths.home(), &journal)?;
         } else {
             // A transition was durable but the database result was not. Never
@@ -347,6 +531,11 @@ fn apply_or_resume_with_hooks(
     if journal.phase == RecoveryPhase::Prepared {
         validate_frozen_plan(&paths, &journal.planned_workspaces, false)?;
         journal.phase = RecoveryPhase::ApplyStarted;
+        journal.apply_attempts = journal
+            .apply_attempts
+            .checked_add(1)
+            .ok_or(RecoveryError::InvalidJournal)?;
+        touch_journal(&mut journal)?;
         write_journal(&parent, paths.home(), &journal)?;
         hooks.checkpoint(RecoveryFaultPoint::ApplyStarted)?;
         apply_invoked = true;
@@ -360,6 +549,7 @@ fn apply_or_resume_with_hooks(
         apply = Some(execution.report);
         hooks.checkpoint(RecoveryFaultPoint::CoreEffect)?;
         journal.phase = RecoveryPhase::Applied;
+        touch_journal(&mut journal)?;
         write_journal(&parent, paths.home(), &journal)?;
     }
     Ok(execution(
@@ -393,6 +583,8 @@ fn publish_applied_with_hooks(
         )?;
         hooks.checkpoint(RecoveryFaultPoint::PublishEffect)?;
         journal.phase = RecoveryPhase::Published;
+        journal.binary_replaced = true;
+        touch_journal(&mut journal)?;
         write_journal(&parent, paths.home(), &journal)?;
         true
     } else if journal.phase == RecoveryPhase::Published {
@@ -445,11 +637,16 @@ fn execution(
 ) -> RecoveryExecution {
     RecoveryExecution {
         journal_phase: journal.phase,
+        run_id: journal.run_id.clone(),
+        recovery_backup_root: parent
+            .join(&journal.recovery_backup_root)
+            .to_string_lossy()
+            .into_owned(),
         resumed,
         apply_invoked,
         binary_published,
         durability_warning,
-        home_backup_retained: parent.join(&journal.home_backup_dir).is_dir(),
+        home_backup_retained: parent.join(&journal.recovery_backup_root).is_dir(),
         apply,
     }
 }
@@ -599,6 +796,264 @@ fn uuid_temporary_name(name: &str, prefix: &str) -> bool {
     })
 }
 
+fn inspect_recovery_parent(parent: &Path) -> Result<RecoveryInspectReport, RecoveryError> {
+    let root = AnchoredDir::open_workspace(parent, None)?;
+    let mut current_journal_paths = Vec::new();
+    let mut legacy_paths = Vec::new();
+    let mut orphan_backups = Vec::new();
+    let mut current_phases = BTreeSet::new();
+    let mut legacy_apply_started = false;
+
+    for name in directory_names(&root)? {
+        let name_text = name.to_string_lossy().into_owned();
+        let path_text = super::display_path(&parent.join(&name));
+        if name_text.starts_with(BACKUP_PREFIX) || name_text.starts_with(LEGACY_RC7_BACKUP_PREFIX) {
+            orphan_backups.push(path_text);
+        } else if name_text.starts_with(JOURNAL_PREFIX) {
+            if let Some(phase) = phase_from_journal_name(&name_text) {
+                current_phases.insert(phase);
+            }
+            current_journal_paths.push(path_text);
+        } else if name_text.starts_with(LEGACY_RC7_JOURNAL_PREFIX) {
+            if name_text.contains("04-apply-started")
+                || name_text.contains("05-applied")
+                || name_text.contains("06-published")
+            {
+                legacy_apply_started = true;
+            }
+            legacy_paths.push(path_text);
+        }
+    }
+    current_journal_paths.sort();
+    legacy_paths.sort();
+    orphan_backups.sort();
+
+    let read = read_journal(parent);
+    match read {
+        Ok(Some(journal)) => {
+            let evidence = RecoveryEvidenceRun {
+                run_id: journal.run_id.clone(),
+                journal_schema_version: Some(journal.journal_schema_version),
+                target_version: Some(journal.target_version.clone()),
+                phase: Some(journal.phase),
+                backup_root: Some(super::display_path(
+                    &parent.join(&journal.recovery_backup_root),
+                )),
+                apply_started: matches!(
+                    journal.phase,
+                    RecoveryPhase::ApplyStarted | RecoveryPhase::Applied | RecoveryPhase::Published
+                ),
+                apply_attempts: journal.apply_attempts,
+                binary_replaced: journal.binary_replaced,
+                evidence_paths: current_journal_paths.clone(),
+            };
+            let classification = match journal.phase {
+                RecoveryPhase::BackupComplete
+                | RecoveryPhase::StagedVerified
+                | RecoveryPhase::Prepared => RecoveryClassification::ActivePreApplyRun,
+                RecoveryPhase::ApplyStarted => RecoveryClassification::ApplyStarted,
+                RecoveryPhase::Applied => RecoveryClassification::AppliedNotPublished,
+                RecoveryPhase::Published => RecoveryClassification::PublishedComplete,
+            };
+            let can_start_fresh = matches!(
+                classification,
+                RecoveryClassification::PublishedComplete
+                    | RecoveryClassification::LegacyHistoricalEvidence
+            );
+            let can_resume_publish = classification == RecoveryClassification::AppliedNotPublished;
+            let blocking_evidence = if matches!(
+                classification,
+                RecoveryClassification::ApplyStarted
+                    | RecoveryClassification::AppliedNotPublished
+                    | RecoveryClassification::ActivePreApplyRun
+            ) {
+                current_journal_paths.clone()
+            } else {
+                Vec::new()
+            };
+            Ok(RecoveryInspectReport {
+                classification,
+                active_run: Some(evidence),
+                historical_runs: legacy_evidence_runs(&legacy_paths, &orphan_backups),
+                blocking_evidence,
+                ignored_pre_apply_evidence: Vec::new(),
+                apply_started: matches!(
+                    journal.phase,
+                    RecoveryPhase::ApplyStarted | RecoveryPhase::Applied | RecoveryPhase::Published
+                ),
+                can_start_fresh,
+                can_resume_publish,
+                recommended_action: recommended_action(classification).to_string(),
+            })
+        }
+        Ok(None) => {
+            let classification = if legacy_apply_started {
+                RecoveryClassification::ApplyStarted
+            } else if orphan_backups.is_empty() && legacy_paths.is_empty() {
+                RecoveryClassification::CleanNoEvidence
+            } else {
+                RecoveryClassification::StalePreApplyBackup
+            };
+            let can_start_fresh = !legacy_apply_started;
+            Ok(RecoveryInspectReport {
+                classification,
+                active_run: None,
+                historical_runs: legacy_evidence_runs(&legacy_paths, &orphan_backups),
+                blocking_evidence: if legacy_apply_started {
+                    legacy_paths.clone()
+                } else {
+                    Vec::new()
+                },
+                ignored_pre_apply_evidence: if legacy_apply_started {
+                    Vec::new()
+                } else {
+                    orphan_backups.clone()
+                },
+                apply_started: legacy_apply_started,
+                can_start_fresh,
+                can_resume_publish: false,
+                recommended_action: recommended_action(classification).to_string(),
+            })
+        }
+        Err(_) => {
+            let has_apply_started = legacy_apply_started
+                || current_phases.contains(&RecoveryPhase::ApplyStarted)
+                || current_phases.contains(&RecoveryPhase::Applied)
+                || current_phases.contains(&RecoveryPhase::Published);
+            let has_gap = has_phase_gap(&current_phases);
+            let classification = if has_apply_started {
+                RecoveryClassification::ApplyStarted
+            } else if has_gap {
+                RecoveryClassification::PreApplyPhaseGap
+            } else {
+                RecoveryClassification::MalformedPreApplyJournal
+            };
+            let can_start_fresh = !has_apply_started;
+            Ok(RecoveryInspectReport {
+                classification,
+                active_run: None,
+                historical_runs: legacy_evidence_runs(&legacy_paths, &orphan_backups),
+                blocking_evidence: if has_apply_started {
+                    current_journal_paths
+                        .iter()
+                        .chain(legacy_paths.iter())
+                        .cloned()
+                        .collect()
+                } else {
+                    Vec::new()
+                },
+                ignored_pre_apply_evidence: if can_start_fresh {
+                    current_journal_paths.clone()
+                } else {
+                    Vec::new()
+                },
+                apply_started: has_apply_started,
+                can_start_fresh,
+                can_resume_publish: false,
+                recommended_action: recommended_action(classification).to_string(),
+            })
+        }
+    }
+}
+
+fn legacy_evidence_runs(
+    legacy_paths: &[String],
+    orphan_backups: &[String],
+) -> Vec<RecoveryEvidenceRun> {
+    let mut runs = Vec::new();
+    if !legacy_paths.is_empty() {
+        runs.push(RecoveryEvidenceRun {
+            run_id: "legacy-rc7-journals".to_string(),
+            journal_schema_version: None,
+            target_version: Some("0.2.0-rc7".to_string()),
+            phase: None,
+            backup_root: None,
+            apply_started: legacy_paths.iter().any(|path| {
+                path.contains("04-apply-started")
+                    || path.contains("05-applied")
+                    || path.contains("06-published")
+            }),
+            apply_attempts: 0,
+            binary_replaced: false,
+            evidence_paths: legacy_paths.to_vec(),
+        });
+    }
+    for (index, backup) in orphan_backups.iter().enumerate() {
+        runs.push(RecoveryEvidenceRun {
+            run_id: format!("orphan-backup-{index}"),
+            journal_schema_version: None,
+            target_version: None,
+            phase: None,
+            backup_root: Some(backup.clone()),
+            apply_started: false,
+            apply_attempts: 0,
+            binary_replaced: false,
+            evidence_paths: vec![backup.clone()],
+        });
+    }
+    runs
+}
+
+fn recommended_action(classification: RecoveryClassification) -> &'static str {
+    match classification {
+        RecoveryClassification::CleanNoEvidence => "start fresh recovery backup",
+        RecoveryClassification::StalePreApplyBackup => {
+            "preserve stale evidence and start fresh recovery backup"
+        }
+        RecoveryClassification::MalformedPreApplyJournal => {
+            "preserve malformed pre-apply journal and start fresh recovery backup"
+        }
+        RecoveryClassification::PreApplyPhaseGap => {
+            "preserve pre-apply phase gap and start fresh recovery backup"
+        }
+        RecoveryClassification::ActivePreApplyRun => "continue current pre-apply recovery run",
+        RecoveryClassification::ApplyStarted => {
+            "stop; preserve evidence; do not retry apply automatically"
+        }
+        RecoveryClassification::AppliedNotPublished => "resume publish only",
+        RecoveryClassification::PublishedComplete => "treat as historical evidence",
+        RecoveryClassification::UnknownApplyOutcome => {
+            "stop; preserve evidence; manual recovery review required"
+        }
+        RecoveryClassification::LegacyHistoricalEvidence => "treat as historical evidence",
+    }
+}
+
+fn phase_from_journal_name(name: &str) -> Option<RecoveryPhase> {
+    [
+        RecoveryPhase::BackupComplete,
+        RecoveryPhase::StagedVerified,
+        RecoveryPhase::Prepared,
+        RecoveryPhase::ApplyStarted,
+        RecoveryPhase::Applied,
+        RecoveryPhase::Published,
+    ]
+    .into_iter()
+    .find(|phase| journal_name(*phase) == name)
+}
+
+fn has_phase_gap(phases: &BTreeSet<RecoveryPhase>) -> bool {
+    let ordered = [
+        RecoveryPhase::BackupComplete,
+        RecoveryPhase::StagedVerified,
+        RecoveryPhase::Prepared,
+        RecoveryPhase::ApplyStarted,
+        RecoveryPhase::Applied,
+        RecoveryPhase::Published,
+    ];
+    let mut missing_seen = false;
+    for phase in ordered {
+        if phases.contains(&phase) {
+            if missing_seen {
+                return true;
+            }
+        } else {
+            missing_seen = true;
+        }
+    }
+    false
+}
+
 fn read_journal(parent: &Path) -> Result<Option<RecoveryJournal>, RecoveryError> {
     let root = AnchoredDir::open_workspace(parent, None)?;
     let phases = [
@@ -694,6 +1149,11 @@ fn serialize_journal(journal: &RecoveryJournal) -> Result<Vec<u8>, RecoveryError
     Ok(bytes)
 }
 
+fn touch_journal(journal: &mut RecoveryJournal) -> Result<(), RecoveryError> {
+    journal.updated_at = timestamp_utc()?;
+    Ok(())
+}
+
 fn journal_name(phase: RecoveryPhase) -> String {
     let (rank, name) = match phase {
         RecoveryPhase::BackupComplete => (1, "backup-complete"),
@@ -719,9 +1179,14 @@ const fn previous_phase(phase: RecoveryPhase) -> Option<RecoveryPhase> {
 
 fn valid_journal_transition(previous: &RecoveryJournal, current: &RecoveryJournal) -> bool {
     previous_phase(current.phase) == Some(previous.phase)
-        && previous.version == current.version
+        && previous.journal_schema_version == current.journal_schema_version
+        && previous.target_version == current.target_version
+        && previous.source_version == current.source_version
+        && previous.run_id == current.run_id
         && previous.home_identity == current.home_identity
-        && previous.home_backup_dir == current.home_backup_dir
+        && previous.safety_backup_root == current.safety_backup_root
+        && previous.recovery_backup_root == current.recovery_backup_root
+        && previous.source_manifest_sha256 == current.source_manifest_sha256
         && previous.backup_manifest_sha256 == current.backup_manifest_sha256
         && (previous.phase == RecoveryPhase::BackupComplete
             || (previous.staged_binary_name == current.staged_binary_name
@@ -730,6 +1195,8 @@ fn valid_journal_transition(previous: &RecoveryJournal, current: &RecoveryJourna
             previous.phase,
             RecoveryPhase::BackupComplete | RecoveryPhase::StagedVerified
         ) || previous.planned_workspaces == current.planned_workspaces)
+        && current.apply_attempts >= previous.apply_attempts
+        && (!previous.binary_replaced || current.binary_replaced)
 }
 
 fn retain_staged_binary(
@@ -749,7 +1216,7 @@ fn retain_staged_binary(
     }
     fs::create_dir_all(bin)?;
     let root = AnchoredDir::open_workspace(bin, None)?;
-    let temporary = ".aopmem-v0.2.0-rc7.retain.tmp";
+    let temporary = RETAIN_TEMP_NAME;
     if root
         .open_regular_optional_os(OsStr::new(temporary))?
         .is_some()
@@ -826,7 +1293,7 @@ fn publish_staged_binary_with(
     } else {
         "aopmem"
     };
-    let temporary = ".aopmem-v0.2.0-rc7.publish.tmp";
+    let temporary = PUBLISH_TEMP_NAME;
     if root
         .open_regular_optional_os(OsStr::new(temporary))?
         .is_some()
@@ -900,37 +1367,537 @@ fn verify_installed_binary(expected_sha256: &str, bin: &Path) -> Result<(), Reco
     ensure_executable(&bin.join(destination))
 }
 
+#[cfg(test)]
 fn create_full_home_backup(home: &Path, parent: &Path) -> Result<PathBuf, RecoveryError> {
-    let backup_name = format!("{BACKUP_PREFIX}{}", uuid::Uuid::new_v4());
+    Ok(create_full_home_backup_record(home, parent)?.path)
+}
+
+fn create_full_home_backup_record(
+    home: &Path,
+    parent: &Path,
+) -> Result<CreatedRecoveryBackup, RecoveryError> {
+    let mut last_error = None;
+    for attempt in 0..2 {
+        match create_full_home_backup_once(home, parent) {
+            Ok(backup) => return Ok(backup),
+            Err(RecoveryError::HomeChangedDuringBackup) if attempt == 0 => {
+                last_error = Some(RecoveryError::HomeChangedDuringBackup);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.unwrap_or(RecoveryError::HomeChangedDuringBackup))
+}
+
+fn create_full_home_backup_once(
+    home: &Path,
+    parent: &Path,
+) -> Result<CreatedRecoveryBackup, RecoveryError> {
+    let run_id = short_run_id()?;
+    let created_at = timestamp_utc()?;
+    let source_binary_sha256 = installed_binary_sha256(home)?;
+    let source = build_inventory(
+        home,
+        &run_id,
+        &created_at,
+        &current_binary_version(&home.join("bin")),
+        source_binary_sha256.clone(),
+        false,
+    )?;
+    let source_digest = inventory_digest(&source)?;
+    let backup_name = format!("{BACKUP_PREFIX}{run_id}");
     let parent_root = AnchoredDir::open_workspace(parent, None)?;
     let backup_root = parent_root.create_new_child_dir_os(OsStr::new(&backup_name))?;
-    let source_root = AnchoredDir::open_workspace(home, None)?;
-    let temporary = ".MANIFEST.sha256.tmp";
-    let mut file = backup_root.create_new_regular(temporary)?;
-    let mut entries = 0_usize;
-    copy_tree_anchored(
-        &source_root,
-        &backup_root,
-        Path::new(""),
-        &mut file,
-        &mut entries,
-        0,
+    copy_inventory(home, &parent.join(&backup_name), &source.entries)?;
+
+    let after = build_inventory(
+        home,
+        &run_id,
+        &created_at,
+        &current_binary_version(&home.join("bin")),
+        source_binary_sha256,
+        false,
     )?;
-    file.sync_all()?;
+    if !inventory_entries_equivalent(&source.entries, &after.entries, false) {
+        return Err(RecoveryError::HomeChangedDuringBackup);
+    }
+
+    let backup_inventory = build_inventory(
+        &parent.join(&backup_name),
+        &run_id,
+        &created_at,
+        &source.source_binary_version,
+        source.source_binary_sha256.clone(),
+        true,
+    )?;
+    if !inventory_entries_equivalent(&source.entries, &backup_inventory.entries, true) {
+        return Err(RecoveryError::BackupIncomplete);
+    }
+
+    write_json_manifest(&backup_root, &backup_inventory, &source_digest)?;
+    write_legacy_manifest(&backup_root)?;
+    let backup_path = parent.join(&backup_name);
+    let backup_manifest_sha256 = sha256_regular_nofollow(&backup_path.join("MANIFEST.sha256"))?;
+    backup_root.sync()?;
+    parent_root.sync()?;
+    Ok(CreatedRecoveryBackup {
+        path: backup_path,
+        source_manifest_sha256: source_digest,
+        backup_manifest_sha256,
+    })
+}
+
+fn short_run_id() -> Result<String, RecoveryError> {
+    let mut random = [0_u8; 8];
+    getrandom::fill(&mut random).map_err(|_| RecoveryError::InvalidJournal)?;
+    let mut id = String::from("r8-");
+    for byte in random {
+        use std::fmt::Write as _;
+        write!(id, "{byte:02x}").map_err(|_| RecoveryError::InvalidJournal)?;
+    }
+    Ok(id)
+}
+
+fn build_inventory(
+    home: &Path,
+    run_id: &str,
+    created_at: &str,
+    source_binary_version: &str,
+    source_binary_sha256: Option<String>,
+    backup_root: bool,
+) -> Result<InventoryManifest, RecoveryError> {
+    let root = AnchoredDir::open_workspace(home, None)?;
+    let mut entries = Vec::new();
+    let mut excluded_counts_by_reason = BTreeMap::new();
+    collect_inventory(
+        &root,
+        Path::new(""),
+        &mut entries,
+        &mut excluded_counts_by_reason,
+        0,
+        backup_root,
+    )?;
+    entries.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    Ok(InventoryManifest {
+        inventory_policy_version: 1,
+        run_id: run_id.to_string(),
+        source_home_identity: root.stable_identity_token().map_err(RecoveryError::Io)?,
+        created_at: created_at.to_string(),
+        entries,
+        excluded_counts_by_reason,
+        workspace_identities: workspace_manifest_identities(&root)?,
+        source_binary_version: source_binary_version.to_string(),
+        source_binary_sha256,
+    })
+}
+
+fn collect_inventory(
+    directory: &AnchoredDir,
+    relative: &Path,
+    entries: &mut Vec<InventoryEntry>,
+    excluded_counts_by_reason: &mut BTreeMap<String, usize>,
+    depth: usize,
+    backup_root: bool,
+) -> Result<(), RecoveryError> {
+    if depth > MAX_BACKUP_DEPTH {
+        return Err(RecoveryError::BackupIncomplete);
+    }
+    for name in directory_names(directory)? {
+        let child_relative = relative.join(&name);
+        let relative_text = relative_path_text(&child_relative)?;
+        if backup_root && matches!(relative_text.as_str(), "MANIFEST.sha256" | "MANIFEST.json") {
+            continue;
+        }
+        if let Some(reason) = excluded_inventory_reason(&relative_text) {
+            *excluded_counts_by_reason
+                .entry(reason.to_string())
+                .or_default() += 1;
+            continue;
+        }
+        if let Ok(child) = directory.child_dir_os(&name, false) {
+            collect_inventory(
+                &child,
+                &child_relative,
+                entries,
+                excluded_counts_by_reason,
+                depth + 1,
+                backup_root,
+            )?;
+            continue;
+        }
+        let file = directory.open_regular_os(&name)?;
+        let metadata = file.metadata().map_err(RecoveryError::Io)?;
+        if !metadata.is_file() {
+            return Err(RecoveryError::BackupIncomplete);
+        }
+        let kind = if is_workspace_database(&relative_text) {
+            InventoryEntryKind::SqliteDatabase
+        } else {
+            InventoryEntryKind::RegularFile
+        };
+        entries.push(InventoryEntry {
+            relative_path: relative_text,
+            entry_kind: kind,
+            size: metadata.len(),
+            sha256: sha256_reader(file).map_err(RecoveryError::Io)?,
+            persistence: PersistenceClass::Persistent,
+        });
+    }
+    Ok(())
+}
+
+fn workspace_manifest_identities(
+    root: &AnchoredDir,
+) -> Result<Vec<WorkspaceManifestIdentity>, RecoveryError> {
+    let workspaces = match root.child_dir_os(OsStr::new("workspaces"), false) {
+        Ok(workspaces) => workspaces,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(RecoveryError::Io(error)),
+    };
+    let mut identities = Vec::new();
+    for name in directory_names(&workspaces)? {
+        if let Ok(workspace) = workspaces.child_dir_os(&name, false) {
+            identities.push(WorkspaceManifestIdentity {
+                workspace_key: name.to_string_lossy().into_owned(),
+                root_identity: workspace
+                    .stable_identity_token()
+                    .map_err(RecoveryError::Io)?,
+            });
+        }
+    }
+    identities.sort_by(|left, right| left.workspace_key.cmp(&right.workspace_key));
+    Ok(identities)
+}
+
+fn excluded_inventory_reason(relative: &str) -> Option<&'static str> {
+    let parts = relative.split('/').collect::<Vec<_>>();
+    if parts.len() == 3 && parts[0] == "workspaces" && parts[2] == ".mutation.lock" {
+        return Some("workspace_mutation_lock_ephemeral");
+    }
+    if parts.len() == 3
+        && parts[0] == "workspaces"
+        && matches!(parts[2], "aopmem.sqlite-wal" | "aopmem.sqlite-shm")
+    {
+        return Some("sqlite_sidecar_captured_by_online_backup");
+    }
+    if relative.starts_with("bin/.aopmem-v") && relative.ends_with(".tmp") {
+        return Some("product_temporary_publish_file");
+    }
+    None
+}
+
+fn is_workspace_database(relative: &str) -> bool {
+    let parts = relative.split('/').collect::<Vec<_>>();
+    parts.len() == 3 && parts[0] == "workspaces" && parts[2] == "aopmem.sqlite"
+}
+
+fn inventory_entries_equivalent(
+    left: &[InventoryEntry],
+    right: &[InventoryEntry],
+    allow_sqlite_transform: bool,
+) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(left, right)| {
+            left.relative_path == right.relative_path
+                && left.entry_kind == right.entry_kind
+                && (allow_sqlite_transform && left.entry_kind == InventoryEntryKind::SqliteDatabase
+                    || (left.size == right.size && left.sha256 == right.sha256))
+        })
+}
+
+fn inventory_digest(manifest: &InventoryManifest) -> Result<String, RecoveryError> {
+    let bytes = serde_json::to_vec(manifest).map_err(|_| RecoveryError::InvalidJournal)?;
+    Ok(sha256_bytes(&bytes))
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
+fn copy_inventory(
+    source_home: &Path,
+    backup_home: &Path,
+    entries: &[InventoryEntry],
+) -> Result<(), RecoveryError> {
+    let source_root = AnchoredDir::open_workspace(source_home, None)?;
+    let backup_root = AnchoredDir::open_workspace(backup_home, None)?;
+    for entry in entries {
+        let relative = Path::new(&entry.relative_path);
+        if entry.entry_kind == InventoryEntryKind::SqliteDatabase {
+            copy_sqlite_database(source_home, backup_home, relative)?;
+        } else {
+            copy_regular_inventory_file(&source_root, &backup_root, relative)?;
+        }
+    }
+    backup_root.sync()?;
+    Ok(())
+}
+
+fn copy_regular_inventory_file(
+    source_root: &AnchoredDir,
+    backup_root: &AnchoredDir,
+    relative: &Path,
+) -> Result<(), RecoveryError> {
+    let source_file = open_relative_regular(source_root, relative)?;
+    let metadata = source_file.metadata().map_err(RecoveryError::Io)?;
+    let (destination_parent, final_name) = ensure_relative_parent(backup_root, relative)?;
+    let temporary = format!(".backup-{}.tmp", uuid::Uuid::new_v4().hyphenated());
+    let mut output = destination_parent.create_new_regular(&temporary)?;
+    let mut input = source_file;
+    io::copy(&mut input, &mut output).map_err(RecoveryError::Io)?;
+    output
+        .set_permissions(metadata.permissions())
+        .map_err(RecoveryError::Io)?;
+    require_recovery_publish(
+        "backup_file",
+        publish_regular(
+            &destination_parent,
+            output,
+            OsStr::new(&temporary),
+            &final_name,
+            PublishMode::NoReplace,
+        ),
+    )
+}
+
+fn copy_sqlite_database(
+    source_home: &Path,
+    backup_home: &Path,
+    relative: &Path,
+) -> Result<(), RecoveryError> {
+    let source_path = source_home.join(relative);
+    let final_path = backup_home.join(relative);
+    let destination_parent_path = final_path
+        .parent()
+        .ok_or(RecoveryError::BackupIncomplete)?
+        .to_path_buf();
+    let backup_root = AnchoredDir::open_workspace(backup_home, None)?;
+    let source_root = AnchoredDir::open_workspace(source_home, None)?;
+    drop(open_relative_regular(&source_root, relative)?);
+    let _ = ensure_relative_parent(&backup_root, relative)?;
+    let expected_schema = inspect_recovery_database(&source_path)?;
+    let source = Connection::open_with_flags(&source_path, sqlite_read_only_flags())
+        .map_err(|error| RecoveryError::Io(sqlite_io(error)))?;
+    online_backup_recovery_database(source, &source_path, &destination_parent_path, &final_path)?;
+    let final_schema = inspect_recovery_database(&final_path)?;
+    if final_schema != expected_schema {
+        return Err(RecoveryError::BackupIncomplete);
+    }
+    Ok(())
+}
+
+fn inspect_recovery_database(path: &Path) -> Result<super::WorkspaceSchemaPlan, RecoveryError> {
+    let connection = Connection::open_with_flags(path, sqlite_read_only_flags())
+        .map_err(|error| RecoveryError::Io(sqlite_io(error)))?;
+    connection
+        .execute_batch("PRAGMA query_only = ON; PRAGMA temp_store = MEMORY;")
+        .map_err(|error| RecoveryError::Io(sqlite_io(error)))?;
+    let schema = super::inspect_schema(&connection).map_err(|error| {
+        RecoveryError::Io(io::Error::new(io::ErrorKind::InvalidData, error.message))
+    })?;
+    close_connection_recovery(connection)?;
+    Ok(schema)
+}
+
+fn online_backup_recovery_database(
+    source: Connection,
+    source_path: &Path,
+    destination_dir: &Path,
+    final_path: &Path,
+) -> Result<(), RecoveryError> {
+    let destination_root = AnchoredDir::open_workspace(destination_dir, None)?;
+    let final_name = final_path
+        .file_name()
+        .ok_or(RecoveryError::BackupIncomplete)?;
+    let temporary = format!(
+        ".{}.backup-{}.tmp",
+        final_name.to_string_lossy(),
+        uuid::Uuid::new_v4().hyphenated()
+    );
+    let file = destination_root.create_new_regular(&temporary)?;
+    drop(file);
+    let temporary_path = destination_dir.join(&temporary);
+    let mut destination = Connection::open_with_flags(
+        &temporary_path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+    )
+    .map_err(|error| RecoveryError::Io(sqlite_io(error)))?;
+    destination
+        .execute_batch("PRAGMA synchronous = FULL; PRAGMA journal_mode = DELETE;")
+        .map_err(|error| RecoveryError::Io(sqlite_io(error)))?;
+    run_recovery_sqlite_backup(&source, &mut destination)?;
+    close_connection_recovery(destination)?;
+    close_connection_recovery(source)?;
+    inspect_recovery_database(&temporary_path)?;
+    let temporary_file = destination_root
+        .open_regular_for_update_os(OsStr::new(&temporary))
+        .map_err(RecoveryError::Io)?;
+    temporary_file.sync_all().map_err(RecoveryError::Io)?;
+    require_recovery_publish(
+        "backup_file",
+        publish_regular(
+            &destination_root,
+            temporary_file,
+            OsStr::new(&temporary),
+            final_name,
+            PublishMode::NoReplace,
+        ),
+    )?;
+    if destination_root.open_regular_os(final_name).is_err() {
+        return Err(RecoveryError::Io(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "SQLite backup was not published for {}",
+                source_path.display()
+            ),
+        )));
+    }
+    Ok(())
+}
+
+fn sqlite_read_only_flags() -> OpenFlags {
+    OpenFlags::SQLITE_OPEN_READ_ONLY
+}
+
+fn run_recovery_sqlite_backup(
+    source: &Connection,
+    destination: &mut Connection,
+) -> Result<(), RecoveryError> {
+    let backup =
+        Backup::new(source, destination).map_err(|error| RecoveryError::Io(sqlite_io(error)))?;
+    let started = std::time::Instant::now();
+    loop {
+        match backup
+            .step(RECOVERY_SQLITE_BACKUP_PAGE_BATCH)
+            .map_err(|error| RecoveryError::Io(sqlite_io(error)))?
+        {
+            StepResult::Done => break,
+            StepResult::More => {}
+            StepResult::Busy | StepResult::Locked => {
+                if started.elapsed() >= RECOVERY_SQLITE_BUSY_TIMEOUT {
+                    return Err(RecoveryError::Io(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "SQLite Online Backup remained busy for 30 seconds",
+                    )));
+                }
+                std::thread::sleep(RECOVERY_SQLITE_BUSY_PAUSE);
+            }
+            _ => {
+                return Err(RecoveryError::Io(io::Error::other(
+                    "SQLite Online Backup returned an unknown state",
+                )));
+            }
+        }
+    }
+    drop(backup);
+    Ok(())
+}
+
+fn close_connection_recovery(connection: Connection) -> Result<(), RecoveryError> {
+    connection.close().map_err(|(connection, error)| {
+        drop(connection);
+        RecoveryError::Io(sqlite_io(error))
+    })
+}
+
+fn ensure_relative_parent(
+    root: &AnchoredDir,
+    relative: &Path,
+) -> Result<(AnchoredDir, OsString), RecoveryError> {
+    let final_name = relative
+        .file_name()
+        .ok_or(RecoveryError::BackupIncomplete)?
+        .to_os_string();
+    let mut directory = root.clone();
+    if let Some(parent) = relative.parent() {
+        for component in parent.components() {
+            let std::path::Component::Normal(name) = component else {
+                return Err(RecoveryError::BackupIncomplete);
+            };
+            directory = directory
+                .child_dir_os(name, true)
+                .map_err(RecoveryError::Io)?;
+        }
+    }
+    Ok((directory, final_name))
+}
+
+fn write_json_manifest(
+    backup_root: &AnchoredDir,
+    manifest: &InventoryManifest,
+    source_manifest_sha256: &str,
+) -> Result<(), RecoveryError> {
+    let temporary = ".MANIFEST.json.tmp";
+    let mut bytes = serde_json::to_vec_pretty(&serde_json::json!({
+        "source_manifest_sha256": source_manifest_sha256,
+        "backup_manifest": manifest,
+    }))
+    .map_err(|_| RecoveryError::InvalidJournal)?;
+    bytes.push(b'\n');
+    let mut file = backup_root.create_new_regular(temporary)?;
+    file.write_all(&bytes).map_err(RecoveryError::Io)?;
+    file.sync_all().map_err(RecoveryError::Io)?;
     require_recovery_publish(
         "backup_manifest",
         publish_regular(
-            &backup_root,
+            backup_root,
+            file,
+            OsStr::new(temporary),
+            OsStr::new("MANIFEST.json"),
+            PublishMode::NoReplace,
+        ),
+    )
+}
+
+fn write_legacy_manifest(backup_root: &AnchoredDir) -> Result<(), RecoveryError> {
+    let temporary = ".MANIFEST.sha256.tmp";
+    let mut bytes = Vec::new();
+    let mut entries = 0_usize;
+    write_tree_manifest(backup_root, Path::new(""), &mut bytes, &mut entries, 0)?;
+    let mut file = backup_root.create_new_regular(temporary)?;
+    file.write_all(&bytes).map_err(RecoveryError::Io)?;
+    file.sync_all().map_err(RecoveryError::Io)?;
+    require_recovery_publish(
+        "backup_manifest",
+        publish_regular(
+            backup_root,
             file,
             OsStr::new(temporary),
             OsStr::new("MANIFEST.sha256"),
             PublishMode::NoReplace,
         ),
-    )?;
-    backup_root.sync()?;
-    parent_root.sync()?;
-    let backup = parent.join(backup_name);
-    Ok(backup)
+    )
+}
+
+fn installed_binary_sha256(home: &Path) -> Result<Option<String>, RecoveryError> {
+    let path = if cfg!(windows) {
+        home.join("bin/aopmem.exe")
+    } else {
+        home.join("bin/aopmem")
+    };
+    match fs::metadata(&path) {
+        Ok(metadata) if metadata.is_file() => sha256_regular_nofollow(&path).map(Some),
+        Ok(_) => Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(RecoveryError::Io(error)),
+    }
+}
+
+fn relative_path_text(path: &Path) -> Result<String, RecoveryError> {
+    let mut parts = Vec::new();
+    for component in path.components() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(RecoveryError::BackupIncomplete);
+        };
+        let text = name.to_str().ok_or(RecoveryError::BackupIncomplete)?;
+        if text.contains(['\n', '\r']) {
+            return Err(RecoveryError::BackupIncomplete);
+        }
+        parts.push(text);
+    }
+    Ok(parts.join("/"))
 }
 
 fn validate_adoptable_backup(
@@ -984,7 +1951,7 @@ fn current_home_manifest_sha256(home: &Path, parent: &Path) -> Result<String, Re
 fn write_tree_manifest(
     source: &AnchoredDir,
     relative: &Path,
-    manifest: &mut File,
+    manifest: &mut impl Write,
     entries: &mut usize,
     depth: usize,
 ) -> Result<(), RecoveryError> {
@@ -993,6 +1960,14 @@ fn write_tree_manifest(
     }
     let before = directory_names(source)?;
     for name in &before {
+        if relative.as_os_str().is_empty()
+            && matches!(
+                name.to_str(),
+                Some("MANIFEST.sha256") | Some("MANIFEST.json")
+            )
+        {
+            continue;
+        }
         *entries = entries
             .checked_add(1)
             .ok_or(RecoveryError::InvalidJournal)?;
@@ -1056,6 +2031,7 @@ fn write_tree_manifest(
     Ok(())
 }
 
+#[allow(dead_code)]
 fn copy_tree_anchored(
     source: &AnchoredDir,
     destination: &AnchoredDir,
@@ -1149,7 +2125,19 @@ fn copy_tree_anchored(
 
 fn directory_names(directory: &AnchoredDir) -> Result<Vec<std::ffi::OsString>, RecoveryError> {
     directory.verify_logical_identity()?;
-    let mut names = fs::read_dir(directory.logical_path())?
+    #[cfg(windows)]
+    let read_path = crate::windows_path::verbatim_path(directory.logical_path())
+        .map_err(|_| RecoveryError::LongPathFailure)?;
+    #[cfg(not(windows))]
+    let read_path = directory.logical_path().to_path_buf();
+    let mut names = fs::read_dir(read_path)
+        .map_err(|error| {
+            if cfg!(windows) && error.raw_os_error() == Some(206) {
+                RecoveryError::LongPathFailure
+            } else {
+                RecoveryError::Io(error)
+            }
+        })?
         .map(|entry| entry.map(|entry| entry.file_name()))
         .collect::<Result<Vec<_>, _>>()?;
     if names.len() > MAX_BACKUP_DIRECTORY_ENTRIES {
@@ -1180,6 +2168,17 @@ fn sha256_reader(mut file: File) -> io::Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+fn sqlite_io(error: rusqlite::Error) -> io::Error {
+    match error {
+        rusqlite::Error::SqliteFailure(inner, message) => io::Error::other(format!(
+            "SQLite error {:?}: {}",
+            inner.code,
+            message.unwrap_or_default()
+        )),
+        other => io::Error::other(other),
+    }
+}
+
 fn is_sha256(value: &str) -> bool {
     value.len() == 64
         && value
@@ -1192,23 +2191,50 @@ fn home_identity(home: &Path) -> Result<String, RecoveryError> {
     root.stable_identity_token().map_err(RecoveryError::Io)
 }
 
+fn timestamp_utc() -> Result<String, RecoveryError> {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| RecoveryError::InvalidJournal)?
+        .as_secs();
+    Ok(format!("unix:{seconds}"))
+}
+
+fn current_binary_version(bin: &Path) -> String {
+    let destination = if cfg!(windows) {
+        bin.join("aopmem.exe")
+    } else {
+        bin.join("aopmem")
+    };
+    fs::metadata(&destination)
+        .ok()
+        .filter(|metadata| metadata.is_file())
+        .map(|_| env!("CARGO_PKG_VERSION").to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 fn validate_journal(
     journal: &RecoveryJournal,
     home: &Path,
     parent: &Path,
 ) -> Result<(), RecoveryError> {
-    if journal.version != "v0.2.0-rc7"
+    if journal.journal_schema_version != JOURNAL_SCHEMA_VERSION
+        || journal.target_version != TARGET_VERSION
+        || journal.run_id.is_empty()
         || journal.home_identity != home_identity(home)?
-        || !valid_direct_name(&journal.home_backup_dir)
-        || !journal.home_backup_dir.starts_with(BACKUP_PREFIX)
+        || !valid_direct_name(&journal.recovery_backup_root)
+        || !(journal.recovery_backup_root.starts_with(BACKUP_PREFIX)
+            || journal
+                .recovery_backup_root
+                .starts_with(LEGACY_RC7_BACKUP_PREFIX))
+        || !is_sha256(&journal.source_manifest_sha256)
         || !is_sha256(&journal.backup_manifest_sha256)
     {
         return Err(RecoveryError::InvalidJournal);
     }
-    let backup = parent.join(&journal.home_backup_dir);
+    let backup = parent.join(&journal.recovery_backup_root);
     let manifest = backup.join("MANIFEST.sha256");
     if sha256_regular_nofollow(&manifest)? != journal.backup_manifest_sha256 {
-        return Err(RecoveryError::InvalidJournal);
+        return Err(RecoveryError::BackupManifestMismatch);
     }
     validate_backup_manifest(&backup, &manifest)?;
 
@@ -1348,7 +2374,12 @@ fn validate_manifest_coverage(
         if !file.metadata()?.is_file() {
             return Err(RecoveryError::InvalidJournal);
         }
-        if relative.as_os_str().is_empty() && name == OsStr::new("MANIFEST.sha256") {
+        if relative.as_os_str().is_empty()
+            && matches!(
+                name.to_str(),
+                Some("MANIFEST.sha256") | Some("MANIFEST.json")
+            )
+        {
             continue;
         }
         let path = relative
@@ -1739,6 +2770,39 @@ mod tests {
         (artifact, digest)
     }
 
+    fn journal_fixture(
+        phase: RecoveryPhase,
+        home_identity: String,
+        backup_name: String,
+        manifest_sha256: String,
+        staged_binary_name: String,
+        staged_sha256: String,
+        planned_workspaces: Vec<PlannedWorkspaceIdentity>,
+    ) -> RecoveryJournal {
+        RecoveryJournal {
+            journal_schema_version: JOURNAL_SCHEMA_VERSION,
+            target_version: TARGET_VERSION.to_string(),
+            source_version: "test-source".to_string(),
+            run_id: backup_name
+                .strip_prefix(BACKUP_PREFIX)
+                .unwrap_or(&backup_name)
+                .to_string(),
+            phase,
+            home_identity,
+            safety_backup_root: None,
+            recovery_backup_root: backup_name,
+            source_manifest_sha256: manifest_sha256.clone(),
+            backup_manifest_sha256: manifest_sha256,
+            staged_binary_name,
+            staged_sha256,
+            planned_workspaces,
+            apply_attempts: 0,
+            binary_replaced: false,
+            created_at: "unix:0".to_string(),
+            updated_at: "unix:0".to_string(),
+        }
+    }
+
     #[test]
     fn durable_journal_round_trips_through_atomic_publish() {
         let root = temp_dir("journal");
@@ -1746,21 +2810,19 @@ mod tests {
         fs::create_dir(&home).expect("home should create");
         fs::write(home.join("value"), b"preserved").expect("home value should write");
         let backup = create_full_home_backup(&home, &root).expect("backup should create");
-        let journal = RecoveryJournal {
-            version: "v0.2.0-rc7".to_string(),
-            phase: RecoveryPhase::BackupComplete,
-            home_identity: home_identity(&home).expect("home identity"),
-            home_backup_dir: backup
+        let journal = journal_fixture(
+            RecoveryPhase::BackupComplete,
+            home_identity(&home).expect("home identity"),
+            backup
                 .file_name()
                 .expect("backup name")
                 .to_string_lossy()
                 .into_owned(),
-            backup_manifest_sha256: sha256_regular_nofollow(&backup.join("MANIFEST.sha256"))
-                .expect("manifest digest"),
-            staged_binary_name: String::new(),
-            staged_sha256: String::new(),
-            planned_workspaces: Vec::new(),
-        };
+            sha256_regular_nofollow(&backup.join("MANIFEST.sha256")).expect("manifest digest"),
+            String::new(),
+            String::new(),
+            Vec::new(),
+        );
         write_journal(&root, &home, &journal).expect("journal should publish");
         assert_eq!(
             read_journal(&root).expect("journal should read"),
@@ -1941,22 +3003,21 @@ mod tests {
 
     #[test]
     fn oversized_serialized_checkpoint_is_rejected_before_write() {
-        let journal = RecoveryJournal {
-            version: "v0.2.0-rc7".to_string(),
-            phase: RecoveryPhase::Prepared,
-            home_identity: "home".to_string(),
-            home_backup_dir: "backup".to_string(),
-            backup_manifest_sha256: "0".repeat(64),
-            staged_binary_name: STAGED_BINARY_NAME.to_string(),
-            staged_sha256: "1".repeat(64),
-            planned_workspaces: vec![PlannedWorkspaceIdentity {
+        let journal = journal_fixture(
+            RecoveryPhase::Prepared,
+            "home".to_string(),
+            format!("{BACKUP_PREFIX}backup"),
+            "0".repeat(64),
+            STAGED_BINARY_NAME.to_string(),
+            "1".repeat(64),
+            vec![PlannedWorkspaceIdentity {
                 workspace_key: "alpha".to_string(),
                 root_identity: "x".repeat(MAX_JOURNAL_BYTES),
                 database_identity: "database".to_string(),
                 observability_identity: "observability".to_string(),
                 schema_before: "003".to_string(),
             }],
-        };
+        );
         assert!(matches!(
             serialize_journal(&journal),
             Err(RecoveryError::InvalidJournal)
@@ -1966,16 +3027,15 @@ mod tests {
     #[test]
     fn journal_rejects_missing_first_or_middle_checkpoint() {
         let root = temp_dir("journal-gap");
-        let base = RecoveryJournal {
-            version: "v0.2.0-rc7".to_string(),
-            phase: RecoveryPhase::BackupComplete,
-            home_identity: "home".to_string(),
-            home_backup_dir: "backup".to_string(),
-            backup_manifest_sha256: "0".repeat(64),
-            staged_binary_name: String::new(),
-            staged_sha256: String::new(),
-            planned_workspaces: Vec::new(),
-        };
+        let base = journal_fixture(
+            RecoveryPhase::BackupComplete,
+            "home".to_string(),
+            format!("{BACKUP_PREFIX}backup"),
+            "0".repeat(64),
+            String::new(),
+            String::new(),
+            Vec::new(),
+        );
         let mut staged = base.clone();
         staged.phase = RecoveryPhase::StagedVerified;
         staged.staged_binary_name = STAGED_BINARY_NAME.to_string();
@@ -2008,6 +3068,128 @@ mod tests {
             read_journal(&root),
             Err(RecoveryError::InvalidJournal)
         ));
+        fs::remove_dir_all(root).expect("temporary directory should remove");
+    }
+
+    #[test]
+    fn recovery_inspect_classifies_orphan_backup_as_stale_pre_apply() {
+        let root = temp_dir("inspect-orphan");
+        let home = root.join("home");
+        fs::create_dir(&home).expect("home should create");
+        fs::write(home.join("value"), b"preserved").expect("home value should write");
+        let backup = create_full_home_backup(&home, &root).expect("orphan backup should create");
+
+        let report = inspect_recovery_parent(&root).expect("inspect should classify");
+
+        assert_eq!(
+            report.classification,
+            RecoveryClassification::StalePreApplyBackup
+        );
+        assert!(report.can_start_fresh);
+        assert!(!report.apply_started);
+        assert!(report
+            .ignored_pre_apply_evidence
+            .iter()
+            .any(|path| path.contains(backup.file_name().unwrap().to_string_lossy().as_ref())));
+        fs::remove_dir_all(root).expect("temporary directory should remove");
+    }
+
+    #[test]
+    fn recovery_inspect_malformed_pre_apply_starts_fresh_but_apply_started_blocks() {
+        let root = temp_dir("inspect-malformed");
+        fs::write(
+            root.join(journal_name(RecoveryPhase::BackupComplete)),
+            b"not-json",
+        )
+        .expect("malformed journal should write");
+        let report = inspect_recovery_parent(&root).expect("inspect should classify malformed");
+        assert_eq!(
+            report.classification,
+            RecoveryClassification::MalformedPreApplyJournal
+        );
+        assert!(report.can_start_fresh);
+        assert!(!report.apply_started);
+
+        fs::remove_file(root.join(journal_name(RecoveryPhase::BackupComplete)))
+            .expect("malformed journal should remove");
+        fs::write(
+            root.join(journal_name(RecoveryPhase::ApplyStarted)),
+            b"not-json",
+        )
+        .expect("apply-started journal should write");
+        let report = inspect_recovery_parent(&root).expect("inspect should classify apply-started");
+        assert_eq!(report.classification, RecoveryClassification::ApplyStarted);
+        assert!(!report.can_start_fresh);
+        assert!(report.apply_started);
+        fs::remove_dir_all(root).expect("temporary directory should remove");
+    }
+
+    #[test]
+    fn recovery_backup_inventory_preserves_runtime_tools_and_excludes_ephemeral_sidecars() {
+        let root = temp_dir("inventory-policy");
+        let home = root.join("home");
+        let workspace = home.join("workspaces/alpha");
+        fs::create_dir_all(workspace.join("runtimes/tool/.venv/Lib/site-packages/pkg"))
+            .expect("runtime tree should create");
+        fs::create_dir_all(workspace.join("tools/tool-a")).expect("tool tree should create");
+        fs::write(
+            workspace.join("runtimes/tool/.venv/Lib/site-packages/pkg/module.py"),
+            b"runtime",
+        )
+        .expect("runtime file should write");
+        fs::write(workspace.join("tools/tool-a/tool.json"), b"tool")
+            .expect("tool file should write");
+        fs::write(workspace.join(".pending-snapshot"), b"pending")
+            .expect("pending marker should write");
+        fs::write(workspace.join(".mutation.lock"), b"").expect("lock should write");
+        fs::write(workspace.join("aopmem.sqlite-wal"), b"wal").expect("wal should write");
+        fs::write(workspace.join("aopmem.sqlite-shm"), b"shm").expect("shm should write");
+
+        let backup = create_full_home_backup(&home, &root).expect("backup should create");
+
+        assert!(backup
+            .join("workspaces/alpha/runtimes/tool/.venv/Lib/site-packages/pkg/module.py")
+            .is_file());
+        assert!(backup
+            .join("workspaces/alpha/tools/tool-a/tool.json")
+            .is_file());
+        assert!(backup.join("workspaces/alpha/.pending-snapshot").is_file());
+        assert!(!backup.join("workspaces/alpha/.mutation.lock").exists());
+        assert!(!backup.join("workspaces/alpha/aopmem.sqlite-wal").exists());
+        assert!(!backup.join("workspaces/alpha/aopmem.sqlite-shm").exists());
+        fs::remove_dir_all(root).expect("temporary directory should remove");
+    }
+
+    #[test]
+    fn safety_backup_name_is_not_a_normal_adopt_source() {
+        let _lock = crate::install::test_env_lock()
+            .lock()
+            .expect("environment lock should not be poisoned");
+        let root = temp_dir("safety-backup-adopt");
+        let home = root.join("home");
+        fs::create_dir_all(&home).expect("home should create");
+        fs::write(home.join("value.txt"), b"preserved").expect("home value should write");
+        let _guard = EnvGuard::set(&home);
+
+        for name in [
+            "aopmem-home-backup-v0.2.0-rc8-fixture",
+            "aopmem-home-backup-v0.2.0-rc7-fixture",
+        ] {
+            let safety = root.join(name);
+            fs::create_dir_all(&safety).expect("safety backup should create");
+            fs::write(safety.join("value.txt"), b"preserved").expect("safety value should write");
+            let safety_root =
+                AnchoredDir::open_workspace(&safety, None).expect("safety root should open");
+            write_legacy_manifest(&safety_root).expect("safety manifest should write");
+            let digest = sha256_regular_nofollow(&safety.join("MANIFEST.sha256"))
+                .expect("manifest digest should compute");
+
+            assert!(matches!(
+                adopt_home_backup(&safety, &digest),
+                Err(RecoveryError::InvalidJournal)
+            ));
+        }
+        assert_eq!(read_journal(&root).expect("journal read should work"), None);
         fs::remove_dir_all(root).expect("temporary directory should remove");
     }
 
@@ -2315,20 +3497,19 @@ mod tests {
         let root = temp_dir("hash");
         let staged = root.join("staged");
         fs::write(&staged, b"verified").expect("fixture should write");
-        let journal = RecoveryJournal {
-            version: "v0.2.0-rc7".to_string(),
-            phase: RecoveryPhase::Prepared,
-            home_identity: "identity".to_string(),
-            home_backup_dir: "backup".to_string(),
-            backup_manifest_sha256: "0".repeat(64),
-            staged_binary_name: staged
+        let journal = journal_fixture(
+            RecoveryPhase::Prepared,
+            "identity".to_string(),
+            format!("{BACKUP_PREFIX}backup"),
+            "0".repeat(64),
+            staged
                 .file_name()
                 .expect("name")
                 .to_string_lossy()
                 .into_owned(),
-            staged_sha256: "not-the-file".to_string(),
-            planned_workspaces: Vec::new(),
-        };
+            "not-the-file".to_string(),
+            Vec::new(),
+        );
         assert!(matches!(
             verify_retained_staged(&journal, &root),
             Err(RecoveryError::InvalidStagedBinary)
@@ -2524,8 +3705,7 @@ mod tests {
 
         let retained =
             retain_staged_binary(&source, &bin, &digest).expect("first retain should publish");
-        fs::write(bin.join(".aopmem-v0.2.0-rc7.retain.tmp"), b"stale")
-            .expect("stale temp should write");
+        fs::write(bin.join(RETAIN_TEMP_NAME), b"stale").expect("stale temp should write");
         let resumed =
             retain_staged_binary(&source, &bin, &digest).expect("resume should be idempotent");
 
@@ -2535,7 +3715,7 @@ mod tests {
             digest
         );
         assert!(
-            !bin.join(".aopmem-v0.2.0-rc7.retain.tmp").exists(),
+            !bin.join(RETAIN_TEMP_NAME).exists(),
             "idempotent retain must clean stale temporary"
         );
         #[cfg(unix)]
@@ -2564,8 +3744,7 @@ mod tests {
         let digest = sha256_regular_nofollow(&source).expect("source digest");
         let retained = retain_staged_binary(&source, &bin, &digest).expect("retain should publish");
         fs::write(bin.join("aopmem"), b"old-binary").expect("old binary should write");
-        fs::write(bin.join(".aopmem-v0.2.0-rc7.publish.tmp"), b"stale")
-            .expect("stale publish temp should write");
+        fs::write(bin.join(PUBLISH_TEMP_NAME), b"stale").expect("stale publish temp should write");
 
         publish_staged_binary(STAGED_BINARY_NAME, &digest, &bin)
             .expect("first publish should replace old binary");
@@ -2581,7 +3760,7 @@ mod tests {
             digest
         );
         assert!(
-            !bin.join(".aopmem-v0.2.0-rc7.publish.tmp").exists(),
+            !bin.join(PUBLISH_TEMP_NAME).exists(),
             "idempotent publish must clean stale temporary"
         );
         #[cfg(unix)]
@@ -2606,21 +3785,19 @@ mod tests {
         fs::create_dir(&home).expect("home should create");
         fs::write(home.join("value"), b"preserved").expect("home value should write");
         let backup = create_full_home_backup(&home, &root).expect("backup should create");
-        let journal = RecoveryJournal {
-            version: "v0.2.0-rc7".to_string(),
-            phase: RecoveryPhase::BackupComplete,
-            home_identity: home_identity(&home).expect("home identity"),
-            home_backup_dir: backup
+        let journal = journal_fixture(
+            RecoveryPhase::BackupComplete,
+            home_identity(&home).expect("home identity"),
+            backup
                 .file_name()
                 .expect("backup name")
                 .to_string_lossy()
                 .into_owned(),
-            backup_manifest_sha256: sha256_regular_nofollow(&backup.join("MANIFEST.sha256"))
-                .expect("manifest digest"),
-            staged_binary_name: String::new(),
-            staged_sha256: String::new(),
-            planned_workspaces: Vec::new(),
-        };
+            sha256_regular_nofollow(&backup.join("MANIFEST.sha256")).expect("manifest digest"),
+            String::new(),
+            String::new(),
+            Vec::new(),
+        );
         validate_journal(&journal, &home, &root).expect("valid journal should pass");
 
         fs::write(backup.join("value"), b"tampered").expect("backup should tamper");
@@ -2648,21 +3825,19 @@ mod tests {
         fs::create_dir(&home).expect("home should create");
         fs::write(home.join("value"), b"preserved").expect("home value should write");
         let backup = create_full_home_backup(&home, &root).expect("backup should create");
-        let journal = RecoveryJournal {
-            version: "v0.2.0-rc7".to_string(),
-            phase: RecoveryPhase::BackupComplete,
-            home_identity: home_identity(&home).expect("home identity"),
-            home_backup_dir: backup
+        let journal = journal_fixture(
+            RecoveryPhase::BackupComplete,
+            home_identity(&home).expect("home identity"),
+            backup
                 .file_name()
                 .expect("backup name")
                 .to_string_lossy()
                 .into_owned(),
-            backup_manifest_sha256: sha256_regular_nofollow(&backup.join("MANIFEST.sha256"))
-                .expect("manifest digest"),
-            staged_binary_name: String::new(),
-            staged_sha256: String::new(),
-            planned_workspaces: Vec::new(),
-        };
+            sha256_regular_nofollow(&backup.join("MANIFEST.sha256")).expect("manifest digest"),
+            String::new(),
+            String::new(),
+            Vec::new(),
+        );
         fs::write(root.join(format!(".{JOURNAL_PREFIX}stale.tmp")), b"stale")
             .expect("stale journal temp should write");
 

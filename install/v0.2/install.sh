@@ -5,7 +5,7 @@ umask 077
 LC_ALL=C
 export LC_ALL
 
-PRODUCT_VERSION="0.2.0-rc7"
+PRODUCT_VERSION="0.2.0-rc8"
 OLD_RELEASE_LABEL="0.1.0-rc3"
 ASSET_NAME="aopmem-darwin-arm64"
 CHECKSUM_NAME="SHA256SUMS"
@@ -29,7 +29,7 @@ FAILURE_MESSAGE=""
 INSTALL_RUN_ID=$$
 
 # The installer owns only orchestration.  Recovery state and replacement are
-# deliberately owned by the verified RC7 binary (D037/D038).
+# deliberately owned by the verified RC8 binary (D037/D038).
 ACTIVE_ADAPTER=${AOPMEM_ACTIVE_ADAPTER:-}
 ACTIVE_INSTRUCTION_FILE=${AOPMEM_ACTIVE_INSTRUCTION_FILE:-}
 
@@ -377,8 +377,8 @@ backup_aopmem_home() {
   fi
   SOURCE_PREFLIGHT_ENTRIES=0
   preflight_backup_source_tree "$AOPMEM_HOME_PATH" 0
-  # `upgrade backup --adopt` accepts only a direct, RC7-named sibling of
-  # AOPMEM_HOME and binds its deterministic manifest to the unchanged home.
+  # Safety Backup is durable evidence only. Normal RC8 recovery never adopts
+  # this shell-created full-home backup.
   FULL_BACKUP_ROOT="$backup_parent/aopmem-home-backup-v${PRODUCT_VERSION}-${backup_stamp}-$$"
   FULL_BACKUP_HOME="$FULL_BACKUP_ROOT"
   if [ -e "$FULL_BACKUP_ROOT" ] || [ -L "$FULL_BACKUP_ROOT" ]; then
@@ -548,12 +548,6 @@ run_staged_json() {
   fi
 }
 
-run_upgrade_adopt() {
-  trace_install_event "upgrade.backup.adopt"
-  run_staged_json "upgrade-backup-adopt" upgrade backup --adopt "$FULL_BACKUP_ROOT" \
-    --manifest-sha256 "$FULL_BACKUP_MANIFEST_SHA256" --json
-}
-
 run_upgrade_stage() {
   trace_install_event "upgrade.stage"
   run_staged_json "upgrade-stage" upgrade stage --artifact "$DOWNLOADED_BINARY" \
@@ -565,6 +559,27 @@ run_upgrade_stage() {
 run_staged_platform_check() {
   trace_install_event "platform.check.staged"
   run_staged_json "platform-check" platform check --json
+}
+
+run_upgrade_recovery_inspect() {
+  trace_install_event "upgrade.recovery.inspect"
+  run_staged_json "upgrade-recovery-inspect" upgrade recovery inspect --json
+  if grep -Eq '"apply_started"[[:space:]]*:[[:space:]]*true' \
+      "$TEMP_ROOT/upgrade-recovery-inspect.json" \
+    && ! grep -Eq '"can_resume_publish"[[:space:]]*:[[:space:]]*true' \
+      "$TEMP_ROOT/upgrade-recovery-inspect.json"; then
+    fail_install "upgrade recovery has apply-started evidence; automatic fresh run is blocked"
+  fi
+}
+
+run_upgrade_recovery_backup() {
+  trace_install_event "upgrade.backup.fresh"
+  run_staged_json "upgrade-backup-fresh" upgrade backup --all-workspaces --json
+  UPGRADE_BACKUP_ROOT=$(json_field_or_empty \
+    "$TEMP_ROOT/upgrade-backup-fresh.json" "data.recovery_backup_root")
+  if [ -z "$UPGRADE_BACKUP_ROOT" ] || [ "$UPGRADE_BACKUP_ROOT" = "null" ]; then
+    fail_install "upgrade backup did not report recovery backup root"
+  fi
 }
 
 run_audit_repair() {
@@ -784,7 +799,7 @@ run_current_workspace_health() {
 
   task_start_output="$TEMP_ROOT/task-start-smoke.json"
   trace_install_event "task.start.smoke"
-  if ! printf '%s' 'RC7 installer task-start smoke' | AOPMEM_HOME="$AOPMEM_HOME_PATH" \
+  if ! printf '%s' 'RC8 installer task-start smoke' | AOPMEM_HOME="$AOPMEM_HOME_PATH" \
     "$INSTALLED_BINARY" task start --query-stdin --json > "$task_start_output"; then
     fail_install "task-start smoke failed for current workspace"
   fi
@@ -968,9 +983,10 @@ chmod 755 "$DOWNLOADED_BINARY"
 verify_new_binary_version
 
 if [ "$MODE" = "update" ]; then
-  run_upgrade_adopt
-  run_upgrade_stage
   run_staged_platform_check
+  run_upgrade_recovery_inspect
+  run_upgrade_recovery_backup
+  run_upgrade_stage
   run_audit_repair staged "$DOWNLOADED_BINARY"
   run_upgrade_prepare
   run_upgrade_plan
