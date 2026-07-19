@@ -11580,7 +11580,7 @@ mod tests {
         assert_eq!(envelope["data"], serde_json::json!({}));
         assert_eq!(envelope["warnings"], serde_json::json!([]));
         assert_eq!(envelope["errors"], serde_json::json!([]));
-        assert_eq!(envelope["meta"]["version"], "0.2.0-rc6");
+        assert_eq!(envelope["meta"]["version"], "0.2.0-rc7");
     }
 
     #[test]
@@ -11602,7 +11602,7 @@ mod tests {
             envelope["errors"][0]["message"],
             "command is not implemented yet: node_create"
         );
-        assert_eq!(envelope["meta"]["version"], "0.2.0-rc6");
+        assert_eq!(envelope["meta"]["version"], "0.2.0-rc7");
     }
 
     #[test]
@@ -11782,7 +11782,7 @@ mod tests {
             envelope["errors"][0]["fix_hint"],
             "run `aopmem --help` to see supported commands"
         );
-        assert_eq!(envelope["meta"]["version"], "0.2.0-rc6");
+        assert_eq!(envelope["meta"]["version"], "0.2.0-rc7");
     }
 
     #[test]
@@ -21250,7 +21250,7 @@ mod tests {
             "upgrade",
             "backup",
             "--adopt",
-            "aopmem-home-backup-v0.2.0-rc6-fixture",
+            "aopmem-home-backup-v0.2.0-rc7-fixture",
             "--manifest-sha256",
             &"0".repeat(64),
             "--json",

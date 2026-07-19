@@ -33,9 +33,9 @@ use crate::storage::{self, AopmemPaths, WorkspacePaths};
 use crate::verify;
 
 const SOURCE_VERSION: &str = "0.1.0-rc3";
-const TARGET_VERSION: &str = "0.2.0-rc6";
+const TARGET_VERSION: &str = "0.2.0-rc7";
 const BACKUPS_DIRECTORY: &str = "backups";
-const BACKUP_RUN_PREFIX: &str = "upgrade-0.2.0-rc6-";
+const BACKUP_RUN_PREFIX: &str = "upgrade-0.2.0-rc7-";
 const COMMAND_ID: &str = "upgrade_apply";
 
 const OWNED_GLOBAL_ASSETS: &[OwnedGlobalAsset] = &[

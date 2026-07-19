@@ -2,7 +2,7 @@
 
 This document defines the authoritative task-state boundary and the
 `aopmem task start`, `task apply`, and `task complete` contracts for AOPMem
-v0.2.0-rc6.
+v0.2.0-rc7.
 
 ## Start command
 

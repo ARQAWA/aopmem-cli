@@ -9,6 +9,7 @@ MAC_INSTALLER="$REPO_ROOT/install/v0.2/install.sh"
 WINDOWS_INSTALLER="$REPO_ROOT/install/v0.2/install.ps1"
 TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/aopmem-installer-audit.XXXXXX")
 TEST_COUNT=0
+USE_KNOWN_SOURCE_MATRIX=0
 
 cleanup() {
   rm -rf "$TEST_ROOT"
@@ -73,7 +74,7 @@ write_new_stub() {
     printf '%s\n' 'fi'
     printf '%s\n' 'case "$*" in'
     printf '%s\n' '  "--version")'
-    printf '%s\n' '    printf "%s\n" "aopmem 0.2.0-rc6"'
+    printf '%s\n' '    printf "%s\n" "aopmem 0.2.0-rc7"'
     printf '%s\n' '    ;;'
     printf '%s\n' '  "upgrade prepare --all-workspaces --json")'
     printf '%s\n' '    if [ "${AOPMEM_STUB_PREPARE_FAIL:-0}" = "1" ]; then'
@@ -86,8 +87,8 @@ write_new_stub() {
     printf '%s\n' '    printf "%s\n" '\''{"ok":true,"data":{"journal_phase":"backup_complete"}}'\'''
     printf '%s\n' '    ;;'
     printf '%s\n' '  "upgrade stage --artifact "*)'
-    printf '%s\n' '    cp "$0" "$AOPMEM_HOME/bin/.aopmem-v0.2.0-rc6.staged"'
-    printf '%s\n' '    chmod 755 "$AOPMEM_HOME/bin/.aopmem-v0.2.0-rc6.staged"'
+    printf '%s\n' '    cp "$0" "$AOPMEM_HOME/bin/.aopmem-v0.2.0-rc7.staged"'
+    printf '%s\n' '    chmod 755 "$AOPMEM_HOME/bin/.aopmem-v0.2.0-rc7.staged"'
     printf '%s\n' '    printf "%s\n" '\''{"ok":true,"data":{"journal_phase":"staged_verified"}}'\'''
     printf '%s\n' '    ;;'
     printf '%s\n' '  "platform check --json")'
@@ -188,6 +189,7 @@ setup_case() {
   case_name=$1
   TEST_OLD_SHA=""
   OLD_STUB_VERSION="0.1.0"
+  USE_KNOWN_SOURCE_MATRIX=0
   CASE_ROOT="$TEST_ROOT/$case_name"
   ASSET_DIR="$CASE_ROOT/assets"
   TEMP_PARENT="$CASE_ROOT/temp"
@@ -216,6 +218,10 @@ install_old_binary() {
 }
 
 run_installer() {
+  old_hash_override=${TEST_OLD_SHA:-}
+  if [ "$USE_KNOWN_SOURCE_MATRIX" = "1" ]; then
+    old_hash_override=""
+  fi
   (
     cd "$REPO_DIR"
     env \
@@ -227,7 +233,7 @@ run_installer() {
       AOPMEM_INSTALL_TEST_TRACE="$TRACE_PATH" \
       AOPMEM_STUB_TRACE="$TRACE_PATH" \
       AOPMEM_STUB_PUBLISHED_BINARY="$ASSET_DIR/aopmem-darwin-arm64" \
-      AOPMEM_INSTALL_TEST_OLD_BINARY_SHA256="${TEST_OLD_SHA:-}" \
+      AOPMEM_INSTALL_TEST_OLD_BINARY_SHA256="$old_hash_override" \
       AOPMEM_STUB_OLD_VERSION="$OLD_STUB_VERSION" \
       AOPMEM_ACTIVE_ADAPTER=codex \
       AOPMEM_ACTIVE_INSTRUCTION_FILE=AGENTS.md \
@@ -281,10 +287,16 @@ run_static_audit() {
   assert_contains "$WINDOWS_INSTALLER" 'chcp\.com.*65001'
   assert_contains "$WINDOWS_INSTALLER" 'Console.*InputEncoding'
   assert_contains "$WINDOWS_INSTALLER" 'Console.*OutputEncoding'
-  assert_contains "$WINDOWS_INSTALLER" 'Invoke-WebRequest'
-  assert_contains "$WINDOWS_INSTALLER" 'UseBasicParsing'
-  assert_contains "$WINDOWS_INSTALLER" 'MaximumRedirection 0'
-  assert_contains "$WINDOWS_INSTALLER" 'Assert-TrustedHttpsUri -Uri .nextUri'
+  assert_contains "$WINDOWS_INSTALLER" 'HttpClientHandler'
+  assert_contains "$WINDOWS_INSTALLER" 'AllowAutoRedirect = .false'
+  assert_contains "$WINDOWS_INSTALLER" 'ResponseHeadersRead'
+  assert_contains "$WINDOWS_INSTALLER" 'HTTP_REDIRECT_LOOP'
+  assert_contains "$WINDOWS_INSTALLER" 'HTTP_REDIRECT_LIMIT'
+  assert_contains "$WINDOWS_INSTALLER" 'ASSET_LENGTH_MISMATCH'
+  assert_contains "$WINDOWS_INSTALLER" 'ProxyUseDefaultCredentials'
+  assert_contains "$WINDOWS_INSTALLER" 'DefaultNetworkCredentials'
+  assert_contains "$WINDOWS_INSTALLER" 'FileMode.*CreateNew'
+  assert_contains "$WINDOWS_INSTALLER" 'File.*Move'
   assert_contains "$WINDOWS_INSTALLER" 'Scheme -cne "https"'
   assert_contains "$WINDOWS_INSTALLER" 'parsedBase\.Query'
   assert_contains "$WINDOWS_INSTALLER" 'parsedBase\.Fragment'
@@ -321,6 +333,9 @@ run_static_audit() {
   assert_not_contains "$WINDOWS_INSTALLER" 'Start-Process.*RunAs'
   assert_not_contains "$WINDOWS_INSTALLER" 'Set-ExecutionPolicy'
   assert_not_contains "$WINDOWS_INSTALLER" 'Invoke-Expression'
+  assert_not_contains "$WINDOWS_INSTALLER" 'Invoke-WebRequest'
+  assert_not_contains "$WINDOWS_INSTALLER" 'MaximumRedirection[[:space:]]+0'
+  assert_not_contains "$WINDOWS_INSTALLER" '\$_\.Exception\.Response'
   assert_not_contains "$WINDOWS_INSTALLER" 'cmd\.exe'
   assert_not_contains "$WINDOWS_INSTALLER" 'cargo|rustup|git clone|Codex CLI|node(\.exe)?'
   assert_not_contains "$WINDOWS_INSTALLER" 'robocopy\.exe'
@@ -341,6 +356,33 @@ run_static_audit() {
     "$windows_tag_hash" \
     "01010aeffc20aead5f353353674621b367e6ad590769e4b5915b8d02d62f6d7a" \
     "tagged Windows v0.1.0-rc3 asset hash"
+
+  for source_record in \
+    "v0.2.0-rc1|b32e918d2a44f0767444e09c84c1ed44fe9177709b2d56b2aa89c300081d4308|a4e3302d6f26dd9d16387a075189fec51c469aef9b8d9c730f81001b21b2cf57" \
+    "v0.2.0-rc2|d4a3f52aeddd3fd656f46358305a5a4a688868b3f25d4675eb37f6cf223a81d4|77a2e79162c609ff62dbaa4533c5f7237490c842047485fe79a608a14f57a5f8" \
+    "v0.2.0-rc3|8bc4d3a7ae38253c1a6e4c653292cf954fb2c8eee916c69a03c6dc5e2484261c|ed59be73d99efd2c1a4fe99e50b85e8b6ce8e8a73b7ff0c96b5327e1c2d39477" \
+    "v0.2.0-rc4|4812ca6c798cd2460b4b9da468e5f99f433a68907dc40eba257b88d197886e4e|e4442fd06622a6b94f997e23b67a55753f1d841f6570ef20ac72b99083a6cc1c" \
+    "v0.2.0-rc5|594bb9606bd7f971a0fb97b16916fe2a5da84096e8340a5885c36d7037dd1b5e|150db4699c2f41c6e529f9606ac099c9ac6b4771b5084952f2cb5df3226d1b58" \
+    "v0.2.0-rc6|b933d921ae6ec68ce7e0f118de27fd7eabe9d1c42d715a0a6df8f2ec731cb949|8cd03fd00ffdaf505d7f31cd1c485fd15179823f84a78061b7bcfc00ee4fd4c7"
+  do
+    tag=${source_record%%|*}
+    hashes=${source_record#*|}
+    expected_mac=${hashes%%|*}
+    expected_windows=${hashes#*|}
+    actual_mac=$(git -C "$REPO_ROOT" show "$tag:dist/aopmem-darwin-arm64" \
+      | shasum -a 256 | awk '{ print tolower($1) }')
+    actual_windows=$(git -C "$REPO_ROOT" \
+      show "$tag:dist/aopmem-windows-x86_64.exe" \
+      | shasum -a 256 | awk '{ print tolower($1) }')
+    assert_equal "$actual_mac" "$expected_mac" "$tag macOS source hash"
+    assert_equal "$actual_windows" "$expected_windows" "$tag Windows source hash"
+    assert_contains "$MAC_INSTALLER" "$expected_mac"
+    assert_contains "$WINDOWS_INSTALLER" "$expected_windows"
+  done
+
+  PYTHONDONTWRITEBYTECODE=1 \
+    python3 "$REPO_ROOT/scripts/test_windows_installer_transport.py" \
+    >/dev/null || fail "Windows transport contract tests failed"
   pass
 }
 
@@ -419,7 +461,7 @@ test_update_success() {
   assert_trace_order "$TRACE_PATH" "observe.status" "observe.report"
   backup=$(find "$AOPMEM_HOME_PATH/bin" -name 'aopmem.backup-v0.1.0-*' -print -quit)
   assert_file "$backup"
-  full_backup=$(find "$CASE_ROOT" -path '*/aopmem-home-backup-v0.2.0-rc6-*/bin/aopmem' -print -quit)
+  full_backup=$(find "$CASE_ROOT" -path '*/aopmem-home-backup-v0.2.0-rc7-*/bin/aopmem' -print -quit)
   assert_file "$full_backup"
   assert_equal \
     "$(shasum -a 256 "$full_backup" | awk '{ print $1 }')" \
@@ -429,7 +471,7 @@ test_update_success() {
   actual=$(shasum -a 256 "$AOPMEM_HOME_PATH/bin/aopmem" | awk '{ print $1 }')
   assert_equal "$actual" "$expected" "published update hash"
   assert_temp_clean "$TEMP_PARENT"
-  retained=$(find "$AOPMEM_HOME_PATH/bin" -name '.aopmem-v0.2.0-rc6.staged' -print -quit)
+  retained=$(find "$AOPMEM_HOME_PATH/bin" -name '.aopmem-v0.2.0-rc7.staged' -print -quit)
   assert_file "$retained"
   pass
 }
@@ -447,18 +489,59 @@ test_tagged_source_acceptance_and_hash_binding() {
   assert_contains "$TRACE_PATH" '^upgrade\.apply$'
   assert_not_contains "$TRACE_PATH" '^init$'
 
-  setup_case noncanonical-old-hash
+  for source_record in \
+    "v0.2.0-rc4|0.2.0-rc4" \
+    "v0.2.0-rc5|0.2.0-rc5" \
+    "v0.2.0-rc6|0.2.0-rc6"
+  do
+    tag=${source_record%%|*}
+    version=${source_record#*|}
+    setup_case "known-${version}"
+    mkdir -p "$AOPMEM_HOME_PATH/bin"
+    git -C "$REPO_ROOT" show "$tag:dist/aopmem-darwin-arm64" \
+      > "$AOPMEM_HOME_PATH/bin/aopmem"
+    chmod 755 "$AOPMEM_HOME_PATH/bin/aopmem"
+    TEST_OLD_SHA=$(shasum -a 256 "$AOPMEM_HOME_PATH/bin/aopmem" \
+      | awk '{ print tolower($1) }')
+    USE_KNOWN_SOURCE_MATRIX=1
+    expect_success
+    assert_not_contains "$STDERR_PATH" 'NONCANONICAL'
+    assert_equal \
+      "$(grep -Ec '^upgrade\.apply$' "$TRACE_PATH")" \
+      "1" \
+      "$version apply count"
+  done
+
+  setup_case noncanonical-v010-hash
   install_old_binary
   expect_success \
     AOPMEM_INSTALL_TEST_OLD_BINARY_SHA256=ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
   assert_contains "$STDERR_PATH" 'NONCANONICAL_V010_BINARY'
   assert_contains "$TRACE_PATH" '^warning\.NONCANONICAL_V010_BINARY$'
   assert_contains "$TRACE_PATH" '^upgrade\.prepare$'
+
+  setup_case noncanonical-rc4-hash
+  OLD_STUB_VERSION="0.2.0-rc4"
+  install_old_binary
+  USE_KNOWN_SOURCE_MATRIX=1
+  expect_success
+  assert_contains "$STDERR_PATH" 'NONCANONICAL_SOURCE_BINARY'
+  assert_not_contains "$STDERR_PATH" 'NONCANONICAL_V010_BINARY'
+  assert_contains "$STDERR_PATH" "version=aopmem 0.2.0-rc4"
+  assert_contains "$STDERR_PATH" "sha256=$TEST_OLD_SHA"
+  assert_contains "$TRACE_PATH" '^warning\.NONCANONICAL_SOURCE_BINARY$'
+  assert_equal \
+    "$(grep -Ec '^upgrade\.apply$' "$TRACE_PATH")" \
+    "1" \
+    "unknown RC4 apply count"
   pass
 }
 
 test_supported_version_matrix() {
-  for old_version in 0.1.0 0.2.0-rc1 0.2.0-rc2 0.2.0-rc3 0.2.0-rc4 0.2.0-rc5; do
+  for old_version in \
+    0.1.0 0.2.0-rc1 0.2.0-rc2 0.2.0-rc3 \
+    0.2.0-rc4 0.2.0-rc5 0.2.0-rc6
+  do
     setup_case "accepted-${old_version}"
     OLD_STUB_VERSION=$old_version
     install_old_binary
@@ -467,7 +550,7 @@ test_supported_version_matrix() {
     assert_contains "$TRACE_PATH" '^upgrade\.publish$'
   done
 
-  for old_version in 0.2.0-rc6 0.2.0-rc0 0.3.0; do
+  for old_version in 0.2.0-rc7 0.2.0-rc0 0.3.0; do
     setup_case "rejected-${old_version}"
     OLD_STUB_VERSION=$old_version
     install_old_binary
@@ -506,9 +589,9 @@ EOF
   pass
 }
 
-test_real_rc6_adopts_installer_manifest() {
+test_real_rc7_adopts_installer_manifest() {
   [ -x "$REPO_ROOT/target/debug/aopmem" ] ||
-    fail "real debug rc6 binary is required for manifest adoption proof"
+    fail "real debug rc7 binary is required for manifest adoption proof"
   setup_case real-adopt-manifest
   install_old_binary
   mkdir -p "$AOPMEM_HOME_PATH/a"
@@ -539,7 +622,7 @@ test_real_rc6_adopts_installer_manifest() {
   manifest_hash=$(shasum -a 256 "$backup/MANIFEST.sha256" | awk '{ print tolower($1) }')
   AOPMEM_HOME="$AOPMEM_HOME_PATH" "$REPO_ROOT/target/debug/aopmem" \
     upgrade backup --adopt "$backup" --manifest-sha256 "$manifest_hash" --json \
-    > "$CASE_ROOT/adopt.json" || fail "real rc6 rejected installer manifest"
+    > "$CASE_ROOT/adopt.json" || fail "real rc7 rejected installer manifest"
   assert_contains "$CASE_ROOT/adopt.json" '"ok":true'
   assert_contains "$backup/MANIFEST.sha256" '^a/child$'
   assert_contains "$backup/MANIFEST.sha256" '^a\.txt$'
@@ -668,7 +751,7 @@ test_path_rejections() {
   expect_failure
   assert_contains "$STDERR_PATH" 'AOPMem home contains a symbolic link'
   backup_root=$(find "$CASE_ROOT" -maxdepth 1 \
-    -name 'aopmem-home-backup-v0.2.0-rc6-*' -print -quit)
+    -name 'aopmem-home-backup-v0.2.0-rc7-*' -print -quit)
   [ -z "$backup_root" ] || fail "unsafe source was copied before rejection"
   assert_not_contains "$TRACE_PATH" '^asset\.download\.started$'
 
@@ -685,7 +768,7 @@ test_path_rejections() {
   expect_failure
   assert_contains "$STDERR_PATH" 'maximum backup directory depth'
   backup_root=$(find "$CASE_ROOT" -maxdepth 1 \
-    -name 'aopmem-home-backup-v0.2.0-rc6-*' -print -quit)
+    -name 'aopmem-home-backup-v0.2.0-rc7-*' -print -quit)
   [ -z "$backup_root" ] || fail "over-depth source was copied before rejection"
   assert_not_contains "$TRACE_PATH" '^asset\.download\.started$'
 
@@ -704,7 +787,7 @@ test_pre_apply_failures_leave_binary_unchanged() {
   assert_not_contains "$TRACE_PATH" '^upgrade\.apply$'
   assert_contains "$TRACE_PATH" '^rollback\.unchanged$'
   assert_contains "$STDERR_PATH" 'code=FIXTURE_PREPARE_FAILED'
-  full_backup=$(find "$CASE_ROOT" -path '*/aopmem-home-backup-v0.2.0-rc6-*/bin/aopmem' -print -quit)
+  full_backup=$(find "$CASE_ROOT" -path '*/aopmem-home-backup-v0.2.0-rc7-*/bin/aopmem' -print -quit)
   assert_file "$full_backup"
   assert_temp_clean "$TEMP_PARENT"
 
@@ -720,7 +803,7 @@ test_pre_apply_failures_leave_binary_unchanged() {
   assert_contains "$TRACE_PATH" '^rollback\.unchanged$'
   backup=$(find "$AOPMEM_HOME_PATH/bin" -name 'aopmem.backup-*' -print -quit)
   assert_file "$backup"
-  retained=$(find "$AOPMEM_HOME_PATH/bin" -name '.aopmem-v0.2.0-rc6.staged' -print -quit)
+  retained=$(find "$AOPMEM_HOME_PATH/bin" -name '.aopmem-v0.2.0-rc7.staged' -print -quit)
   assert_file "$retained"
   assert_temp_clean "$TEMP_PARENT"
 
@@ -752,7 +835,7 @@ test_post_apply_failures_preserve_recovery() {
   expect_failure AOPMEM_STUB_APPLY_FAIL=1
   new_inode=$(ls -di "$AOPMEM_HOME_PATH/bin/aopmem" | awk '{ print $1 }')
   assert_equal "$new_inode" "$old_inode" "apply failure inode"
-  recovery=$(find "$AOPMEM_HOME_PATH/bin" -name '.aopmem-v0.2.0-rc6.staged' -print -quit)
+  recovery=$(find "$AOPMEM_HOME_PATH/bin" -name '.aopmem-v0.2.0-rc7.staged' -print -quit)
   assert_file "$recovery"
   assert_contains "$STDERR_PATH" 'do not run the v0.1 binary'
   assert_contains "$STDERR_PATH" 'recovery binary preserved at'
@@ -773,7 +856,7 @@ test_post_apply_failures_preserve_recovery() {
   expect_failure AOPMEM_INSTALL_TEST_FAIL_AT=publish
   new_inode=$(ls -di "$AOPMEM_HOME_PATH/bin/aopmem" | awk '{ print $1 }')
   assert_equal "$new_inode" "$old_inode" "publish failure inode"
-  recovery=$(find "$AOPMEM_HOME_PATH/bin" -name '.aopmem-v0.2.0-rc6.staged' -print -quit)
+  recovery=$(find "$AOPMEM_HOME_PATH/bin" -name '.aopmem-v0.2.0-rc7.staged' -print -quit)
   assert_file "$recovery"
   expected=$(shasum -a 256 "$ASSET_DIR/aopmem-darwin-arm64" | awk '{ print $1 }')
   actual=$(shasum -a 256 "$recovery" | awk '{ print $1 }')
@@ -818,7 +901,7 @@ test_update_success
 test_tagged_source_acceptance_and_hash_binding
 test_supported_version_matrix
 test_exact_active_adapter_pairs
-test_real_rc6_adopts_installer_manifest
+test_real_rc7_adopts_installer_manifest
 test_checksum_failures
 test_asset_base_uri_rejections
 test_path_rejections

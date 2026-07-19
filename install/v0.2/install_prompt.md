@@ -1,11 +1,11 @@
-# AOPMem v0.2.0-rc6 install prompt
+# AOPMem v0.2.0-rc7 install prompt
 
-Use this prompt to install AOPMem v0.2.0-rc6 for the current project.
+Use this prompt to install AOPMem v0.2.0-rc7 for the current project.
 It supports a fresh install and an update from compatible AOPMem v0.1.0
 SQLite workspaces.
 
 ````text
-You are installing AOPMem v0.2.0-rc6 for the user's current project.
+You are installing AOPMem v0.2.0-rc7 for the user's current project.
 
 Complete the whole safe flow without pausing between normal steps.
 Do not run Codex CLI during installation.
@@ -43,6 +43,73 @@ Forbidden install methods:
 - Codex CLI;
 - external terminals.
 
+Windows bootstrap:
+
+- Use native Windows PowerShell 5.1 in the current console.
+- Download the immutable RC7 installer from:
+  `https://raw.githubusercontent.com/ARQAWA/aopmem-cli/v0.2.0-rc7/install/v0.2/install.ps1`
+- Create a new unique private directory below `%TEMP%`; never download the
+  installer into the repository.
+- Behind a proxy, use normal `Invoke-WebRequest` redirect behavior with
+  `-Proxy <PROXY_URI>` and optional `-ProxyUseDefaultCredentials`. Do not use
+  `-MaximumRedirection 0`:
+
+  ```powershell
+  $proxyUri = [Uri]"<PROXY_URI>"
+  $tempRoot = Join-Path ([IO.Path]::GetTempPath()) `
+      ("aopmem-rc7-bootstrap-" + [Guid]::NewGuid().ToString("N"))
+  $null = New-Item -ItemType Directory -Path $tempRoot -ErrorAction Stop
+  $installer = Join-Path $tempRoot "install.ps1"
+  Invoke-WebRequest `
+      -Uri "https://raw.githubusercontent.com/ARQAWA/aopmem-cli/v0.2.0-rc7/install/v0.2/install.ps1" `
+      -OutFile $installer `
+      -UseBasicParsing `
+      -Proxy $proxyUri `
+      -ProxyUseDefaultCredentials `
+      -TimeoutSec 900 `
+      -ErrorAction Stop
+  $installerHash = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash
+  if ($installerHash -ine "c306d664664852b4f60bf834fa2f5d798312e8646ef9921eae9d14007bd5c949") {
+      throw "INSTALLER_SHA256_MISMATCH"
+  }
+  & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
+      -NoProfile `
+      -ExecutionPolicy Bypass `
+      -File $installer `
+      -AssetBaseUri "https://github.com/ARQAWA/aopmem-cli/releases/download/v0.2.0-rc7" `
+      -ProxyUri $proxyUri `
+      -ProxyUseDefaultCredentials
+  ```
+
+- Omit both `-Proxy`/`-ProxyUseDefaultCredentials` from the bootstrap and
+  `-ProxyUri`/`-ProxyUseDefaultCredentials` from the installer invocation
+  when no proxy is configured:
+
+  ```powershell
+  $tempRoot = Join-Path ([IO.Path]::GetTempPath()) `
+      ("aopmem-rc7-bootstrap-" + [Guid]::NewGuid().ToString("N"))
+  $null = New-Item -ItemType Directory -Path $tempRoot -ErrorAction Stop
+  $installer = Join-Path $tempRoot "install.ps1"
+  Invoke-WebRequest `
+      -Uri "https://raw.githubusercontent.com/ARQAWA/aopmem-cli/v0.2.0-rc7/install/v0.2/install.ps1" `
+      -OutFile $installer `
+      -UseBasicParsing `
+      -TimeoutSec 900 `
+      -ErrorAction Stop
+  $installerHash = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash
+  if ($installerHash -ine "c306d664664852b4f60bf834fa2f5d798312e8646ef9921eae9d14007bd5c949") {
+      throw "INSTALLER_SHA256_MISMATCH"
+  }
+  & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
+      -NoProfile `
+      -ExecutionPolicy Bypass `
+      -File $installer `
+      -AssetBaseUri "https://github.com/ARQAWA/aopmem-cli/releases/download/v0.2.0-rc7"
+  ```
+
+Proxy setup is technical environment setup. It is not an onboarding question.
+Never put proxy credentials in a URI, command, log, report, or file.
+
 Release inputs:
 
 - The trusted release context supplies an HTTPS asset base URI.
@@ -54,14 +121,16 @@ Release inputs:
   - aopmem-windows-x86_64.exe
   - SHA256SUMS
 
-The audited RC6 artifact digests are:
+The audited RC7 artifact digests are:
 
 - aopmem-darwin-arm64:
-  b933d921ae6ec68ce7e0f118de27fd7eabe9d1c42d715a0a6df8f2ec731cb949
+  8998c88efaa59a9abc4d4ddce01adf67f4b1a47361b01b483053ebe0e3841786
 - aopmem-windows-x86_64.exe:
-  8cd03fd00ffdaf505d7f31cd1c485fd15179823f84a78061b7bcfc00ee4fd4c7
+  9e957a2b47c7442ab6aff57a8f8d3469b41e158831a55be18218fc239db29ae1
 - SHA256SUMS:
-  e4e7142e30cb6ef4cac2c7402b8ace8b87fc37df87add59ccb8d79d15d0f3dba
+  89e59fd7eceed6048d1ef0367bd4cccc32cc40ab692713e4224e60c78b36e0bc
+- immutable install.ps1:
+  c306d664664852b4f60bf834fa2f5d798312e8646ef9921eae9d14007bd5c949
 
 Integrity rules:
 
@@ -71,7 +140,7 @@ Integrity rules:
 - Reject a missing, duplicate, malformed, or differently named line.
 - Verify SHA-256 before chmod or any binary execution.
 - Verify the downloaded binary reports exactly:
-  aopmem 0.2.0-rc6
+  aopmem 0.2.0-rc7
 - Never execute an unverified file.
 
 Path rules:
@@ -89,11 +158,14 @@ Select the flow silently:
 1. No installed binary means fresh install.
 2. A compatible installed binary reports exactly one of `aopmem 0.1.0`,
    `aopmem 0.2.0-rc1`, `aopmem 0.2.0-rc2`, `aopmem 0.2.0-rc3`,
-   `aopmem 0.2.0-rc4`, or `aopmem 0.2.0-rc5`.
-   Recognize the known v0.1.0-rc3 release SHA-256. For another SHA-256,
-   emit `NONCANONICAL_V010_BINARY`, require the durable full backup, and let
-   staged `upgrade prepare` plus `upgrade plan` decide workspace compatibility.
-3. Any other installed version, including RC6 itself, is unsupported. Stop
+   `aopmem 0.2.0-rc4`, `aopmem 0.2.0-rc5`, or `aopmem 0.2.0-rc6`.
+   Recognize exact published platform hashes for v0.1.0-rc3 and RC1 through
+   RC6. For another compatible RC1-RC6 SHA-256, emit
+   `NONCANONICAL_SOURCE_BINARY`; for another compatible v0.1 SHA-256, emit
+   `NONCANONICAL_V010_BINARY`. Keep the actual version and hash visible,
+   require the durable full backup, and let staged `upgrade prepare` plus
+   `upgrade plan` decide workspace compatibility.
+3. Any other installed version, including RC7 itself, is unsupported. Stop
    without changing it.
 
 For macOS, use the supplied install/v0.2/install.sh.
@@ -108,10 +180,16 @@ Use native Windows PowerShell 5.1 only.
 Invoke the system Windows PowerShell executable in the same console with
 -NoProfile and process-only -ExecutionPolicy Bypass. This does not change
 the user or machine execution policy and must not open a new window.
-The script must configure TLS 1.2 and UTF-8, use
-Invoke-WebRequest -UseBasicParsing, inspect each redirect with automatic
-redirects disabled and use Get-FileHash. It must never call File.Replace or
-File.Move for the update binary; only `aopmem upgrade publish --json` may do it.
+The script must configure TLS 1.2 and UTF-8 and use a PowerShell 5.1-compatible
+`System.Net.Http.HttpClient` transport with
+`HttpClientHandler.AllowAutoRedirect=false`. It must process 301, 302, 303,
+307, and 308 as normal responses, validate every redirect as HTTPS-only,
+reject userinfo, loops, and more than 10 hops, stream into a create-new partial
+file, preserve the original network exception, and use `Get-FileHash`.
+It must not use production `Invoke-WebRequest -MaximumRedirection 0` or access
+an absent `Exception.Response` property. It must never call `File.Replace` or
+`File.Move` for the update binary; only `aopmem upgrade publish --json` may do
+it.
 
 Fresh flow:
 
@@ -146,8 +224,8 @@ Update flow:
    unknown process automatically.
 3. Create and verify a durable full backup of AOPMem home plus the old binary.
    The installer-owned backup is a direct sibling named
-   `aopmem-home-backup-v0.2.0-rc6-*` with deterministic `MANIFEST.sha256`.
-4. Download and verify RC6. Then adopt exactly that unchanged backup:
+   `aopmem-home-backup-v0.2.0-rc7-*` with deterministic `MANIFEST.sha256`.
+4. Download and verify RC7. Then adopt exactly that unchanged backup:
    `aopmem upgrade backup --adopt <backup> --manifest-sha256 <digest> --json`.
 5. Retain the verified artifact with `upgrade stage --artifact ... --sha256 ...`.
 6. Run staged `platform check --json`. If it fails, stop before prepare.

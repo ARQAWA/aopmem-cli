@@ -1,17 +1,37 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $false)]
-    [string]$AssetBaseUri
+    [string]$AssetBaseUri,
+
+    [Parameter(Mandatory = $false)]
+    [Uri]$ProxyUri,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$ProxyUseDefaultCredentials
 )
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = "Stop"
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
-$script:ProductVersion = "0.2.0-rc6"
+$script:ProductVersion = "0.2.0-rc7"
 $script:OldReleaseLabel = "0.1.0-rc3"
-$script:OldBinaryVersion = "0.1.0"
-$script:OldBinarySha256 = "01010aeffc20aead5f353353674621b367e6ad590769e4b5915b8d02d62f6d7a"
+$script:KnownSourceHashes = @{
+    "aopmem 0.1.0" =
+        "01010aeffc20aead5f353353674621b367e6ad590769e4b5915b8d02d62f6d7a"
+    "aopmem 0.2.0-rc1" =
+        "a4e3302d6f26dd9d16387a075189fec51c469aef9b8d9c730f81001b21b2cf57"
+    "aopmem 0.2.0-rc2" =
+        "77a2e79162c609ff62dbaa4533c5f7237490c842047485fe79a608a14f57a5f8"
+    "aopmem 0.2.0-rc3" =
+        "ed59be73d99efd2c1a4fe99e50b85e8b6ce8e8a73b7ff0c96b5327e1c2d39477"
+    "aopmem 0.2.0-rc4" =
+        "e4442fd06622a6b94f997e23b67a55753f1d841f6570ef20ac72b99083a6cc1c"
+    "aopmem 0.2.0-rc5" =
+        "150db4699c2f41c6e529f9606ac099c9ac6b4771b5084952f2cb5df3226d1b58"
+    "aopmem 0.2.0-rc6" =
+        "8cd03fd00ffdaf505d7f31cd1c485fd15179823f84a78061b7bcfc00ee4fd4c7"
+}
 $script:AssetName = "aopmem-windows-x86_64.exe"
 $script:ChecksumName = "SHA256SUMS"
 $script:TestMode = ($env:AOPMEM_INSTALL_TEST_MODE -eq "1")
@@ -39,6 +59,11 @@ $script:VerifiedBinaryHash = $null
 $script:LastAopmemJsonText = $null
 $script:ActiveAdapter = $env:AOPMEM_ACTIVE_ADAPTER
 $script:ActiveInstructionFile = $env:AOPMEM_ACTIVE_INSTRUCTION_FILE
+$script:AssetProxyInitialized = $false
+$script:AssetProxy = $null
+$script:ProxySource = "none"
+$script:ProxyConfigured = "no"
+$script:LastTransportResult = $null
 
 function Write-TestTrace {
     param([Parameter(Mandatory = $true)][string]$EventName)
@@ -208,55 +233,454 @@ function Assert-TrustedHttpsUri {
     }
 }
 
+function Throw-AssetTransportError {
+    param(
+        [Parameter(Mandatory = $true)][string]$Code,
+        [Parameter(Mandatory = $true)][string]$Detail,
+        [Parameter(Mandatory = $true)][Uri]$TargetUri,
+        [Parameter(Mandatory = $true)][string]$Destination,
+        [Parameter(Mandatory = $true)][int]$RedirectHop,
+        [Parameter(Mandatory = $true)][string]$PartialState,
+        [Parameter(Mandatory = $false)][Exception]$InnerException
+    )
+
+    $safeTarget = $TargetUri.Host + $TargetUri.AbsolutePath
+    $message = (
+        "{0}: {1}; stage=asset_download target={2} proxy_configured={3} " +
+        "proxy_source={4} redirect_hop={5} destination={6} partial={7}"
+    ) -f
+        $Code,
+        $Detail,
+        $safeTarget,
+        $script:ProxyConfigured,
+        $script:ProxySource,
+        $RedirectHop,
+        $Destination,
+        $PartialState
+    if ($null -ne $InnerException) {
+        $message += (
+            "; exception_type={0} exception_message={1}" -f
+                $InnerException.GetType().FullName,
+                $InnerException.Message)
+        throw (New-Object System.InvalidOperationException `
+            -ArgumentList @($message, $InnerException))
+    }
+    Throw-InstallError $message
+}
+
+function Test-ValidProxyUri {
+    param([Parameter(Mandatory = $true)][Uri]$Candidate)
+
+    return (
+        $Candidate.IsAbsoluteUri -and
+        ($Candidate.Scheme -ieq "http" -or $Candidate.Scheme -ieq "https") -and
+        -not [string]::IsNullOrWhiteSpace($Candidate.Host) -and
+        [string]::IsNullOrEmpty($Candidate.UserInfo) -and
+        [string]::IsNullOrEmpty($Candidate.Query) -and
+        [string]::IsNullOrEmpty($Candidate.Fragment) -and
+        -not ($Candidate.OriginalString -match "\s"))
+}
+
+function Get-OriginalTransportException {
+    param([Parameter(Mandatory = $true)][Exception]$Exception)
+
+    $original = $Exception
+    while ($null -ne $original.InnerException -and
+        ($original -is
+            [System.Management.Automation.MethodInvocationException] -or
+         $original -is
+            [System.Reflection.TargetInvocationException])) {
+        $original = $original.InnerException
+    }
+    return $original
+}
+
+function Initialize-AssetProxy {
+    param([Parameter(Mandatory = $true)][Uri]$ProbeUri)
+
+    if ($script:AssetProxyInitialized) {
+        return
+    }
+
+    $selectedUri = $null
+    $selectedSource = "none"
+    if ($null -ne $ProxyUri) {
+        $selectedUri = $ProxyUri
+        $selectedSource = "explicit"
+    }
+    else {
+        foreach ($environmentName in @(
+                "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy")) {
+            $environmentValue = [Environment]::GetEnvironmentVariable(
+                $environmentName)
+            if (-not [string]::IsNullOrEmpty($environmentValue)) {
+                $parsedEnvironmentUri = $null
+                if (-not [Uri]::TryCreate(
+                        $environmentValue,
+                        [UriKind]::Absolute,
+                        [ref]$parsedEnvironmentUri) -or
+                    -not (Test-ValidProxyUri -Candidate $parsedEnvironmentUri)) {
+                    Throw-InstallError (
+                        "PROXY_CONFIGURATION_INVALID: invalid env proxy; " +
+                        "proxy_configured=yes proxy_source=env")
+                }
+                $selectedUri = $parsedEnvironmentUri
+                $selectedSource = "env"
+                break
+            }
+        }
+    }
+
+    if ($null -ne $selectedUri) {
+        if (-not (Test-ValidProxyUri -Candidate $selectedUri)) {
+            Throw-InstallError (
+                "PROXY_CONFIGURATION_INVALID: invalid proxy; " +
+                "proxy_configured=yes proxy_source=$selectedSource")
+        }
+        $script:AssetProxy = New-Object System.Net.WebProxy($selectedUri)
+        $script:ProxySource = $selectedSource
+        $script:ProxyConfigured = "yes"
+    }
+    else {
+        $systemProxy = [System.Net.WebRequest]::DefaultWebProxy
+        if ($null -ne $systemProxy) {
+            $systemProxyUri = $null
+            try {
+                if (-not $systemProxy.IsBypassed($ProbeUri)) {
+                    $systemProxyUri = $systemProxy.GetProxy($ProbeUri)
+                }
+            }
+            catch {
+                $systemProxyUri = $null
+            }
+            if ($null -ne $systemProxyUri -and
+                $systemProxyUri.AbsoluteUri -ine $ProbeUri.AbsoluteUri -and
+                (Test-ValidProxyUri -Candidate $systemProxyUri)) {
+                $script:AssetProxy =
+                    New-Object System.Net.WebProxy($systemProxyUri)
+                $script:ProxySource = "system"
+                $script:ProxyConfigured = "yes"
+            }
+        }
+    }
+
+    if ($ProxyUseDefaultCredentials -and $null -ne $script:AssetProxy) {
+        $script:AssetProxy.Credentials =
+            [System.Net.CredentialCache]::DefaultNetworkCredentials
+    }
+    $script:AssetProxyInitialized = $true
+}
+
 function Save-HttpsAsset {
     param(
         [Parameter(Mandatory = $true)][Uri]$InitialUri,
         [Parameter(Mandatory = $true)][string]$Destination
     )
 
+    Initialize-AssetProxy -ProbeUri $InitialUri
+    Add-Type -AssemblyName System.Net.Http
+
+    $partial = $null
+    $partialOwned = $false
+    $partialState = "none"
+    $handler = $null
+    $client = $null
+    $response = $null
+    $responseStream = $null
+    $destinationStream = $null
     $currentUri = $InitialUri
-    for ($redirectCount = 0; $redirectCount -le 10; $redirectCount += 1) {
-        Assert-TrustedHttpsUri -Uri $currentUri -Context "asset URI"
-        try {
-            $null = Invoke-WebRequest `
-                -Uri $currentUri `
-                -OutFile $Destination `
-                -UseBasicParsing `
-                -MaximumRedirection 0 `
-                -TimeoutSec 900 `
-                -ErrorAction Stop
-            if (-not [IO.File]::Exists($Destination) -or
-                (Get-Item -LiteralPath $Destination).Length -le 0) {
-                Throw-InstallError "download returned no data: $currentUri"
-            }
-            return
+    $redirectCount = 0
+    $byteCount = [Int64]0
+
+    Assert-TrustedHttpsUri -Uri $InitialUri -Context "asset URI"
+    if (-not [string]::IsNullOrEmpty($InitialUri.Query) -or
+        -not [string]::IsNullOrEmpty($InitialUri.Fragment)) {
+        Throw-AssetTransportError -Code "UNSAFE_REDIRECT_TARGET" `
+            -Detail "initial URI contains query or fragment" `
+            -TargetUri $InitialUri -Destination $Destination `
+            -RedirectHop 0 -PartialState $partialState
+    }
+
+    $destinationParent = [IO.Path]::GetFullPath(
+        [IO.Path]::GetDirectoryName($Destination))
+    $validatedTempRoot = [IO.Path]::GetFullPath($script:TempRoot)
+    if ($destinationParent -ine $validatedTempRoot) {
+        Throw-AssetTransportError -Code "ASSET_DOWNLOAD_FAILED" `
+            -Detail "destination parent is not the private temporary root" `
+            -TargetUri $InitialUri -Destination $Destination `
+            -RedirectHop 0 -PartialState $partialState
+    }
+    if ([IO.File]::Exists($Destination) -or
+        [IO.Directory]::Exists($Destination)) {
+        Throw-AssetTransportError -Code "ASSET_DOWNLOAD_FAILED" `
+            -Detail "destination already exists" -TargetUri $InitialUri `
+            -Destination $Destination -RedirectHop 0 `
+            -PartialState $partialState
+    }
+
+    $initialOrigin = $InitialUri.GetLeftPart([UriPartial]::Authority)
+    $initialPath = $InitialUri.AbsolutePath
+    $lastSlash = $initialPath.LastIndexOf("/")
+    if ($lastSlash -lt 0 -or $lastSlash -eq ($initialPath.Length - 1)) {
+        Throw-AssetTransportError -Code "UNSAFE_REDIRECT_TARGET" `
+            -Detail "initial asset is not a flat direct child" `
+            -TargetUri $InitialUri -Destination $Destination `
+            -RedirectHop 0 -PartialState $partialState
+    }
+    $initialBasePath = $initialPath.Substring(0, $lastSlash + 1)
+    $flatAssetName = [Uri]::UnescapeDataString(
+        $initialPath.Substring($lastSlash + 1))
+    if ([string]::IsNullOrWhiteSpace($flatAssetName) -or
+        $flatAssetName.Contains("/") -or $flatAssetName.Contains("\")) {
+        Throw-AssetTransportError -Code "UNSAFE_REDIRECT_TARGET" `
+            -Detail "initial asset name is not flat" -TargetUri $InitialUri `
+            -Destination $Destination -RedirectHop 0 `
+            -PartialState $partialState
+    }
+    $githubRelease = (
+        $InitialUri.Host -ieq "github.com" -and
+        $initialPath -match
+            "^/[^/]+/[^/]+/releases/download/[^/]+/[^/]+$")
+    $onReleaseAssets = $false
+    $visited = New-Object "System.Collections.Generic.HashSet[string]" (
+        [StringComparer]::Ordinal)
+    [void]$visited.Add($InitialUri.AbsoluteUri)
+
+    try {
+        $handler = New-Object System.Net.Http.HttpClientHandler
+        $handler.AllowAutoRedirect = $false
+        $handler.UseCookies = $false
+        $handler.UseDefaultCredentials = $false
+        $handler.PreAuthenticate = $false
+        $handler.Credentials = $null
+        if ($null -ne $script:AssetProxy) {
+            $handler.UseProxy = $true
+            $handler.Proxy = $script:AssetProxy
         }
-        catch {
-            Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
-            $response = $_.Exception.Response
-            if ($null -eq $response) {
-                throw
-            }
+        else {
+            $handler.UseProxy = $false
+        }
+        $client = New-Object System.Net.Http.HttpClient($handler, $false)
+        $client.Timeout = [TimeSpan]::FromSeconds(900)
+
+        while ($true) {
             try {
-                $statusCode = [int]$response.StatusCode
-                $location = $response.Headers["Location"]
+                $response = $client.GetAsync(
+                    $currentUri,
+                    [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead
+                ).GetAwaiter().GetResult()
             }
-            finally {
-                $response.Close()
+            catch {
+                $requestException = Get-OriginalTransportException `
+                    -Exception $_.Exception
+                Throw-AssetTransportError -Code "HTTP_REQUEST_FAILED" `
+                    -Detail "HTTP request failed" -TargetUri $currentUri `
+                    -Destination $Destination -RedirectHop $redirectCount `
+                    -PartialState $partialState `
+                    -InnerException $requestException
             }
-            if ($statusCode -lt 300 -or $statusCode -ge 400 -or
-                [string]::IsNullOrWhiteSpace($location)) {
-                throw
+
+            $statusCode = [int]$response.StatusCode
+            # Accepted redirect status codes: 301, 302, 303, 307, 308.
+            $isRedirect = $statusCode -eq 301 -or $statusCode -eq 302 -or
+                $statusCode -eq 303 -or $statusCode -eq 307 -or
+                $statusCode -eq 308
+            if ($isRedirect) {
+                $location = $response.Headers.Location
+                $response.Dispose()
+                $response = $null
+                if ($null -eq $location -or
+                    [string]::IsNullOrWhiteSpace($location.OriginalString)) {
+                    Throw-AssetTransportError `
+                        -Code "HTTP_REDIRECT_MISSING_LOCATION" `
+                        -Detail "HTTP status=$statusCode has no Location" `
+                        -TargetUri $currentUri -Destination $Destination `
+                        -RedirectHop $redirectCount -PartialState $partialState
+                }
+                if ($redirectCount -ge 10) {
+                    Throw-AssetTransportError -Code "HTTP_REDIRECT_LIMIT" `
+                        -Detail "redirect limit 10 exceeded; HTTP status=$statusCode" `
+                        -TargetUri $currentUri -Destination $Destination `
+                        -RedirectHop $redirectCount -PartialState $partialState
+                }
+                try {
+                    $nextUri = New-Object System.Uri($currentUri, $location)
+                }
+                catch {
+                    Throw-AssetTransportError -Code "UNSAFE_REDIRECT_TARGET" `
+                        -Detail "redirect Location is malformed" `
+                        -TargetUri $currentUri -Destination $Destination `
+                        -RedirectHop $redirectCount -PartialState $partialState `
+                        -InnerException $_.Exception
+                }
+                if (-not $nextUri.IsAbsoluteUri -or
+                    $nextUri.Scheme -cne "https" -or
+                    [string]::IsNullOrWhiteSpace($nextUri.Host) -or
+                    -not [string]::IsNullOrEmpty($nextUri.UserInfo) -or
+                    -not [string]::IsNullOrEmpty($nextUri.Fragment)) {
+                    Throw-AssetTransportError -Code "UNSAFE_REDIRECT_TARGET" `
+                        -Detail "redirect target violates HTTPS boundary" `
+                        -TargetUri $currentUri -Destination $Destination `
+                        -RedirectHop $redirectCount -PartialState $partialState
+                }
+
+                $nextPath = $nextUri.AbsolutePath
+                $decodedPath = [Uri]::UnescapeDataString($nextPath)
+                if ($decodedPath.Contains("\") -or
+                    $decodedPath -match "(^|/)\.\.?(/|$)") {
+                    Throw-AssetTransportError -Code "UNSAFE_REDIRECT_TARGET" `
+                        -Detail "redirect target contains path traversal" `
+                        -TargetUri $currentUri -Destination $Destination `
+                        -RedirectHop $redirectCount -PartialState $partialState
+                }
+                $nextOrigin = $nextUri.GetLeftPart([UriPartial]::Authority)
+                if ($onReleaseAssets) {
+                    $allowedTarget = (
+                        $nextUri.Host -ieq "release-assets.githubusercontent.com" -and
+                        $nextOrigin -ieq
+                            "https://release-assets.githubusercontent.com" -and
+                        -not [string]::IsNullOrWhiteSpace($nextPath) -and
+                        $nextPath -cne "/")
+                }
+                elseif ($nextOrigin -ieq $initialOrigin) {
+                    $allowedTarget = (
+                        $nextPath.StartsWith(
+                            $initialBasePath,
+                            [StringComparison]::Ordinal) -and
+                        [string]::IsNullOrEmpty($nextUri.Query))
+                }
+                else {
+                    $allowedTarget = (
+                        $githubRelease -and
+                        $nextOrigin -ieq
+                            "https://release-assets.githubusercontent.com" -and
+                        -not [string]::IsNullOrWhiteSpace($nextPath) -and
+                        $nextPath -cne "/")
+                    if ($allowedTarget) {
+                        $onReleaseAssets = $true
+                    }
+                }
+                if (-not $allowedTarget) {
+                    Throw-AssetTransportError -Code "UNSAFE_REDIRECT_TARGET" `
+                        -Detail "redirect target escapes release boundary" `
+                        -TargetUri $currentUri -Destination $Destination `
+                        -RedirectHop $redirectCount -PartialState $partialState
+                }
+                if (-not $visited.Add($nextUri.AbsoluteUri)) {
+                    Throw-AssetTransportError -Code "HTTP_REDIRECT_LOOP" `
+                        -Detail "redirect target was already visited" `
+                        -TargetUri $currentUri -Destination $Destination `
+                        -RedirectHop $redirectCount -PartialState $partialState
+                }
+                $currentUri = $nextUri
+                $redirectCount += 1
+                continue
             }
-            if ($redirectCount -ge 10) {
-                Throw-InstallError "download redirect limit exceeded: $InitialUri"
+
+            if ($statusCode -ne 200) {
+                Throw-AssetTransportError -Code "HTTP_STATUS_REJECTED" `
+                    -Detail "HTTP status=$statusCode" -TargetUri $currentUri `
+                    -Destination $Destination -RedirectHop $redirectCount `
+                    -PartialState $partialState
             }
-            $nextUri = New-Object System.Uri($currentUri, $location)
-            Assert-TrustedHttpsUri -Uri $nextUri -Context "download redirect"
-            $currentUri = $nextUri
+
+            $partial = Join-Path $destinationParent (
+                ".{0}.{1}.partial" -f
+                    [IO.Path]::GetFileName($Destination),
+                    [Guid]::NewGuid().ToString("N"))
+            try {
+                $destinationStream = [IO.File]::Open(
+                    $partial,
+                    [IO.FileMode]::CreateNew,
+                    [IO.FileAccess]::Write,
+                    [IO.FileShare]::None)
+                $partialOwned = $true
+                $partialState = "created"
+                $responseStream = $response.Content.ReadAsStreamAsync(
+                    ).GetAwaiter().GetResult()
+                $buffer = New-Object byte[] 65536
+                while (($read = $responseStream.Read(
+                            $buffer, 0, $buffer.Length)) -gt 0) {
+                    $destinationStream.Write($buffer, 0, $read)
+                    $byteCount += [Int64]$read
+                }
+                if ($byteCount -le 0) {
+                    Throw-AssetTransportError -Code "ASSET_DOWNLOAD_FAILED" `
+                        -Detail "download returned zero bytes; HTTP status=200" `
+                        -TargetUri $currentUri -Destination $Destination `
+                        -RedirectHop $redirectCount -PartialState $partialState
+                }
+                $contentLength = $response.Content.Headers.ContentLength
+                if ($null -ne $contentLength -and
+                    [Int64]$contentLength -ne $byteCount) {
+                    Throw-AssetTransportError -Code "ASSET_LENGTH_MISMATCH" `
+                        -Detail (
+                            "Content-Length={0} actual={1}; HTTP status=200" -f
+                                $contentLength, $byteCount) `
+                        -TargetUri $currentUri -Destination $Destination `
+                        -RedirectHop $redirectCount -PartialState $partialState
+                }
+                $destinationStream.Flush($true)
+                $destinationStream.Dispose()
+                $destinationStream = $null
+                $responseStream.Dispose()
+                $responseStream = $null
+                $response.Dispose()
+                $response = $null
+                if ([IO.File]::Exists($Destination) -or
+                    [IO.Directory]::Exists($Destination)) {
+                    Throw-AssetTransportError -Code "ASSET_DOWNLOAD_FAILED" `
+                        -Detail "destination appeared before publication" `
+                        -TargetUri $currentUri -Destination $Destination `
+                        -RedirectHop $redirectCount -PartialState $partialState
+                }
+                [IO.File]::Move($partial, $Destination)
+                $partialOwned = $false
+                $partialState = "published"
+                $script:LastTransportResult = [PSCustomObject]@{
+                    Path = $Destination
+                    ByteCount = $byteCount
+                    FinalUri = $currentUri.Host + $currentUri.AbsolutePath
+                    RedirectCount = $redirectCount
+                    PartialState = $partialState
+                }
+                return
+            }
+            catch {
+                if ($_.Exception.Message -match
+                    "^(ASSET_DOWNLOAD_FAILED|ASSET_LENGTH_MISMATCH):") {
+                    throw
+                }
+                $streamException = Get-OriginalTransportException `
+                    -Exception $_.Exception
+                Throw-AssetTransportError -Code "ASSET_DOWNLOAD_FAILED" `
+                    -Detail "stream or publication failed" `
+                    -TargetUri $currentUri -Destination $Destination `
+                    -RedirectHop $redirectCount -PartialState $partialState `
+                    -InnerException $streamException
+            }
         }
     }
-    Throw-InstallError "download redirect limit exceeded: $InitialUri"
+    finally {
+        if ($null -ne $destinationStream) {
+            $destinationStream.Dispose()
+        }
+        if ($null -ne $responseStream) {
+            $responseStream.Dispose()
+        }
+        if ($null -ne $response) {
+            $response.Dispose()
+        }
+        if ($null -ne $client) {
+            $client.Dispose()
+        }
+        if ($null -ne $handler) {
+            $handler.Dispose()
+        }
+        if ($partialOwned -and -not [string]::IsNullOrWhiteSpace($partial)) {
+            Remove-Item -LiteralPath $partial -Force -ErrorAction SilentlyContinue
+        }
+    }
 }
 
 function Copy-ReleaseAsset {
@@ -441,8 +865,8 @@ function Assert-NoActiveAopmemProcesses {
 
 function Backup-AopmemHome {
     $stamp = [DateTime]::UtcNow.ToString("yyyyMMddTHHmmssZ")
-    # Adoption accepts an RC6-named direct sibling only.  This producer is
-    # intentionally before download so an old binary need not know RC6 CLI.
+    # Adoption accepts an RC7-named direct sibling only.  This producer is
+    # intentionally before download so an old binary need not know RC7 CLI.
     $backupParent = Split-Path -Parent $script:AopmemHome
     Assert-SafeDirectory -LiteralPath $backupParent -Label "durable backup parent"
     if ($null -eq (Get-ExistingPathItem -LiteralPath $backupParent)) {
@@ -465,7 +889,7 @@ function Backup-AopmemHome {
     [IO.Directory]::CreateDirectory($script:FullBackupRoot) | Out-Null
     $script:FullBackupHome = $script:FullBackupRoot
     # Reject every reparse/non-regular source before copying. The bounds match
-    # the RC6 recovery adopter.
+    # the RC7 recovery adopter.
     $script:SourcePreflightEntries = 0
     function Assert-SourceTreeNoFollow {
         param([string]$Directory, [int]$Depth)
@@ -910,7 +1334,7 @@ function Invoke-CurrentWorkspaceHealth {
         Throw-InstallError "verify did not report clean state"
     }
     Write-TestTrace -EventName "task.start.smoke"
-    $taskStart = "RC6 installer task-start smoke" | & $script:InstalledBinary `
+    $taskStart = "RC7 installer task-start smoke" | & $script:InstalledBinary `
         task start --query-stdin --json
     $taskExit = $LASTEXITCODE
     try {
@@ -1037,24 +1461,28 @@ try {
                 "aopmem 0.2.0-rc2",
                 "aopmem 0.2.0-rc3",
                 "aopmem 0.2.0-rc4",
-                "aopmem 0.2.0-rc5")) {
+                "aopmem 0.2.0-rc5",
+                "aopmem 0.2.0-rc6")) {
             Throw-InstallError "existing version is unsupported: $installedVersion"
         }
         $script:OldReleaseLabel = $installedVersion.Substring("aopmem ".Length)
-        $expectedOldHash = $null
-        if ($installedVersion -ceq "aopmem $script:OldBinaryVersion") {
-            $expectedOldHash = $script:OldBinarySha256
-        }
-        if ($script:TestMode) {
+        $expectedOldHash = $script:KnownSourceHashes[$installedVersion]
+        if ($script:TestMode -and -not [string]::IsNullOrWhiteSpace(
+                $env:AOPMEM_INSTALL_TEST_OLD_BINARY_SHA256)) {
             $expectedOldHash = $env:AOPMEM_INSTALL_TEST_OLD_BINARY_SHA256
         }
         $installedOldHash = Get-Sha256 -LiteralPath $script:InstalledBinary
         if ([string]::IsNullOrWhiteSpace($expectedOldHash) -or
             $installedOldHash -cne $expectedOldHash.ToLowerInvariant()) {
-            [Console]::Error.WriteLine(
-                "WARNING NONCANONICAL_V010_BINARY: version is compatible; " +
-                "workspace compatibility will be decided by upgrade prepare and plan")
-            Write-TestTrace -EventName "warning.NONCANONICAL_V010_BINARY"
+            $warningCode = "NONCANONICAL_SOURCE_BINARY"
+            if ($installedVersion -ceq "aopmem 0.1.0") {
+                $warningCode = "NONCANONICAL_V010_BINARY"
+            }
+            [Console]::Error.WriteLine((
+                "WARNING {0}: version={1} sha256={2}; version is compatible; " +
+                "workspace compatibility will be decided by upgrade prepare and plan"
+            ) -f $warningCode, $installedVersion, $installedOldHash)
+            Write-TestTrace -EventName ("warning.{0}" -f $warningCode)
         }
         $script:Mode = "update"
         Assert-NoActiveAopmemProcesses

@@ -72,7 +72,7 @@ dependencies = [
 
 [[package]]
 name = "aopmem"
-version = "0.2.0-rc6"
+version = "0.2.0-rc7"
 dependencies = [
  "clap",
  "directories",

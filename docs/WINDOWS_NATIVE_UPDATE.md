@@ -1,7 +1,7 @@
 # Windows native update
 
-This path updates SQLite-backed AOPMem v0.1 through `v0.2.0-rc5` to
-`v0.2.0-rc6` on Windows 11
+This path updates SQLite-backed AOPMem v0.1 through `v0.2.0-rc6` to
+`v0.2.0-rc7` on Windows 11
 x64 through native Windows PowerShell 5.1.
 
 ## Boundaries
@@ -19,12 +19,33 @@ x64 through native Windows PowerShell 5.1.
 Required flat release assets:
 
 - `aopmem-windows-x86_64.exe` — SHA-256
-  `8cd03fd00ffdaf505d7f31cd1c485fd15179823f84a78061b7bcfc00ee4fd4c7`;
+  `9e957a2b47c7442ab6aff57a8f8d3469b41e158831a55be18218fc239db29ae1`;
 - `SHA256SUMS` — SHA-256
-  `e4e7142e30cb6ef4cac2c7402b8ace8b87fc37df87add59ccb8d79d15d0f3dba`.
+  `89e59fd7eceed6048d1ef0367bd4cccc32cc40ab692713e4224e60c78b36e0bc`.
 
 Use only the trusted release asset URI. Verify SHA-256 before executing the
 staged binary.
+
+## Corporate proxy
+
+Use `-ProxyUri <PROXY_URI>` when the host requires an explicit proxy. Add
+`-ProxyUseDefaultCredentials` only when integrated proxy credentials are
+required. Never put credentials in the proxy URI.
+
+The installer resolves one proxy in this order: explicit `-ProxyUri`,
+`HTTPS_PROXY`, `https_proxy`, `HTTP_PROXY`, `http_proxy`, usable system
+default proxy, then direct connection. Direct mode remains supported.
+
+The RC7 installer uses `HttpClientHandler.AllowAutoRedirect=false` and handles
+301, 302, 303, 307, and 308 as normal responses. Every redirect remains HTTPS,
+contains no userinfo, reuses the same proxy, and is bounded by loop and
+10-hop checks. Downloads stream to a create-new partial file under the private
+temporary root. An existing destination is never overwritten.
+
+Errors preserve the original exception type and message. RC7 does not inspect
+an absent `Exception.Response` property, so a transport error cannot be masked
+by `PropertyNotFoundException`. See
+[Windows proxy install](WINDOWS_PROXY_INSTALL.md) for bootstrap commands.
 
 ## Before update
 
@@ -46,7 +67,7 @@ Verify the copied binary hash, workspace directories, and database files.
 ## Required update sequence
 
 The official updater keeps this exact order. It uses the downloaded and
-verified `v0.2.0-rc6` binary; do not manually copy or replace the installed
+verified `v0.2.0-rc7` binary; do not manually copy or replace the installed
 binary.
 
 ```text
@@ -173,7 +194,7 @@ command, then repeat status, doctor, and verify.
 
 Require:
 
-- installed `aopmem 0.2.0-rc6` and release SHA-256;
+- installed `aopmem 0.2.0-rc7` and release SHA-256;
 - unchanged workspace keys;
 - all old workspace directories present;
 - adapter in sync;
@@ -192,6 +213,9 @@ macOS-hosted checks can prove Rust tests, fixtures, installer structure, PE
 type, imports, and release hash. They cannot prove native Windows PowerShell
 or executable runtime behavior.
 
-Native Windows runtime remains `PENDING_DOGFOOD` until this exact RC6 asset
+The operational schema remains `004_task_protocol_and_tool_aliases`; RC7 adds
+no migration `005`.
+
+Native Windows runtime remains `PENDING_DOGFOOD` until this exact RC7 asset
 runs on Windows 11 x64 with PowerShell 5.1 against backed-up dogfood
 workspaces. macOS-hosted proof is not a native runtime PASS.

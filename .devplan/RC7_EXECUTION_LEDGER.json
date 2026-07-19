@@ -1,0 +1,17 @@
+{
+  "release": "v0.2.0-rc7",
+  "baseline_release": "v0.2.0-rc6",
+  "baseline_commit": "b47ff96681c77aa18a4baa07e030fa2dc78eeb88",
+  "target_schema": "004",
+  "stages": [
+    {"id": "01", "name": "Baseline, field failure transcription, worktree classification", "status": "VERIFIED"},
+    {"id": "02", "name": "Proxy and redirect transport specification plus proof harness", "status": "VERIFIED"},
+    {"id": "03", "name": "PowerShell installer implementation", "status": "VERIFIED"},
+    {"id": "04", "name": "Known-source classification and installer integration", "status": "VERIFIED"},
+    {"id": "05", "name": "Full local regression, installer tests, macOS install/update proof", "status": "VERIFIED"},
+    {"id": "06", "name": "Version, docs, acceptance prompt, release assets", "status": "VERIFIED"},
+    {"id": "07", "name": "Independent global audit, P1=0, P2=0", "status": "VERIFIED"},
+    {"id": "08", "name": "Local release commit", "status": "VERIFIED"},
+    {"id": "09", "name": "External gate, publication, remote verification", "status": "PENDING"}
+  ]
+}

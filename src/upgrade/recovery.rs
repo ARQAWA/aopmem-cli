@@ -1,4 +1,4 @@
-//! Durable, resumable boundary around the RC6 database upgrade.
+//! Durable, resumable boundary around the RC7 database upgrade.
 //!
 //! The journal deliberately records state outside `AOPMEM_HOME`: a failed
 //! home must never take its only recovery evidence with it.  It is a small
@@ -26,9 +26,9 @@ use super::{
     apply_core_all_workspaces, plan_all_workspaces, UpgradeApplyExecution, UpgradePlanReport,
 };
 
-const JOURNAL_PREFIX: &str = "aopmem-upgrade-recovery-v0.2.0-rc6-";
-const STAGED_BINARY_NAME: &str = ".aopmem-v0.2.0-rc6.staged";
-const BACKUP_PREFIX: &str = "aopmem-home-backup-v0.2.0-rc6-";
+const JOURNAL_PREFIX: &str = "aopmem-upgrade-recovery-v0.2.0-rc7-";
+const STAGED_BINARY_NAME: &str = ".aopmem-v0.2.0-rc7.staged";
+const BACKUP_PREFIX: &str = "aopmem-home-backup-v0.2.0-rc7-";
 const MAX_BACKUP_ENTRIES: usize = 100_000;
 const MAX_BACKUP_DIRECTORY_ENTRIES: usize = 10_000;
 const MAX_BACKUP_DEPTH: usize = 128;
@@ -183,7 +183,7 @@ pub fn backup_home() -> Result<RecoveryExecution, RecoveryError> {
     backup_home_with_hooks(&mut LiveRecoveryHooks)
 }
 
-/// Adopts an installer-created sibling full-home backup after the RC6 binary
+/// Adopts an installer-created sibling full-home backup after the RC7 binary
 /// has been downloaded. The backup must exactly match the still-unchanged
 /// current home and the caller-provided manifest digest.
 pub fn adopt_home_backup(
@@ -209,7 +209,7 @@ pub fn adopt_home_backup(
     let (backup_name, manifest_sha256) =
         validate_adoptable_backup(paths.home(), parent, backup, expected_manifest_sha256)?;
     let journal = RecoveryJournal {
-        version: "v0.2.0-rc6".to_string(),
+        version: "v0.2.0-rc7".to_string(),
         phase: RecoveryPhase::BackupComplete,
         home_identity: home_identity(paths.home())?,
         home_backup_dir: backup_name,
@@ -240,7 +240,7 @@ fn backup_home_with_hooks(
             hooks.checkpoint(RecoveryFaultPoint::BackupEffect)?;
             let manifest_sha256 = sha256_regular_nofollow(&backup.join("MANIFEST.sha256"))?;
             let journal = RecoveryJournal {
-                version: "v0.2.0-rc6".to_string(),
+                version: "v0.2.0-rc7".to_string(),
                 phase: RecoveryPhase::BackupComplete,
                 home_identity: home_identity(paths.home())?,
                 home_backup_dir: backup
@@ -749,7 +749,7 @@ fn retain_staged_binary(
     }
     fs::create_dir_all(bin)?;
     let root = AnchoredDir::open_workspace(bin, None)?;
-    let temporary = ".aopmem-v0.2.0-rc6.retain.tmp";
+    let temporary = ".aopmem-v0.2.0-rc7.retain.tmp";
     if root
         .open_regular_optional_os(OsStr::new(temporary))?
         .is_some()
@@ -826,7 +826,7 @@ fn publish_staged_binary_with(
     } else {
         "aopmem"
     };
-    let temporary = ".aopmem-v0.2.0-rc6.publish.tmp";
+    let temporary = ".aopmem-v0.2.0-rc7.publish.tmp";
     if root
         .open_regular_optional_os(OsStr::new(temporary))?
         .is_some()
@@ -1197,7 +1197,7 @@ fn validate_journal(
     home: &Path,
     parent: &Path,
 ) -> Result<(), RecoveryError> {
-    if journal.version != "v0.2.0-rc6"
+    if journal.version != "v0.2.0-rc7"
         || journal.home_identity != home_identity(home)?
         || !valid_direct_name(&journal.home_backup_dir)
         || !journal.home_backup_dir.starts_with(BACKUP_PREFIX)
@@ -1747,7 +1747,7 @@ mod tests {
         fs::write(home.join("value"), b"preserved").expect("home value should write");
         let backup = create_full_home_backup(&home, &root).expect("backup should create");
         let journal = RecoveryJournal {
-            version: "v0.2.0-rc6".to_string(),
+            version: "v0.2.0-rc7".to_string(),
             phase: RecoveryPhase::BackupComplete,
             home_identity: home_identity(&home).expect("home identity"),
             home_backup_dir: backup
@@ -1942,7 +1942,7 @@ mod tests {
     #[test]
     fn oversized_serialized_checkpoint_is_rejected_before_write() {
         let journal = RecoveryJournal {
-            version: "v0.2.0-rc6".to_string(),
+            version: "v0.2.0-rc7".to_string(),
             phase: RecoveryPhase::Prepared,
             home_identity: "home".to_string(),
             home_backup_dir: "backup".to_string(),
@@ -1967,7 +1967,7 @@ mod tests {
     fn journal_rejects_missing_first_or_middle_checkpoint() {
         let root = temp_dir("journal-gap");
         let base = RecoveryJournal {
-            version: "v0.2.0-rc6".to_string(),
+            version: "v0.2.0-rc7".to_string(),
             phase: RecoveryPhase::BackupComplete,
             home_identity: "home".to_string(),
             home_backup_dir: "backup".to_string(),
@@ -2316,7 +2316,7 @@ mod tests {
         let staged = root.join("staged");
         fs::write(&staged, b"verified").expect("fixture should write");
         let journal = RecoveryJournal {
-            version: "v0.2.0-rc6".to_string(),
+            version: "v0.2.0-rc7".to_string(),
             phase: RecoveryPhase::Prepared,
             home_identity: "identity".to_string(),
             home_backup_dir: "backup".to_string(),
@@ -2524,7 +2524,7 @@ mod tests {
 
         let retained =
             retain_staged_binary(&source, &bin, &digest).expect("first retain should publish");
-        fs::write(bin.join(".aopmem-v0.2.0-rc6.retain.tmp"), b"stale")
+        fs::write(bin.join(".aopmem-v0.2.0-rc7.retain.tmp"), b"stale")
             .expect("stale temp should write");
         let resumed =
             retain_staged_binary(&source, &bin, &digest).expect("resume should be idempotent");
@@ -2535,7 +2535,7 @@ mod tests {
             digest
         );
         assert!(
-            !bin.join(".aopmem-v0.2.0-rc6.retain.tmp").exists(),
+            !bin.join(".aopmem-v0.2.0-rc7.retain.tmp").exists(),
             "idempotent retain must clean stale temporary"
         );
         #[cfg(unix)]
@@ -2564,7 +2564,7 @@ mod tests {
         let digest = sha256_regular_nofollow(&source).expect("source digest");
         let retained = retain_staged_binary(&source, &bin, &digest).expect("retain should publish");
         fs::write(bin.join("aopmem"), b"old-binary").expect("old binary should write");
-        fs::write(bin.join(".aopmem-v0.2.0-rc6.publish.tmp"), b"stale")
+        fs::write(bin.join(".aopmem-v0.2.0-rc7.publish.tmp"), b"stale")
             .expect("stale publish temp should write");
 
         publish_staged_binary(STAGED_BINARY_NAME, &digest, &bin)
@@ -2581,7 +2581,7 @@ mod tests {
             digest
         );
         assert!(
-            !bin.join(".aopmem-v0.2.0-rc6.publish.tmp").exists(),
+            !bin.join(".aopmem-v0.2.0-rc7.publish.tmp").exists(),
             "idempotent publish must clean stale temporary"
         );
         #[cfg(unix)]
@@ -2607,7 +2607,7 @@ mod tests {
         fs::write(home.join("value"), b"preserved").expect("home value should write");
         let backup = create_full_home_backup(&home, &root).expect("backup should create");
         let journal = RecoveryJournal {
-            version: "v0.2.0-rc6".to_string(),
+            version: "v0.2.0-rc7".to_string(),
             phase: RecoveryPhase::BackupComplete,
             home_identity: home_identity(&home).expect("home identity"),
             home_backup_dir: backup
@@ -2649,7 +2649,7 @@ mod tests {
         fs::write(home.join("value"), b"preserved").expect("home value should write");
         let backup = create_full_home_backup(&home, &root).expect("backup should create");
         let journal = RecoveryJournal {
-            version: "v0.2.0-rc6".to_string(),
+            version: "v0.2.0-rc7".to_string(),
             phase: RecoveryPhase::BackupComplete,
             home_identity: home_identity(&home).expect("home identity"),
             home_backup_dir: backup

@@ -1,5 +1,10 @@
 # Official upgrade to AOPMem v0.2.0-rc6
 
+> **Superseded:** RC6 is historical. For current installations and updates,
+> use [AOPMem v0.2.0-rc7](UPGRADE_TO_RC7.md). RC7 fixes the native Windows
+> PowerShell 5.1 proxy transport and source classification. The RC6 content
+> below is preserved for audit and recovery of the immutable RC6 release.
+
 `v0.2.0-rc6` supports SQLite-backed `v0.1.0-rc3`, compatible local v0.1,
 `v0.2.0-rc1` through `rc5`, the active side-by-side `rc4` layout, and mixed
 workspace schemas `001`, `003`, and `004`. The target remains

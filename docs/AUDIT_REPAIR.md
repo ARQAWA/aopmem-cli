@@ -1,6 +1,6 @@
 # Audit repair
 
-Official RC6 commands:
+Official RC7 commands:
 
 ```text
 aopmem audit repair --current-workspace --json

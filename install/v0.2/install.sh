@@ -5,10 +5,8 @@ umask 077
 LC_ALL=C
 export LC_ALL
 
-PRODUCT_VERSION="0.2.0-rc6"
+PRODUCT_VERSION="0.2.0-rc7"
 OLD_RELEASE_LABEL="0.1.0-rc3"
-OLD_BINARY_VERSION="0.1.0"
-OLD_BINARY_SHA256="d238071299d557cfdeabfce75a52b2bcd2f62635802ef34da5ba11767155c607"
 ASSET_NAME="aopmem-darwin-arm64"
 CHECKSUM_NAME="SHA256SUMS"
 TEST_MODE="${AOPMEM_INSTALL_TEST_MODE:-0}"
@@ -31,7 +29,7 @@ FAILURE_MESSAGE=""
 INSTALL_RUN_ID=$$
 
 # The installer owns only orchestration.  Recovery state and replacement are
-# deliberately owned by the verified RC6 binary (D037/D038).
+# deliberately owned by the verified RC7 binary (D037/D038).
 ACTIVE_ADAPTER=${AOPMEM_ACTIVE_ADAPTER:-}
 ACTIVE_INSTRUCTION_FILE=${AOPMEM_ACTIVE_INSTRUCTION_FILE:-}
 
@@ -108,6 +106,33 @@ validate_regular_file() {
 
 sha256_file() {
   shasum -a 256 "$1" | awk '{ print tolower($1) }'
+}
+
+known_source_hash() {
+  case "$1" in
+    "aopmem 0.1.0")
+      printf '%s\n' "d238071299d557cfdeabfce75a52b2bcd2f62635802ef34da5ba11767155c607"
+      ;;
+    "aopmem 0.2.0-rc1")
+      printf '%s\n' "b32e918d2a44f0767444e09c84c1ed44fe9177709b2d56b2aa89c300081d4308"
+      ;;
+    "aopmem 0.2.0-rc2")
+      printf '%s\n' "d4a3f52aeddd3fd656f46358305a5a4a688868b3f25d4675eb37f6cf223a81d4"
+      ;;
+    "aopmem 0.2.0-rc3")
+      printf '%s\n' "8bc4d3a7ae38253c1a6e4c653292cf954fb2c8eee916c69a03c6dc5e2484261c"
+      ;;
+    "aopmem 0.2.0-rc4")
+      printf '%s\n' "4812ca6c798cd2460b4b9da468e5f99f433a68907dc40eba257b88d197886e4e"
+      ;;
+    "aopmem 0.2.0-rc5")
+      printf '%s\n' "594bb9606bd7f971a0fb97b16916fe2a5da84096e8340a5885c36d7037dd1b5e"
+      ;;
+    "aopmem 0.2.0-rc6")
+      printf '%s\n' "b933d921ae6ec68ce7e0f118de27fd7eabe9d1c42d715a0a6df8f2ec731cb949"
+      ;;
+    *) return 1 ;;
+  esac
 }
 
 verify_old_binary_unchanged() {
@@ -352,7 +377,7 @@ backup_aopmem_home() {
   fi
   SOURCE_PREFLIGHT_ENTRIES=0
   preflight_backup_source_tree "$AOPMEM_HOME_PATH" 0
-  # `upgrade backup --adopt` accepts only a direct, RC6-named sibling of
+  # `upgrade backup --adopt` accepts only a direct, RC7-named sibling of
   # AOPMEM_HOME and binds its deterministic manifest to the unchanged home.
   FULL_BACKUP_ROOT="$backup_parent/aopmem-home-backup-v${PRODUCT_VERSION}-${backup_stamp}-$$"
   FULL_BACKUP_HOME="$FULL_BACKUP_ROOT"
@@ -759,7 +784,7 @@ run_current_workspace_health() {
 
   task_start_output="$TEMP_ROOT/task-start-smoke.json"
   trace_install_event "task.start.smoke"
-  if ! printf '%s' 'RC6 installer task-start smoke' | AOPMEM_HOME="$AOPMEM_HOME_PATH" \
+  if ! printf '%s' 'RC7 installer task-start smoke' | AOPMEM_HOME="$AOPMEM_HOME_PATH" \
     "$INSTALLED_BINARY" task start --query-stdin --json > "$task_start_output"; then
     fail_install "task-start smoke failed for current workspace"
   fi
@@ -888,24 +913,28 @@ if [ -e "$INSTALLED_BINARY" ] || [ -L "$INSTALLED_BINARY" ]; then
   fi
   case "$installed_version" in
     "aopmem 0.1.0"|"aopmem 0.2.0-rc1"|"aopmem 0.2.0-rc2"|\
-    "aopmem 0.2.0-rc3"|"aopmem 0.2.0-rc4"|"aopmem 0.2.0-rc5") ;;
+    "aopmem 0.2.0-rc3"|"aopmem 0.2.0-rc4"|"aopmem 0.2.0-rc5"|\
+    "aopmem 0.2.0-rc6") ;;
     *)
     fail_install "existing version is unsupported for this installer: $installed_version"
       ;;
   esac
   OLD_RELEASE_LABEL=${installed_version#aopmem }
   installed_old_hash=$(sha256_file "$INSTALLED_BINARY")
-  expected_old_hash=""
-  if [ "$installed_version" = "aopmem $OLD_BINARY_VERSION" ]; then
-    expected_old_hash=$OLD_BINARY_SHA256
-  fi
-  if [ "$TEST_MODE" = "1" ]; then
+  expected_old_hash=$(known_source_hash "$installed_version") \
+    || expected_old_hash=""
+  if [ "$TEST_MODE" = "1" ] \
+    && [ -n "${AOPMEM_INSTALL_TEST_OLD_BINARY_SHA256:-}" ]; then
     expected_old_hash=${AOPMEM_INSTALL_TEST_OLD_BINARY_SHA256:-}
   fi
   if [ -z "$expected_old_hash" ] || [ "$installed_old_hash" != "$expected_old_hash" ]; then
+    warning_code="NONCANONICAL_SOURCE_BINARY"
+    if [ "$installed_version" = "aopmem 0.1.0" ]; then
+      warning_code="NONCANONICAL_V010_BINARY"
+    fi
     printf '%s\n' \
-      "WARNING NONCANONICAL_V010_BINARY: version is compatible; workspace compatibility will be decided by upgrade prepare and plan" >&2
-    trace_install_event "warning.NONCANONICAL_V010_BINARY"
+      "WARNING $warning_code: version=$installed_version sha256=$installed_old_hash; version is compatible; workspace compatibility will be decided by upgrade prepare and plan" >&2
+    trace_install_event "warning.$warning_code"
   fi
   MODE="update"
   assert_no_active_aopmem_processes
