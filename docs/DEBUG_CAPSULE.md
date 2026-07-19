@@ -104,9 +104,10 @@ action.
 
 ## Safe publication and errors
 
-Export writes a private same-directory temporary file, syncs it, verifies the
-same open file handle, closes publication-conflicting handles, and transfers
-the owned file to shared Atomic Publish V2 in `NoReplace` mode. Windows uses
+Export writes a private same-directory temporary file, syncs it, captures its
+identity, closes the writable handle, then validates a fresh read handle in a
+short scope. All validation handles close before publication. It transfers the
+owned file to shared Atomic Publish V2 in `NoReplace` mode. Windows uses
 `MoveFileExW(MOVEFILE_WRITE_THROUGH)` and one shared absolute verbatim
 drive/UNC path conversion for normal long and non-ASCII paths. Export never
 uses replace mode. Temporary files are removed and their absence is checked

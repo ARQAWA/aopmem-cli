@@ -1,6 +1,6 @@
 # Audit repair
 
-Official RC5 commands:
+Official RC6 commands:
 
 ```text
 aopmem audit repair --current-workspace --json
@@ -12,7 +12,8 @@ Exactly one selector is required.
 Repair takes only the audit snapshot lock. It opens operational SQLite with
 URI `mode=ro`, enables `query_only`, and keeps temporary SQLite state in
 memory. One deferred read transaction streams canonical `memory.sql` through
-the tagged-value redactor and shared Atomic Publish V2 helper. The reopened
+the tagged-value redactor and shared Atomic Publish V2 helper. Its writer
+closes before source validation, and validation closes before publication. The reopened
 published file must match the streamed SHA-256 digest before local audit Git
 is updated.
 

@@ -1,6 +1,7 @@
 # Windows native update
 
-This path updates SQLite-backed AOPMem v0.1 to `v0.2.0-rc5` on Windows 11
+This path updates SQLite-backed AOPMem v0.1 through `v0.2.0-rc5` to
+`v0.2.0-rc6` on Windows 11
 x64 through native Windows PowerShell 5.1.
 
 ## Boundaries
@@ -17,8 +18,10 @@ x64 through native Windows PowerShell 5.1.
 
 Required flat release assets:
 
-- `aopmem-windows-x86_64.exe`;
-- `SHA256SUMS`.
+- `aopmem-windows-x86_64.exe` — SHA-256
+  `8cd03fd00ffdaf505d7f31cd1c485fd15179823f84a78061b7bcfc00ee4fd4c7`;
+- `SHA256SUMS` — SHA-256
+  `e4e7142e30cb6ef4cac2c7402b8ace8b87fc37df87add59ccb8d79d15d0f3dba`.
 
 Use only the trusted release asset URI. Verify SHA-256 before executing the
 staged binary.
@@ -42,25 +45,40 @@ Verify the copied binary hash, workspace directories, and database files.
 
 ## Required update sequence
 
-Run all upgrade commands through the downloaded and verified
-`v0.2.0-rc5` binary:
+The official updater keeps this exact order. It uses the downloaded and
+verified `v0.2.0-rc6` binary; do not manually copy or replace the installed
+binary.
 
 ```text
-aopmem upgrade prepare --all-workspaces --json
-aopmem upgrade plan --all-workspaces --json
-aopmem upgrade apply --all-workspaces --json --approved "+++"
+process gate
+→ durable full-home backup
+→ download and SHA-256/version verification
+→ staged platform check --json
+→ staged audit repair --all-workspaces --json when pending
+→ upgrade prepare --all-workspaces --json
+→ upgrade plan --all-workspaces --json
+→ upgrade apply --all-workspaces --json --approved "+++" exactly once
+→ upgrade publish --json
+→ adapter sync
+→ post-publish audit repair --all-workspaces --json
+→ doctor, verify, task protocol, observability, debug capsule
 ```
 
 Requirements:
 
-1. `prepare` succeeds for every workspace.
-2. No AOPMem DB read runs between `prepare` and `plan`.
-3. `plan` returns `ok=true`, `ready=true`,
+1. Platform check succeeds before audit repair, prepare, plan, apply, or
+   binary publish. Its failure changes no user data.
+2. The durable full-home backup exists before prepare. Keep every backup.
+3. `prepare` succeeds for every workspace.
+4. No AOPMem DB read runs between `prepare` and `plan`.
+5. `plan` returns `ok=true`, `ready=true`,
    `writes_performed=false`.
-4. `apply` starts only after clean plan and runs once.
-5. Binary publication starts only after successful apply.
-6. Publication uses the canonical same-directory atomic replacement flow.
-7. Post-update health checks run only after publication.
+6. `apply` starts only after a clean plan and runs once. Never retry it
+   automatically.
+7. Binary publication starts only after successful apply and uses the
+   canonical same-directory atomic replacement flow.
+8. Adapter sync, post-publish audit repair, and health checks run only after
+   publication.
 
 ## WAL preparation
 
@@ -155,7 +173,7 @@ command, then repeat status, doctor, and verify.
 
 Require:
 
-- installed `aopmem 0.2.0-rc5` and release SHA-256;
+- installed `aopmem 0.2.0-rc6` and release SHA-256;
 - unchanged workspace keys;
 - all old workspace directories present;
 - adapter in sync;
@@ -174,6 +192,6 @@ macOS-hosted checks can prove Rust tests, fixtures, installer structure, PE
 type, imports, and release hash. They cannot prove native Windows PowerShell
 or executable runtime behavior.
 
-Native Windows runtime remains `PENDING_DOGFOOD` until this exact RC5 asset
+Native Windows runtime remains `PENDING_DOGFOOD` until this exact RC6 asset
 runs on Windows 11 x64 with PowerShell 5.1 against backed-up dogfood
 workspaces. macOS-hosted proof is not a native runtime PASS.

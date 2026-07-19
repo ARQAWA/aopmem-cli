@@ -93,6 +93,18 @@ pub(crate) struct PublishFailureView {
     committed: bool,
     durability_confirmed: bool,
     temporary_cleanup_confirmed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    handle_role: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    desired_access: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    share_mode: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    creation_disposition: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    flags: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    handle_expected_closed: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,6 +113,7 @@ enum InjectedFault {
     None,
     AfterCreate,
     Error87,
+    SourceValidationError32,
     AfterNoReplace,
 }
 
@@ -213,22 +226,30 @@ fn execute_checks(
     }
 
     #[cfg(test)]
-    let first = if fault == InjectedFault::Error87 {
-        crate::platform_publish::publish_regular_injected_os_error87(
+    let first = match fault {
+        InjectedFault::Error87 => crate::platform_publish::publish_regular_injected_os_error87(
             parent,
             source,
             OsStr::new("source-no-replace"),
             OsStr::new("destination"),
             PublishMode::NoReplace,
-        )
-    } else {
-        publish_regular(
+        ),
+        InjectedFault::SourceValidationError32 => {
+            crate::platform_publish::publish_regular_injected_source_validation_error32(
+                parent,
+                source,
+                OsStr::new("source-no-replace"),
+                OsStr::new("destination"),
+                PublishMode::NoReplace,
+            )
+        }
+        _ => publish_regular(
             parent,
             source,
             OsStr::new("source-no-replace"),
             OsStr::new("destination"),
             PublishMode::NoReplace,
-        )
+        ),
     };
     #[cfg(not(test))]
     let first = publish_regular(
@@ -471,6 +492,16 @@ impl From<PublishFailureDetails> for PublishFailureView {
             committed: details.committed,
             durability_confirmed: details.durability_confirmed,
             temporary_cleanup_confirmed: details.temporary_cleanup_confirmed,
+            handle_role: details.handle_diagnostics.map(|value| value.handle_role),
+            desired_access: details.handle_diagnostics.map(|value| value.desired_access),
+            share_mode: details.handle_diagnostics.map(|value| value.share_mode),
+            creation_disposition: details
+                .handle_diagnostics
+                .map(|value| value.creation_disposition),
+            flags: details.handle_diagnostics.map(|value| value.flags),
+            handle_expected_closed: details
+                .handle_diagnostics
+                .map(|value| value.handle_expected_closed),
         }
     }
 }
@@ -665,6 +696,55 @@ mod tests {
                 assert_eq!(publish.phase, "os_publish");
                 assert!(!publish.committed);
             }
+        }
+    }
+
+    #[test]
+    fn source_validation_error_32_is_structured_private_and_cleanup_is_complete() {
+        let failure = run_inner(InjectedFault::SourceValidationError32)
+            .expect_err("injected source validation failure");
+
+        assert_eq!(failure.code, "PLATFORM_CHECK_FAILED");
+        assert_eq!(failure.operation, "platform_check");
+        assert_eq!(failure.phase, "no_replace_publish");
+        assert_eq!(failure.raw_os_error, Some(32));
+        assert!(!failure.observability_recorded);
+        assert!(!failure.user_data_changed);
+        assert!(failure.cleanup.attempted);
+        assert!(failure.cleanup.files_removed);
+        assert!(failure.cleanup.directory_empty);
+        assert!(failure.cleanup.root_removed);
+
+        let publish = failure.publish.expect("publish details");
+        assert_eq!(publish.phase, "validate_source");
+        assert_eq!(publish.raw_os_error, Some(32));
+        assert!(publish.source_exists);
+        assert!(!publish.destination_exists);
+        assert!(!publish.committed);
+        assert!(!publish.final_validated);
+        assert!(!publish.temporary_cleanup_confirmed);
+
+        let rendered = serde_json::to_string(&publish).expect("publish JSON");
+        assert!(!rendered.contains(&std::env::temp_dir().display().to_string()));
+        #[cfg(windows)]
+        {
+            assert!(rendered.contains("\"handle_role\":\"source_validation\""));
+            assert!(rendered.contains("\"desired_access\":\"GENERIC_READ | FILE_READ_ATTRIBUTES\""));
+            assert!(rendered.contains("\"share_mode\":\"FILE_SHARE_READ | FILE_SHARE_WRITE\""));
+            assert!(rendered.contains("\"creation_disposition\":\"OPEN_EXISTING\""));
+            assert!(rendered.contains("\"flags\":\"FILE_FLAG_OPEN_REPARSE_POINT\""));
+            assert!(rendered.contains("\"handle_expected_closed\":true"));
+        }
+        #[cfg(not(windows))]
+        for field in [
+            "handle_role",
+            "desired_access",
+            "share_mode",
+            "creation_disposition",
+            "flags",
+            "handle_expected_closed",
+        ] {
+            assert!(!rendered.contains(field), "optional field leaked: {field}");
         }
     }
 

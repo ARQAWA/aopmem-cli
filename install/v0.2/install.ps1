@@ -8,7 +8,7 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = "Stop"
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
-$script:ProductVersion = "0.2.0-rc5"
+$script:ProductVersion = "0.2.0-rc6"
 $script:OldReleaseLabel = "0.1.0-rc3"
 $script:OldBinaryVersion = "0.1.0"
 $script:OldBinarySha256 = "01010aeffc20aead5f353353674621b367e6ad590769e4b5915b8d02d62f6d7a"
@@ -441,8 +441,8 @@ function Assert-NoActiveAopmemProcesses {
 
 function Backup-AopmemHome {
     $stamp = [DateTime]::UtcNow.ToString("yyyyMMddTHHmmssZ")
-    # Adoption accepts an RC5-named direct sibling only.  This producer is
-    # intentionally before download so an old binary need not know RC5 CLI.
+    # Adoption accepts an RC6-named direct sibling only.  This producer is
+    # intentionally before download so an old binary need not know RC6 CLI.
     $backupParent = Split-Path -Parent $script:AopmemHome
     Assert-SafeDirectory -LiteralPath $backupParent -Label "durable backup parent"
     if ($null -eq (Get-ExistingPathItem -LiteralPath $backupParent)) {
@@ -465,7 +465,7 @@ function Backup-AopmemHome {
     [IO.Directory]::CreateDirectory($script:FullBackupRoot) | Out-Null
     $script:FullBackupHome = $script:FullBackupRoot
     # Reject every reparse/non-regular source before copying. The bounds match
-    # the RC5 recovery adopter.
+    # the RC6 recovery adopter.
     $script:SourcePreflightEntries = 0
     function Assert-SourceTreeNoFollow {
         param([string]$Directory, [int]$Depth)
@@ -910,7 +910,7 @@ function Invoke-CurrentWorkspaceHealth {
         Throw-InstallError "verify did not report clean state"
     }
     Write-TestTrace -EventName "task.start.smoke"
-    $taskStart = "RC5 installer task-start smoke" | & $script:InstalledBinary `
+    $taskStart = "RC6 installer task-start smoke" | & $script:InstalledBinary `
         task start --query-stdin --json
     $taskExit = $LASTEXITCODE
     try {
@@ -1036,7 +1036,8 @@ try {
                 "aopmem 0.2.0-rc1",
                 "aopmem 0.2.0-rc2",
                 "aopmem 0.2.0-rc3",
-                "aopmem 0.2.0-rc4")) {
+                "aopmem 0.2.0-rc4",
+                "aopmem 0.2.0-rc5")) {
             Throw-InstallError "existing version is unsupported: $installedVersion"
         }
         $script:OldReleaseLabel = $installedVersion.Substring("aopmem ".Length)

@@ -5,7 +5,7 @@ umask 077
 LC_ALL=C
 export LC_ALL
 
-PRODUCT_VERSION="0.2.0-rc5"
+PRODUCT_VERSION="0.2.0-rc6"
 OLD_RELEASE_LABEL="0.1.0-rc3"
 OLD_BINARY_VERSION="0.1.0"
 OLD_BINARY_SHA256="d238071299d557cfdeabfce75a52b2bcd2f62635802ef34da5ba11767155c607"
@@ -31,7 +31,7 @@ FAILURE_MESSAGE=""
 INSTALL_RUN_ID=$$
 
 # The installer owns only orchestration.  Recovery state and replacement are
-# deliberately owned by the verified RC5 binary (D037/D038).
+# deliberately owned by the verified RC6 binary (D037/D038).
 ACTIVE_ADAPTER=${AOPMEM_ACTIVE_ADAPTER:-}
 ACTIVE_INSTRUCTION_FILE=${AOPMEM_ACTIVE_INSTRUCTION_FILE:-}
 
@@ -352,7 +352,7 @@ backup_aopmem_home() {
   fi
   SOURCE_PREFLIGHT_ENTRIES=0
   preflight_backup_source_tree "$AOPMEM_HOME_PATH" 0
-  # `upgrade backup --adopt` accepts only a direct, RC5-named sibling of
+  # `upgrade backup --adopt` accepts only a direct, RC6-named sibling of
   # AOPMEM_HOME and binds its deterministic manifest to the unchanged home.
   FULL_BACKUP_ROOT="$backup_parent/aopmem-home-backup-v${PRODUCT_VERSION}-${backup_stamp}-$$"
   FULL_BACKUP_HOME="$FULL_BACKUP_ROOT"
@@ -759,7 +759,7 @@ run_current_workspace_health() {
 
   task_start_output="$TEMP_ROOT/task-start-smoke.json"
   trace_install_event "task.start.smoke"
-  if ! printf '%s' 'RC5 installer task-start smoke' | AOPMEM_HOME="$AOPMEM_HOME_PATH" \
+  if ! printf '%s' 'RC6 installer task-start smoke' | AOPMEM_HOME="$AOPMEM_HOME_PATH" \
     "$INSTALLED_BINARY" task start --query-stdin --json > "$task_start_output"; then
     fail_install "task-start smoke failed for current workspace"
   fi
@@ -888,7 +888,7 @@ if [ -e "$INSTALLED_BINARY" ] || [ -L "$INSTALLED_BINARY" ]; then
   fi
   case "$installed_version" in
     "aopmem 0.1.0"|"aopmem 0.2.0-rc1"|"aopmem 0.2.0-rc2"|\
-    "aopmem 0.2.0-rc3"|"aopmem 0.2.0-rc4") ;;
+    "aopmem 0.2.0-rc3"|"aopmem 0.2.0-rc4"|"aopmem 0.2.0-rc5") ;;
     *)
     fail_install "existing version is unsupported for this installer: $installed_version"
       ;;

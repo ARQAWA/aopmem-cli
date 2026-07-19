@@ -1,0 +1,18 @@
+{
+  "release": "v0.2.0-rc6",
+  "baseline_release": "v0.2.0-rc5",
+  "baseline_commit": "d2eb26bc36b20349061bf89d23a152c8c0b161bf",
+  "target_schema": "004",
+  "stages": [
+    {"id": "01", "name": "Baseline, failure transcription, worktree classification", "status": "VERIFIED"},
+    {"id": "02", "name": "Exact Windows handle/share-mode root-cause audit", "status": "VERIFIED"},
+    {"id": "03", "name": "Minimal unified publish remediation", "status": "VERIFIED"},
+    {"id": "04", "name": "Platform-check and sharing-violation regression tests", "status": "VERIFIED"},
+    {"id": "05", "name": "Backup/audit/export consumer integration proof", "status": "VERIFIED"},
+    {"id": "06", "name": "Version, installer, updater, docs, recovery support", "status": "VERIFIED"},
+    {"id": "07", "name": "Full local regression and isolated macOS proof", "status": "VERIFIED"},
+    {"id": "08", "name": "Release assets and supply-chain proof", "status": "VERIFIED"},
+    {"id": "09", "name": "Independent global audit, P1=0, P2=0", "status": "VERIFIED"},
+    {"id": "10", "name": "Local commit and externally gated publication", "status": "IN_PROGRESS"}
+  ]
+}

@@ -1,11 +1,11 @@
-# AOPMem v0.2.0-rc5 install prompt
+# AOPMem v0.2.0-rc6 install prompt
 
-Use this prompt to install AOPMem v0.2.0-rc5 for the current project.
+Use this prompt to install AOPMem v0.2.0-rc6 for the current project.
 It supports a fresh install and an update from compatible AOPMem v0.1.0
 SQLite workspaces.
 
 ````text
-You are installing AOPMem v0.2.0-rc5 for the user's current project.
+You are installing AOPMem v0.2.0-rc6 for the user's current project.
 
 Complete the whole safe flow without pausing between normal steps.
 Do not run Codex CLI during installation.
@@ -54,6 +54,15 @@ Release inputs:
   - aopmem-windows-x86_64.exe
   - SHA256SUMS
 
+The audited RC6 artifact digests are:
+
+- aopmem-darwin-arm64:
+  b933d921ae6ec68ce7e0f118de27fd7eabe9d1c42d715a0a6df8f2ec731cb949
+- aopmem-windows-x86_64.exe:
+  8cd03fd00ffdaf505d7f31cd1c485fd15179823f84a78061b7bcfc00ee4fd4c7
+- SHA256SUMS:
+  e4e7142e30cb6ef4cac2c7402b8ace8b87fc37df87add59ccb8d79d15d0f3dba
+
 Integrity rules:
 
 - Download into a new private temporary directory.
@@ -62,7 +71,7 @@ Integrity rules:
 - Reject a missing, duplicate, malformed, or differently named line.
 - Verify SHA-256 before chmod or any binary execution.
 - Verify the downloaded binary reports exactly:
-  aopmem 0.2.0-rc5
+  aopmem 0.2.0-rc6
 - Never execute an unverified file.
 
 Path rules:
@@ -79,12 +88,12 @@ Select the flow silently:
 
 1. No installed binary means fresh install.
 2. A compatible installed binary reports exactly one of `aopmem 0.1.0`,
-   `aopmem 0.2.0-rc1`, `aopmem 0.2.0-rc2`, `aopmem 0.2.0-rc3`, or
-   `aopmem 0.2.0-rc4`.
+   `aopmem 0.2.0-rc1`, `aopmem 0.2.0-rc2`, `aopmem 0.2.0-rc3`,
+   `aopmem 0.2.0-rc4`, or `aopmem 0.2.0-rc5`.
    Recognize the known v0.1.0-rc3 release SHA-256. For another SHA-256,
    emit `NONCANONICAL_V010_BINARY`, require the durable full backup, and let
    staged `upgrade prepare` plus `upgrade plan` decide workspace compatibility.
-3. Any other installed version, including RC5 itself, is unsupported. Stop
+3. Any other installed version, including RC6 itself, is unsupported. Stop
    without changing it.
 
 For macOS, use the supplied install/v0.2/install.sh.
@@ -137,8 +146,8 @@ Update flow:
    unknown process automatically.
 3. Create and verify a durable full backup of AOPMem home plus the old binary.
    The installer-owned backup is a direct sibling named
-   `aopmem-home-backup-v0.2.0-rc5-*` with deterministic `MANIFEST.sha256`.
-4. Download and verify RC5. Then adopt exactly that unchanged backup:
+   `aopmem-home-backup-v0.2.0-rc6-*` with deterministic `MANIFEST.sha256`.
+4. Download and verify RC6. Then adopt exactly that unchanged backup:
    `aopmem upgrade backup --adopt <backup> --manifest-sha256 <digest> --json`.
 5. Retain the verified artifact with `upgrade stage --artifact ... --sha256 ...`.
 6. Run staged `platform check --json`. If it fails, stop before prepare.

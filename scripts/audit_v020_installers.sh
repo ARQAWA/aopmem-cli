@@ -73,7 +73,7 @@ write_new_stub() {
     printf '%s\n' 'fi'
     printf '%s\n' 'case "$*" in'
     printf '%s\n' '  "--version")'
-    printf '%s\n' '    printf "%s\n" "aopmem 0.2.0-rc5"'
+    printf '%s\n' '    printf "%s\n" "aopmem 0.2.0-rc6"'
     printf '%s\n' '    ;;'
     printf '%s\n' '  "upgrade prepare --all-workspaces --json")'
     printf '%s\n' '    if [ "${AOPMEM_STUB_PREPARE_FAIL:-0}" = "1" ]; then'
@@ -86,8 +86,8 @@ write_new_stub() {
     printf '%s\n' '    printf "%s\n" '\''{"ok":true,"data":{"journal_phase":"backup_complete"}}'\'''
     printf '%s\n' '    ;;'
     printf '%s\n' '  "upgrade stage --artifact "*)'
-    printf '%s\n' '    cp "$0" "$AOPMEM_HOME/bin/.aopmem-v0.2.0-rc5.staged"'
-    printf '%s\n' '    chmod 755 "$AOPMEM_HOME/bin/.aopmem-v0.2.0-rc5.staged"'
+    printf '%s\n' '    cp "$0" "$AOPMEM_HOME/bin/.aopmem-v0.2.0-rc6.staged"'
+    printf '%s\n' '    chmod 755 "$AOPMEM_HOME/bin/.aopmem-v0.2.0-rc6.staged"'
     printf '%s\n' '    printf "%s\n" '\''{"ok":true,"data":{"journal_phase":"staged_verified"}}'\'''
     printf '%s\n' '    ;;'
     printf '%s\n' '  "platform check --json")'
@@ -419,7 +419,7 @@ test_update_success() {
   assert_trace_order "$TRACE_PATH" "observe.status" "observe.report"
   backup=$(find "$AOPMEM_HOME_PATH/bin" -name 'aopmem.backup-v0.1.0-*' -print -quit)
   assert_file "$backup"
-  full_backup=$(find "$CASE_ROOT" -path '*/aopmem-home-backup-v0.2.0-rc5-*/bin/aopmem' -print -quit)
+  full_backup=$(find "$CASE_ROOT" -path '*/aopmem-home-backup-v0.2.0-rc6-*/bin/aopmem' -print -quit)
   assert_file "$full_backup"
   assert_equal \
     "$(shasum -a 256 "$full_backup" | awk '{ print $1 }')" \
@@ -429,7 +429,7 @@ test_update_success() {
   actual=$(shasum -a 256 "$AOPMEM_HOME_PATH/bin/aopmem" | awk '{ print $1 }')
   assert_equal "$actual" "$expected" "published update hash"
   assert_temp_clean "$TEMP_PARENT"
-  retained=$(find "$AOPMEM_HOME_PATH/bin" -name '.aopmem-v0.2.0-rc5.staged' -print -quit)
+  retained=$(find "$AOPMEM_HOME_PATH/bin" -name '.aopmem-v0.2.0-rc6.staged' -print -quit)
   assert_file "$retained"
   pass
 }
@@ -458,7 +458,7 @@ test_tagged_source_acceptance_and_hash_binding() {
 }
 
 test_supported_version_matrix() {
-  for old_version in 0.1.0 0.2.0-rc1 0.2.0-rc2 0.2.0-rc3 0.2.0-rc4; do
+  for old_version in 0.1.0 0.2.0-rc1 0.2.0-rc2 0.2.0-rc3 0.2.0-rc4 0.2.0-rc5; do
     setup_case "accepted-${old_version}"
     OLD_STUB_VERSION=$old_version
     install_old_binary
@@ -467,7 +467,7 @@ test_supported_version_matrix() {
     assert_contains "$TRACE_PATH" '^upgrade\.publish$'
   done
 
-  for old_version in 0.2.0-rc5 0.2.0-rc0 0.3.0; do
+  for old_version in 0.2.0-rc6 0.2.0-rc0 0.3.0; do
     setup_case "rejected-${old_version}"
     OLD_STUB_VERSION=$old_version
     install_old_binary
@@ -506,9 +506,9 @@ EOF
   pass
 }
 
-test_real_rc5_adopts_installer_manifest() {
+test_real_rc6_adopts_installer_manifest() {
   [ -x "$REPO_ROOT/target/debug/aopmem" ] ||
-    fail "real debug rc5 binary is required for manifest adoption proof"
+    fail "real debug rc6 binary is required for manifest adoption proof"
   setup_case real-adopt-manifest
   install_old_binary
   mkdir -p "$AOPMEM_HOME_PATH/a"
@@ -539,7 +539,7 @@ test_real_rc5_adopts_installer_manifest() {
   manifest_hash=$(shasum -a 256 "$backup/MANIFEST.sha256" | awk '{ print tolower($1) }')
   AOPMEM_HOME="$AOPMEM_HOME_PATH" "$REPO_ROOT/target/debug/aopmem" \
     upgrade backup --adopt "$backup" --manifest-sha256 "$manifest_hash" --json \
-    > "$CASE_ROOT/adopt.json" || fail "real rc5 rejected installer manifest"
+    > "$CASE_ROOT/adopt.json" || fail "real rc6 rejected installer manifest"
   assert_contains "$CASE_ROOT/adopt.json" '"ok":true'
   assert_contains "$backup/MANIFEST.sha256" '^a/child$'
   assert_contains "$backup/MANIFEST.sha256" '^a\.txt$'
@@ -668,7 +668,7 @@ test_path_rejections() {
   expect_failure
   assert_contains "$STDERR_PATH" 'AOPMem home contains a symbolic link'
   backup_root=$(find "$CASE_ROOT" -maxdepth 1 \
-    -name 'aopmem-home-backup-v0.2.0-rc5-*' -print -quit)
+    -name 'aopmem-home-backup-v0.2.0-rc6-*' -print -quit)
   [ -z "$backup_root" ] || fail "unsafe source was copied before rejection"
   assert_not_contains "$TRACE_PATH" '^asset\.download\.started$'
 
@@ -685,7 +685,7 @@ test_path_rejections() {
   expect_failure
   assert_contains "$STDERR_PATH" 'maximum backup directory depth'
   backup_root=$(find "$CASE_ROOT" -maxdepth 1 \
-    -name 'aopmem-home-backup-v0.2.0-rc5-*' -print -quit)
+    -name 'aopmem-home-backup-v0.2.0-rc6-*' -print -quit)
   [ -z "$backup_root" ] || fail "over-depth source was copied before rejection"
   assert_not_contains "$TRACE_PATH" '^asset\.download\.started$'
 
@@ -704,7 +704,7 @@ test_pre_apply_failures_leave_binary_unchanged() {
   assert_not_contains "$TRACE_PATH" '^upgrade\.apply$'
   assert_contains "$TRACE_PATH" '^rollback\.unchanged$'
   assert_contains "$STDERR_PATH" 'code=FIXTURE_PREPARE_FAILED'
-  full_backup=$(find "$CASE_ROOT" -path '*/aopmem-home-backup-v0.2.0-rc5-*/bin/aopmem' -print -quit)
+  full_backup=$(find "$CASE_ROOT" -path '*/aopmem-home-backup-v0.2.0-rc6-*/bin/aopmem' -print -quit)
   assert_file "$full_backup"
   assert_temp_clean "$TEMP_PARENT"
 
@@ -720,7 +720,7 @@ test_pre_apply_failures_leave_binary_unchanged() {
   assert_contains "$TRACE_PATH" '^rollback\.unchanged$'
   backup=$(find "$AOPMEM_HOME_PATH/bin" -name 'aopmem.backup-*' -print -quit)
   assert_file "$backup"
-  retained=$(find "$AOPMEM_HOME_PATH/bin" -name '.aopmem-v0.2.0-rc5.staged' -print -quit)
+  retained=$(find "$AOPMEM_HOME_PATH/bin" -name '.aopmem-v0.2.0-rc6.staged' -print -quit)
   assert_file "$retained"
   assert_temp_clean "$TEMP_PARENT"
 
@@ -752,7 +752,7 @@ test_post_apply_failures_preserve_recovery() {
   expect_failure AOPMEM_STUB_APPLY_FAIL=1
   new_inode=$(ls -di "$AOPMEM_HOME_PATH/bin/aopmem" | awk '{ print $1 }')
   assert_equal "$new_inode" "$old_inode" "apply failure inode"
-  recovery=$(find "$AOPMEM_HOME_PATH/bin" -name '.aopmem-v0.2.0-rc5.staged' -print -quit)
+  recovery=$(find "$AOPMEM_HOME_PATH/bin" -name '.aopmem-v0.2.0-rc6.staged' -print -quit)
   assert_file "$recovery"
   assert_contains "$STDERR_PATH" 'do not run the v0.1 binary'
   assert_contains "$STDERR_PATH" 'recovery binary preserved at'
@@ -773,7 +773,7 @@ test_post_apply_failures_preserve_recovery() {
   expect_failure AOPMEM_INSTALL_TEST_FAIL_AT=publish
   new_inode=$(ls -di "$AOPMEM_HOME_PATH/bin/aopmem" | awk '{ print $1 }')
   assert_equal "$new_inode" "$old_inode" "publish failure inode"
-  recovery=$(find "$AOPMEM_HOME_PATH/bin" -name '.aopmem-v0.2.0-rc5.staged' -print -quit)
+  recovery=$(find "$AOPMEM_HOME_PATH/bin" -name '.aopmem-v0.2.0-rc6.staged' -print -quit)
   assert_file "$recovery"
   expected=$(shasum -a 256 "$ASSET_DIR/aopmem-darwin-arm64" | awk '{ print $1 }')
   actual=$(shasum -a 256 "$recovery" | awk '{ print $1 }')
@@ -818,7 +818,7 @@ test_update_success
 test_tagged_source_acceptance_and_hash_binding
 test_supported_version_matrix
 test_exact_active_adapter_pairs
-test_real_rc5_adopts_installer_manifest
+test_real_rc6_adopts_installer_manifest
 test_checksum_failures
 test_asset_base_uri_rejections
 test_path_rejections

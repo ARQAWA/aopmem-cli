@@ -96,7 +96,7 @@ pub const MAX_TOOL_TECHNICAL_DISTINCTION_BYTES: usize = 1024;
 pub const MAX_TOOL_CREATION_GUARD_CANDIDATES: usize = 64;
 const MAX_TOOL_CREATION_GUARD_TOKENS_PER_DOCUMENT: usize = 512;
 const MAX_TOOL_CREATION_GUARD_TOTAL_TOKENS: usize = 262_144;
-/// The only persisted alias state in RC5.
+/// The only persisted alias state in RC6.
 pub const TOOL_ALIAS_STATUS_ACTIVE: &str = "active";
 const TOOL_ALIAS_BULK_SAVEPOINT: &str = "aopmem_tool_alias_bulk";
 /// Hard maximum wall-clock time accepted by the runner.

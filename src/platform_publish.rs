@@ -80,6 +80,17 @@ pub(crate) struct PublishFailureDetails {
     pub(crate) committed: bool,
     pub(crate) durability_confirmed: bool,
     pub(crate) temporary_cleanup_confirmed: bool,
+    pub(crate) handle_diagnostics: Option<PublishHandleDiagnostics>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PublishHandleDiagnostics {
+    pub(crate) handle_role: &'static str,
+    pub(crate) desired_access: &'static str,
+    pub(crate) share_mode: &'static str,
+    pub(crate) creation_disposition: &'static str,
+    pub(crate) flags: &'static str,
+    pub(crate) handle_expected_closed: bool,
 }
 
 #[derive(Debug)]
@@ -151,10 +162,50 @@ struct PublishState {
 enum InjectedFault {
     None,
     FlushSource,
+    SourceValidationError32,
     OsError87,
     ReopenDestination,
     ValidatePublishedIdentity,
     SyncParent,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LifecycleEvent {
+    SourceWriterFlushed,
+    SourceIdentityCaptured,
+    SourceWriterDropped,
+    SourceValidationStarted,
+    SourceValidationOpened,
+    SourceValidationClosed,
+    DestinationValidationOpened,
+    DestinationValidationClosed,
+    OsPublishStarted,
+    FinalValidationStarted,
+}
+
+#[cfg(test)]
+thread_local! {
+    static LIFECYCLE_EVENTS: std::cell::RefCell<Vec<LifecycleEvent>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
+}
+
+#[cfg(test)]
+fn record_lifecycle(event: LifecycleEvent) {
+    LIFECYCLE_EVENTS.with(|events| events.borrow_mut().push(event));
+}
+
+#[cfg(test)]
+fn take_lifecycle_events() -> Vec<LifecycleEvent> {
+    LIFECYCLE_EVENTS.with(|events| std::mem::take(&mut *events.borrow_mut()))
+}
+
+macro_rules! lifecycle_event {
+    ($event:ident) => {
+        #[cfg(test)]
+        record_lifecycle(LifecycleEvent::$event);
+    };
 }
 
 /// Publishes one already-open direct child to another direct child.
@@ -195,6 +246,24 @@ pub(crate) fn publish_regular_injected_os_error87(
         destination_name,
         mode,
         InjectedFault::OsError87,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn publish_regular_injected_source_validation_error32(
+    parent: &AnchoredDir,
+    source: File,
+    source_name: &OsStr,
+    destination_name: &OsStr,
+    mode: PublishMode,
+) -> Result<PublishOutcome, PublishError> {
+    publish_regular_inner(
+        parent,
+        source,
+        source_name,
+        destination_name,
+        mode,
+        InjectedFault::SourceValidationError32,
     )
 }
 
@@ -242,38 +311,75 @@ fn publish_regular_inner(
     parent
         .verify_logical_identity()
         .map_err(|error| context.error(PublishPhase::ValidateParent, error))?;
-    context.refresh_existence(parent, source_name, destination_name);
 
-    if !parent
-        .regular_child_matches_open_file(source_name, &source)
-        .map_err(|error| context.error(PublishPhase::ValidateSource, error))?
-    {
+    if fault == InjectedFault::FlushSource {
+        return Err(context.error(
+            PublishPhase::FlushSource,
+            io::Error::other("injected source flush failure"),
+        ));
+    }
+    source
+        .sync_all()
+        .map_err(|error| context.error(PublishPhase::FlushSource, error))?;
+    lifecycle_event!(SourceWriterFlushed);
+    let expected = file_identity(&source)
+        .map_err(|error| context.error(PublishPhase::ValidateSource, error))?;
+    lifecycle_event!(SourceIdentityCaptured);
+    context.source_size = Some(expected.size);
+    drop(source);
+    lifecycle_event!(SourceWriterDropped);
+
+    let source_identity = {
+        lifecycle_event!(SourceValidationStarted);
+        #[cfg(windows)]
+        context.source_validation_handle_diagnostics();
+        if fault == InjectedFault::SourceValidationError32 {
+            context.source_exists = true;
+            return Err(context.error(
+                PublishPhase::ValidateSource,
+                io::Error::from_raw_os_error(32),
+            ));
+        }
+        let source = parent
+            .open_regular_os(source_name)
+            .map_err(|error| context.error(PublishPhase::ValidateSource, error))?;
+        context.source_exists = true;
+        lifecycle_event!(SourceValidationOpened);
+        file_identity(&source)
+            .map_err(|error| context.error(PublishPhase::ValidateSource, error))?
+    };
+    lifecycle_event!(SourceValidationClosed);
+    if source_identity != expected {
         return Err(context.error(
             PublishPhase::ValidateSource,
             io::Error::other("publish source identity changed"),
         ));
     }
-    let expected = file_identity(&source)
-        .map_err(|error| context.error(PublishPhase::ValidateSource, error))?;
-    context.source_size = Some(expected.size);
+    context.handle_diagnostics = None;
 
-    let destination = parent
-        .open_regular_optional_os(destination_name)
-        .map_err(|error| context.error(PublishPhase::ValidateDestination, error))?;
-    context.destination_existed = destination.is_some();
-    context.strategy = strategy(mode, context.destination_existed);
-    if let Some(file) = destination.as_ref() {
-        let destination_identity = file_identity(file)
+    let destination_identity = {
+        let destination = parent
+            .open_regular_optional_os(destination_name)
             .map_err(|error| context.error(PublishPhase::ValidateDestination, error))?;
-        if destination_identity == expected {
-            return Err(context.error(
-                PublishPhase::ValidateDestination,
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "publish source and destination identify the same file",
-                ),
-            ));
-        }
+        context.destination_existed = destination.is_some();
+        context.destination_exists = context.destination_existed;
+        lifecycle_event!(DestinationValidationOpened);
+        destination
+            .as_ref()
+            .map(file_identity)
+            .transpose()
+            .map_err(|error| context.error(PublishPhase::ValidateDestination, error))?
+    };
+    lifecycle_event!(DestinationValidationClosed);
+    context.strategy = strategy(mode, context.destination_existed);
+    if destination_identity.is_some_and(|identity| identity == expected) {
+        return Err(context.error(
+            PublishPhase::ValidateDestination,
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "publish source and destination identify the same file",
+            ),
+        ));
     }
     if mode == PublishMode::NoReplace && context.destination_existed {
         return Err(context.error(
@@ -285,35 +391,11 @@ fn publish_regular_inner(
         ));
     }
 
-    if fault == InjectedFault::FlushSource {
-        return Err(context.error(
-            PublishPhase::FlushSource,
-            io::Error::other("injected source flush failure"),
-        ));
-    }
-    source
-        .sync_all()
-        .map_err(|error| context.error(PublishPhase::FlushSource, error))?;
-
-    drop(destination);
-    if !parent
-        .regular_child_matches_open_file(source_name, &source)
-        .map_err(|error| context.error(PublishPhase::ValidateSource, error))?
-        || file_identity(&source)
-            .map_err(|error| context.error(PublishPhase::ValidateSource, error))?
-            != expected
-    {
-        return Err(context.error(
-            PublishPhase::ValidateSource,
-            io::Error::other("publish source changed before close"),
-        ));
-    }
     parent
         .verify_logical_identity()
         .map_err(|error| context.error(PublishPhase::ValidateParent, error))?;
-    drop(source);
-    context.source_exists = true;
 
+    lifecycle_event!(OsPublishStarted);
     let state = if fault == InjectedFault::OsError87 {
         context.refresh_existence(parent, source_name, destination_name);
         return Err(context.error(PublishPhase::OsPublish, io::Error::from_raw_os_error(87)));
@@ -338,6 +420,7 @@ fn publish_regular_inner(
     };
     context.strategy = state.strategy;
     context.committed = state.committed;
+    lifecycle_event!(FinalValidationStarted);
     context.source_exists = parent
         .open_regular_optional_os(source_name)
         .map_err(|error| context.error(PublishPhase::ValidatePublishedIdentity, error))?
@@ -420,6 +503,7 @@ struct FailureContext {
     temporary_cleanup_confirmed: bool,
     source_size: Option<u64>,
     final_validated: bool,
+    handle_diagnostics: Option<PublishHandleDiagnostics>,
 }
 
 impl FailureContext {
@@ -435,6 +519,7 @@ impl FailureContext {
             temporary_cleanup_confirmed: false,
             source_size: None,
             final_validated: false,
+            handle_diagnostics: None,
         }
     }
 
@@ -471,9 +556,24 @@ impl FailureContext {
                 committed: self.committed,
                 durability_confirmed: self.durability_confirmed,
                 temporary_cleanup_confirmed: self.temporary_cleanup_confirmed,
+                handle_diagnostics: self.handle_diagnostics,
             }),
             source: Box::new(source),
         }
+    }
+}
+
+#[cfg(windows)]
+impl FailureContext {
+    fn source_validation_handle_diagnostics(&mut self) {
+        self.handle_diagnostics = Some(PublishHandleDiagnostics {
+            handle_role: "source_validation",
+            desired_access: "GENERIC_READ | FILE_READ_ATTRIBUTES",
+            share_mode: "FILE_SHARE_READ | FILE_SHARE_WRITE",
+            creation_disposition: "OPEN_EXISTING",
+            flags: "FILE_FLAG_OPEN_REPARSE_POINT",
+            handle_expected_closed: true,
+        });
     }
 }
 
@@ -978,6 +1078,122 @@ mod tests {
         .expect_err("must reject");
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
         assert_eq!(fs::read(root.join("destination")).expect("read"), b"first");
+        drop(parent);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn lifecycle_closes_validation_handles_before_publish_and_final_validation_after_commit() {
+        let (root, parent) = fixture("lifecycle");
+        fs::write(root.join("destination"), b"previous").expect("existing destination");
+        let _ = take_lifecycle_events();
+
+        let outcome = publish_regular(
+            &parent,
+            source(&parent, "source", b"lifecycle"),
+            OsStr::new("source"),
+            OsStr::new("destination"),
+            PublishMode::ReplaceOrCreate,
+        )
+        .expect("publish");
+
+        assert!(outcome.committed);
+        assert!(outcome.destination_existed);
+        assert_eq!(
+            fs::read(root.join("destination")).expect("destination"),
+            b"lifecycle"
+        );
+        assert_eq!(
+            take_lifecycle_events(),
+            vec![
+                LifecycleEvent::SourceWriterFlushed,
+                LifecycleEvent::SourceIdentityCaptured,
+                LifecycleEvent::SourceWriterDropped,
+                LifecycleEvent::SourceValidationStarted,
+                LifecycleEvent::SourceValidationOpened,
+                LifecycleEvent::SourceValidationClosed,
+                LifecycleEvent::DestinationValidationOpened,
+                LifecycleEvent::DestinationValidationClosed,
+                LifecycleEvent::OsPublishStarted,
+                LifecycleEvent::FinalValidationStarted,
+            ]
+        );
+        drop(parent);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn injected_source_validation_error_32_follows_writer_close_and_preserves_state() {
+        let (root, parent) = fixture("source-error-32");
+        let _ = take_lifecycle_events();
+
+        let error = publish_regular_injected_source_validation_error32(
+            &parent,
+            source(&parent, "source", b"source-error"),
+            OsStr::new("source"),
+            OsStr::new("destination"),
+            PublishMode::NoReplace,
+        )
+        .expect_err("injected source validation error");
+
+        let details = error.details();
+        assert_eq!(details.phase, PublishPhase::ValidateSource);
+        assert_eq!(details.raw_os_error, Some(32));
+        assert!(details.source_exists);
+        assert!(!details.destination_exists);
+        assert!(!details.committed);
+        assert!(!details.final_validated);
+        assert!(!details.temporary_cleanup_confirmed);
+        assert_eq!(
+            take_lifecycle_events(),
+            vec![
+                LifecycleEvent::SourceWriterFlushed,
+                LifecycleEvent::SourceIdentityCaptured,
+                LifecycleEvent::SourceWriterDropped,
+                LifecycleEvent::SourceValidationStarted,
+            ]
+        );
+        assert!(!error.to_string().contains(&root.display().to_string()));
+        drop(parent);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn legacy_incompatible_validation_open_fails_while_live_writer_corrected_publish_succeeds() {
+        use windows_sys::Win32::Foundation::{GENERIC_READ, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
+            FILE_SHARE_WRITE, OPEN_EXISTING,
+        };
+
+        let (root, parent) = fixture("windows-sharing");
+        let writer = source(&parent, "source", b"windows");
+        let source_path = crate::windows_path::verbatim_wide_path(&root.join("source"))
+            .expect("verbatim source path");
+        // SAFETY: source_path is NUL-terminated and the returned handle is closed below.
+        let legacy = unsafe {
+            CreateFileW(
+                source_path.as_ptr(),
+                GENERIC_READ | FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OPEN_REPARSE_POINT,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(legacy, INVALID_HANDLE_VALUE);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(32));
+
+        publish_regular(
+            &parent,
+            writer,
+            OsStr::new("source"),
+            OsStr::new("destination"),
+            PublishMode::NoReplace,
+        )
+        .expect("corrected publish after writer closes");
         drop(parent);
         fs::remove_dir_all(root).expect("cleanup");
     }
